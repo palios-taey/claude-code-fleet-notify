@@ -245,30 +245,77 @@ def _current_task_summary(r, node_id: str):
         return "", None
 
 
+# Atomic compare-and-clear: only delete current_task + last_outcome if the
+# current_task value's task_id still matches what we observed when we built
+# the summary. Without this, a concurrent dispatch() that wrote a fresh
+# task_id between our read and our delete would be silently wiped (Gaia
+# code audit 2026-05-26, TIER 1 collapse of five findings).
+#
+# Returns 1 if the clear executed (task_id matched), 0 if the clear was
+# skipped (task_id mismatch — a newer dispatch is already in flight, do
+# not interfere). The marker key (KEYS[3]) is set to "1" with a short TTL
+# only when the clear actually fires — orch-watch's DEL handler reads
+# this to distinguish a Stop-hook done-clear from a supervisor force-clear
+# (Gaia orch-watch #2).
+_CAS_CLEAR_DONE_LUA = """
+local cur = redis.call('GET', KEYS[1])
+if not cur then return 0 end
+local ok, task = pcall(cjson.decode, cur)
+if not ok then return 0 end
+if task['task_id'] == ARGV[1] then
+    redis.call('DEL', KEYS[1])
+    redis.call('DEL', KEYS[2])
+    redis.call('SET', KEYS[3], '1', 'EX', 30)
+    return 1
+end
+return 0
+"""
+
+
 def _notify_supervisor_of_stop(r, node_id: str, supervisor: str) -> None:
     """Push a peer_idle message to the supervisor's inbox when this worker
     stops. Body includes the just-completed task summary + outcome enum,
     so the supervisor sees the result inline without context-switching to
     the worker pane.
 
-    Dedup: 60s TTL on ``taey:peer-idle-notified:<node>`` prevents back-to-
-    back Stops on the same worker from spamming the supervisor.
+    Dedup is keyed per ``(node_id, task_id)`` — back-to-back Stops on the
+    SAME task dedup; a Stop after a re-dispatch on the SAME worker but a
+    DIFFERENT task fires fresh (Logos contract #3 / Gaia dispatch #2).
 
     Persistence rule (Gaia, Phase A consultation 2026-05-26): clear
-    current_task ONLY when the outcome is explicitly ``done``. For
-    ``error``, ``interrupted``, or ``unknown`` outcomes the current_task
-    persists — it is the signal "previous dispatch did not complete
-    cleanly" that the next dispatch attempt MUST observe. Without this,
-    error-then-restart cycles silently look identical to clean completions.
+    current_task ONLY when the outcome is explicitly ``done``. Any other
+    outcome leaves current_task as the "previous dispatch did not complete
+    cleanly" signal.
+
+    Atomicity rule (Gaia code audit 2026-05-26, TIER 1): the done-clear
+    runs as a Lua compare-and-delete keyed on the observed task_id, so a
+    concurrent dispatch() that wrote a fresh task_id between our read and
+    our delete is NOT silently wiped. The done-clear also writes
+    ``taey:<node>:last_clear_was_done`` (30s TTL marker) so orch-watch's
+    DEL handler can distinguish done-clear from supervisor force-clear.
     """
     try:
         from notifications.inbox import inbox_key, state_key
 
-        dedup = f"taey:peer-idle-notified:{node_id}"
+        summary, outcome = _current_task_summary(r, node_id)
+
+        # Capture the observed task_id BEFORE doing anything else — the
+        # Lua clear below uses this to compare-and-swap. If a concurrent
+        # dispatch() arrives between this read and the Lua, the Lua sees
+        # the new task_id and skips the clear.
+        observed_task_id = None
+        try:
+            cur = r.get(state_key(node_id, "current_task"))
+            if cur:
+                observed_task_id = json.loads(cur).get("task_id")
+        except Exception:
+            observed_task_id = None
+
+        dedup_suffix = observed_task_id or "no-task"
+        dedup = f"taey:peer-idle-notified:{node_id}:{dedup_suffix}"
         if r.exists(dedup):
             return
 
-        summary, outcome = _current_task_summary(r, node_id)
         if summary:
             body = f"{node_id} stopped — {summary}"
             priority = "high" if outcome in ("error", "interrupted") else "normal"
@@ -280,23 +327,37 @@ def _notify_supervisor_of_stop(r, node_id: str, supervisor: str) -> None:
             "from": node_id,
             "type": "peer_idle",
             "body": body,
-            "outcome": outcome,  # explicit enum field for programmatic readers
+            "outcome": outcome,
             "priority": priority,
-            "msg_id": f"peer-idle-{node_id}-{int(time.time())}",
+            "msg_id": f"peer-idle-{node_id}-{dedup_suffix}-{int(time.time())}",
             "timestamp": time.time(),
         })
         r.lpush(inbox_key(supervisor), msg)
         r.set(dedup, "1", ex=60)
 
-        # Clear keys ONLY on confirmed completion. Anything else (error,
-        # interrupted, unknown, or no task at all) leaves current_task in
-        # place so the supervisor's next dispatch sees the unresolved state.
-        if outcome == "done":
-            r.delete(state_key(node_id, "current_task"))
-            r.delete(state_key(node_id, "last_outcome"))
+        # Clear ONLY on confirmed completion, AND only if the observed
+        # task_id still matches what's in Redis (CAS). If a fresh dispatch
+        # arrived between our read and this point, the Lua skips the
+        # clear — its new task_id survives.
+        if outcome == "done" and observed_task_id:
+            try:
+                cleared = r.eval(
+                    _CAS_CLEAR_DONE_LUA, 3,
+                    state_key(node_id, "current_task"),
+                    state_key(node_id, "last_outcome"),
+                    state_key(node_id, "last_clear_was_done"),
+                    observed_task_id,
+                )
+                if not cleared:
+                    log_debug(node_id,
+                              f"STOP CAS skipped clear — current_task task_id no longer "
+                              f"matches observed={observed_task_id}; newer dispatch in flight.")
+            except Exception as cas_exc:
+                log_debug(node_id, f"STOP CAS clear failed: {cas_exc}")
 
         log_debug(node_id,
-                  f"STOP: notified supervisor={supervisor} outcome={outcome} body=\"{body}\"")
+                  f"STOP: notified supervisor={supervisor} outcome={outcome} "
+                  f"observed_task_id={observed_task_id} body=\"{body}\"")
     except Exception as e:
         log_debug(node_id, f"notify_supervisor error: {e}")
 
