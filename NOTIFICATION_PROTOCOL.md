@@ -19,8 +19,35 @@ Targets are arbitrary strings. There is no allowlist. A practical fleet might us
 
 ## Participant types
 
-- **tmux-session participants** are Claude Code sessions with the four hooks installed. The daemon injects a pointer prompt through tmux only when the session is stopped and marked idle.
+- **tmux-session participants** are REPL-CLI sessions with the four hooks installed. Supported CLIs: Claude Code, OpenAI codex, Google gemini, and xAI grok (see "Per-CLI hook integration" below for config-file paths and event-name mappings). The daemon injects a pointer prompt through tmux only when the session is stopped and marked idle.
 - **headless participants** read Redis directly. They do not use hooks, tmux injection, `idle`, or `tool_running` state. They poll `${NOTIFY_KEY_PREFIX:-taey}:<name>:inbox` and reply with `taey-notify <target> --from <name>`.
+
+## Per-CLI hook integration
+
+All four supported CLIs run the same Redis state machine (`idle` / `tool_running` / `last_activity` / `inbox` / `notifications`). The per-CLI hook variants in `hooks/` are thin wrappers that adapt to each CLI's distinct (a) config file location + format, (b) event-name vocabulary, (c) stdin/stdout envelope shape. All four call into the shared `hooks/_shared.py` helper which is the single source of truth for `action_pre_tool` / `action_post_tool` / `action_stop` / `action_user_prompt`.
+
+| CLI | Config file | Format | Event names | Hook scripts |
+|---|---|---|---|---|
+| Claude Code | `~/.claude/settings.json` | JSON | `PreToolUse` / `PostToolUse` / `Stop` / `UserPromptSubmit` | `pre_tool_activity.py` / `check_notifications.py` / `stop_idle.py` / `prompt_activity.py` |
+| OpenAI codex | `~/.codex/hooks.json` | JSON | `PreToolUse` / `PostToolUse` / `Stop` / `UserPromptSubmit` | `codex_pre_tool.py` / `codex_post_tool.py` / `codex_stop.py` / `codex_user_prompt.py` |
+| Google gemini | `~/.gemini/settings.json` | JSON | `BeforeTool` / `AfterTool` / `AfterAgent` / `BeforeAgent` | `gemini_before_tool.py` / `gemini_after_tool.py` / `gemini_after_agent.py` / `gemini_before_agent.py` |
+| xAI grok | inherits `~/.claude/settings.json` | n/a (auto-inherits) | `PreToolUse` / `PostToolUse` / `Stop` / `UserPromptSubmit` | same Claude Code scripts (no separate grok variants needed) |
+
+Use `bash scripts/install-hooks.sh --help` for the full installation matrix. `--apply` writes a timestamped backup of each affected config file before changing it; without `--apply` the script is a dry-run that prints unified diffs and exits.
+
+> **Grok inheritance**: xAI's `grok-cli` reads its hook configuration from `~/.claude/settings.json` automatically, verified via `grok inspect` which reports `Hooks (4)` sourced from that file. Installing Claude Code hooks therefore enables Grok at the same time. There is no `~/.grok/hooks.json` or grok-specific config — and no separate `grok_*.py` hook scripts in this package, because Grok and Claude Code share the same event names + envelope shape.
+
+### Universal Stop+notify (v0.2.0+)
+
+When a worker stops, its Stop hook runs `_shared.py:action_stop` which:
+
+1. Sets `${NOTIFY_KEY_PREFIX:-taey}:<node>:idle=1` (load-bearing — this is the only setter).
+2. Resolves the supervisor via two-mechanism rule: explicit `${NOTIFY_KEY_PREFIX:-taey}:<node>:parent` Redis key wins, else suffix-strip (`<name>-codex` / `<name>-gemini` / `<name>-grok` → `<name>`). Top-level sessions resolve to `None` and skip the parent-notify.
+3. Reads `${NOTIFY_KEY_PREFIX:-taey}:<node>:current_task` (JSON `{task_id, description, supervisor, started_at}`, written by the dispatcher in [`claude-code-fleet-orchestrator`](https://github.com/palios-taey/claude-code-fleet-orchestrator)) + `${NOTIFY_KEY_PREFIX:-taey}:<node>:last_outcome` (JSON `{outcome, details}`, optionally set by the worker via `record_outcome()`).
+4. Pushes a single `peer_idle` message to the supervisor's inbox with the outcome enum (`done | error | interrupted | unknown`) inline.
+5. On outcome=done, atomically clears `current_task` + `last_outcome` via Lua compare-and-swap keyed on the observed `task_id` (so a concurrent dispatch racing past the Stop is not silently wiped) and writes a 30s-TTL `last_clear_was_done` marker the orchestrator's watchloop reads to distinguish done-clear from force-clear.
+
+Any outcome other than `done` leaves `current_task` in place as the "previous dispatch did not complete cleanly" signal for the supervisor's next dispatch attempt.
 
 ## How messages are delivered
 
@@ -81,19 +108,20 @@ Nothing else sets `idle=1`. The daemon never clears idle because tmux injection 
 
 ## Hook install model
 
-Use the installer to review the exact settings change:
+Default behavior installs Claude Code hooks (which also enables Grok by inheritance — see "Per-CLI hook integration" above):
 
 ```bash
-bash scripts/install-hooks.sh
+bash scripts/install-hooks.sh                 # dry-run, print Claude Code diff
+bash scripts/install-hooks.sh --apply         # write after review
 ```
 
-To apply it:
+Add `--codex` / `--gemini` / `--all` to install additional CLIs' hooks in the same invocation:
 
 ```bash
-bash scripts/install-hooks.sh --apply
+bash scripts/install-hooks.sh --all --apply   # all four (claude + codex + gemini + grok-by-inheritance)
 ```
 
-`--apply` writes a timestamped backup of `~/.claude/settings.json` before changing it. Without `--apply`, the script prints a unified diff and exits without writing.
+Each CLI's config file gets a timestamped backup before being written. `bash scripts/install-hooks.sh --help` for the full flag list.
 
 ## Daemon
 
