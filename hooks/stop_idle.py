@@ -1,18 +1,22 @@
 #!/usr/bin/env python3
-"""
-Stop hook — Claude stopped responding. Set idle=1.
+"""Claude Code Stop hook — set idle=1 + notify supervisor on stop.
 
-This is the ONLY way idle gets set. UserPromptSubmit is the ONLY way
+This is the ONLY place idle gets set. UserPromptSubmit is the ONLY way
 it gets cleared. The notification router delivers via tmux ONLY when
 idle=1.
 
+Universal Stop+notify primitive (v0.2.0): if this session has a
+supervisor (resolved via taey:<node>:parent override OR the
+<name>-codex/<name>-gemini/<name>-grok suffix-strip rule), the supervisor
+receives a peer_idle message including the just-completed task summary.
+Workers do not need to call taey-notify manually on completion — the
+Stop hook is the canonical notifier across all supported CLIs.
+
 NO SILENT FAILURES. If Redis fails, log to stderr and a file.
 """
-import json
-import sys
 import os
+import sys
 import time
-import traceback
 
 # DIAGNOSTIC (2026-05-18): invocation marker — fires before any other logic
 # so we can distinguish "hook never invoked by Claude Code" from "hook ran
@@ -24,51 +28,23 @@ try:
 except Exception:
     pass
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
-from notifications.inbox import inbox_key, notifications_key, state_key
-
-LOG_FILE = "/tmp/stop_hook_debug.log"
-
-
-def log(msg):
-    line = f"[{time.strftime('%H:%M:%S')}] {msg}"
-    print(line, file=sys.stderr)
-    try:
-        with open(LOG_FILE, "a") as f:
-            f.write(line + "\n")
-    except Exception:
-        pass
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _shared import (
+    read_stdin_json, get_redis_and_node, action_stop, emit_claude_or_codex,
+)
 
 
 def main():
-    try:
-        sys.stdin.read()
-    except Exception:
-        pass
+    read_stdin_json()  # consume stdin
 
-    try:
-        from identity import detect_node_id, redis_connect
-        node_id = detect_node_id()
-        log(f"Stop hook fired for node={node_id}")
+    r, node_id = get_redis_and_node()
+    if r is None:
+        emit_claude_or_codex("Stop", None)
+        sys.exit(0)
 
-        r = redis_connect()
-        r.ping()
-
-        r.set(state_key(node_id, "idle"), "1")  # no TTL — stopped means stopped until UserPromptSubmit clears it
-        r.delete(state_key(node_id, "tool_running"))
-        r.set(state_key(node_id, "last_activity"), str(time.time()))
-
-        # Check pending messages
-        inbox = r.llen(inbox_key(node_id)) or 0
-        notif = r.llen(notifications_key(node_id)) or 0
-        if inbox + notif > 0:
-            log(f"PENDING: {inbox} inbox + {notif} notifications waiting for {node_id}")
-
-        log(f"Set idle=1 for {node_id}")
-    except Exception as e:
-        log(f"STOP HOOK FAILED: {e}\n{traceback.format_exc()}")
-
-    print(json.dumps({}))
+    action_stop(r, node_id)
+    emit_claude_or_codex("Stop", None)
+    sys.exit(0)
 
 
 if __name__ == "__main__":

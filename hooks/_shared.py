@@ -138,11 +138,183 @@ def action_post_tool(r, node_id: str, tool_name: str = "") -> str:
         return body
 
 
+def _resolve_supervisor(r, node_id: str) -> Optional[str]:
+    """Resolve who supervises this node, if anyone.
+
+    Resolution order:
+    1. Explicit override key ``taey:<node>:parent`` — set by orchestrators
+       that need multi-level supervisor trees (a worker that is itself a
+       supervisor for its own children).
+    2. Suffix-strip rule for CLI peers: ``<name>-codex`` / ``<name>-gemini``
+       / ``<name>-grok`` strip to ``<name>``, which is then treated as the
+       supervisor session.
+    3. Top-level sessions (no recognized suffix and no explicit override)
+       return ``None`` — they have no supervisor to notify.
+
+    The explicit key wins because the suffix rule can't distinguish a
+    second-level worker (e.g., ``treasurer-codex-research``) from a
+    first-level one.
+    """
+    try:
+        from notifications.inbox import state_key
+
+        explicit = r.get(state_key(node_id, "parent"))
+        if explicit:
+            return explicit
+    except Exception:
+        pass
+
+    for suffix in ("-codex", "-gemini", "-grok"):
+        if node_id.endswith(suffix):
+            return node_id[: -len(suffix)]
+    return None
+
+
+_VALID_OUTCOMES = ("done", "error", "interrupted", "unknown")
+
+
+def _current_task_summary(r, node_id: str):
+    """Build a short summary of the worker's just-completed task, if any.
+
+    Reads two optional keys that the dispatcher / worker maintain:
+
+    - ``taey:<node>:current_task`` — JSON {task_id, description,
+      supervisor, started_at} written by ``dispatch()`` when work is
+      assigned.
+    - ``taey:<node>:last_outcome`` — JSON {outcome, details} OR a raw
+      string (treated as ``unknown`` + details). The worker may set this
+      via ``orchestrator.record_outcome()`` before stopping. Absent means
+      ``unknown`` (worker stopped without explicit signal — could be
+      clean finish, could be error-restart).
+
+    Returns ``(summary_text, outcome)`` where ``outcome`` is one of
+    ``done|error|interrupted|unknown`` and is load-bearing for the
+    caller's decision to clear current_task (only clear on ``done``).
+
+    Returns ``("", None)`` if there is no current task at all.
+
+    Gaia (Phase A consultation 2026-05-26): the outcome enum is required
+    because the Stop signal alone overloads two opposite meanings — clean
+    finish AND error-then-restart — and a supervisor that infers
+    completion from idle silently mishandles half the failure modes.
+    """
+    try:
+        from notifications.inbox import state_key
+
+        raw = r.get(state_key(node_id, "current_task"))
+        if not raw:
+            return "", None
+        try:
+            task = json.loads(raw)
+        except Exception:
+            task = {"description": raw[:80]}
+
+        task_id = task.get("task_id", "?")
+        desc = (task.get("description") or "")[:120]
+        started_at = task.get("started_at")
+
+        # last_outcome: structured JSON preferred; raw string falls back
+        # to outcome=unknown + details=raw.
+        outcome = "unknown"
+        details = ""
+        last_outcome_raw = r.get(state_key(node_id, "last_outcome"))
+        if last_outcome_raw:
+            try:
+                parsed = json.loads(last_outcome_raw)
+                outcome = parsed.get("outcome", "unknown")
+                if outcome not in _VALID_OUTCOMES:
+                    outcome = "unknown"
+                details = (parsed.get("details") or "")[:200]
+            except (json.JSONDecodeError, AttributeError):
+                details = last_outcome_raw[:200]
+
+        bits = [f"outcome={outcome}", f"task={task_id}"]
+        if desc:
+            bits.append(f'"{desc}"')
+        if details:
+            bits.append(f"details={details}")
+        if started_at:
+            try:
+                elapsed = int(time.time() - float(started_at))
+                bits.append(f"duration={elapsed}s")
+            except Exception:
+                pass
+        return "; ".join(bits), outcome
+    except Exception as e:
+        log_debug(node_id, f"current_task summary error: {e}")
+        return "", None
+
+
+def _notify_supervisor_of_stop(r, node_id: str, supervisor: str) -> None:
+    """Push a peer_idle message to the supervisor's inbox when this worker
+    stops. Body includes the just-completed task summary + outcome enum,
+    so the supervisor sees the result inline without context-switching to
+    the worker pane.
+
+    Dedup: 60s TTL on ``taey:peer-idle-notified:<node>`` prevents back-to-
+    back Stops on the same worker from spamming the supervisor.
+
+    Persistence rule (Gaia, Phase A consultation 2026-05-26): clear
+    current_task ONLY when the outcome is explicitly ``done``. For
+    ``error``, ``interrupted``, or ``unknown`` outcomes the current_task
+    persists — it is the signal "previous dispatch did not complete
+    cleanly" that the next dispatch attempt MUST observe. Without this,
+    error-then-restart cycles silently look identical to clean completions.
+    """
+    try:
+        from notifications.inbox import inbox_key, state_key
+
+        dedup = f"taey:peer-idle-notified:{node_id}"
+        if r.exists(dedup):
+            return
+
+        summary, outcome = _current_task_summary(r, node_id)
+        if summary:
+            body = f"{node_id} stopped — {summary}"
+            priority = "high" if outcome in ("error", "interrupted") else "normal"
+        else:
+            body = f"{node_id} stopped — no current task recorded"
+            priority = "low"
+
+        msg = json.dumps({
+            "from": node_id,
+            "type": "peer_idle",
+            "body": body,
+            "outcome": outcome,  # explicit enum field for programmatic readers
+            "priority": priority,
+            "msg_id": f"peer-idle-{node_id}-{int(time.time())}",
+            "timestamp": time.time(),
+        })
+        r.lpush(inbox_key(supervisor), msg)
+        r.set(dedup, "1", ex=60)
+
+        # Clear keys ONLY on confirmed completion. Anything else (error,
+        # interrupted, unknown, or no task at all) leaves current_task in
+        # place so the supervisor's next dispatch sees the unresolved state.
+        if outcome == "done":
+            r.delete(state_key(node_id, "current_task"))
+            r.delete(state_key(node_id, "last_outcome"))
+
+        log_debug(node_id,
+                  f"STOP: notified supervisor={supervisor} outcome={outcome} body=\"{body}\"")
+    except Exception as e:
+        log_debug(node_id, f"notify_supervisor error: {e}")
+
+
 def action_stop(r, node_id: str) -> None:
     """Stop / AfterAgent: set idle=1 with no TTL (stopped means stopped until
     UserPromptSubmit clears it). Clear tool_running. Stamp last_activity.
+    Notify supervisor (if any) with completed-task summary.
+
     NOTE: this is the ONLY place idle gets set. Per NOTIFICATION_PROTOCOL.md.
 
+    Universal Stop+notify primitive (v0.2.0): the Stop hook is the canonical
+    notifier for worker→supervisor signaling. Don't trust workers to call
+    taey-notify manually — every Stop fires the parent-notify automatically,
+    with task content from ``taey:<node>:current_task`` (set by the
+    dispatcher) and optional outcome from ``taey:<node>:last_outcome``
+    (worker may set this before stopping). Supervisor receives outcome
+    inline.
     """
     try:
         from notifications.inbox import state_key
@@ -151,6 +323,10 @@ def action_stop(r, node_id: str) -> None:
         r.delete(state_key(node_id, "tool_running"))
         r.set(state_key(node_id, "last_activity"), str(time.time()))
         log_debug(node_id, "STOP: idle=1")
+
+        supervisor = _resolve_supervisor(r, node_id)
+        if supervisor:
+            _notify_supervisor_of_stop(r, node_id, supervisor)
     except Exception as e:
         log_debug(node_id, f"action_stop error: {e}")
 
