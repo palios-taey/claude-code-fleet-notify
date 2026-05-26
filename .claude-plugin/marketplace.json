@@ -1,0 +1,31 @@
+{
+  "name": "claude-code-fleet-notify",
+  "owner": {
+    "name": "PALIOS-TAEY",
+    "email": "jesse@taey.ai"
+  },
+  "metadata": {
+    "description": "Autonomous wake notifications for unattended Claude Code fleets",
+    "version": "0.1.0"
+  },
+  "plugins": [
+    {
+      "name": "claude-code-fleet-notify",
+      "source": "./",
+      "description": "Four Claude Code hooks, Redis inboxes, and a tmux daemon that wakes stopped sessions with pointer prompts while active sessions receive full messages through additionalContext.",
+      "version": "0.1.0",
+      "category": "devops",
+      "tags": [
+        "claude-code",
+        "hooks",
+        "notifications",
+        "tmux",
+        "redis",
+        "fleet"
+      ],
+      "author": {
+        "name": "PALIOS-TAEY"
+      }
+    }
+  ]
+}

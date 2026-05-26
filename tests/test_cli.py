@@ -1,0 +1,156 @@
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import textwrap
+import unittest
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+FAKE_REDIS = r'''
+import json
+import os
+
+
+class Redis:
+    def __init__(self, *args, **kwargs):
+        self.path = os.environ["FAKE_REDIS_STATE"]
+
+    def _load(self):
+        if not os.path.exists(self.path):
+            return {}
+        with open(self.path) as f:
+            return json.load(f)
+
+    def _save(self, data):
+        with open(self.path, "w") as f:
+            json.dump(data, f)
+
+    def ping(self):
+        return True
+
+    def lpush(self, key, value):
+        data = self._load()
+        data.setdefault(key, [])
+        data[key].insert(0, value)
+        self._save(data)
+        return len(data[key])
+
+    def rpush(self, key, value):
+        data = self._load()
+        data.setdefault(key, [])
+        data[key].append(value)
+        self._save(data)
+        return len(data[key])
+
+    def rpop(self, key):
+        data = self._load()
+        values = data.get(key, [])
+        value = values.pop() if values else None
+        self._save(data)
+        return value
+
+    def lpop(self, key):
+        data = self._load()
+        values = data.get(key, [])
+        value = values.pop(0) if values else None
+        self._save(data)
+        return value
+
+    def lrange(self, key, start, end):
+        values = list(self._load().get(key, []))
+        length = len(values)
+        if start < 0:
+            start = max(length + start, 0)
+        if end < 0:
+            end = length + end
+        return values[start:end + 1]
+
+    def llen(self, key):
+        return len(self._load().get(key, []))
+
+    def set(self, key, value, ex=None):
+        data = self._load()
+        data[key] = value
+        self._save(data)
+        return True
+
+    def delete(self, *keys):
+        data = self._load()
+        count = 0
+        for key in keys:
+            if key in data:
+                del data[key]
+                count += 1
+        self._save(data)
+        return count
+'''
+
+
+class CliTests(unittest.TestCase):
+    def run_cli(self, args, env):
+        return subprocess.run(
+            [sys.executable, *args],
+            cwd=ROOT,
+            env=env,
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+
+    def test_taey_notify_writes_expected_json_to_inbox(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_dir = Path(tmp)
+            (fake_dir / "redis.py").write_text(FAKE_REDIS)
+            state = fake_dir / "state.json"
+            env = os.environ.copy()
+            env.update({
+                "PYTHONPATH": f"{fake_dir}:{ROOT}",
+                "FAKE_REDIS_STATE": str(state),
+                "TAEY_NODE_ID": "session-a",
+            })
+
+            self.run_cli(["scripts/taey-notify", "session-b", "hello"], env)
+
+            data = json.loads(state.read_text())
+            raw = data["taey:session-b:inbox"][0]
+            msg = json.loads(raw)
+            self.assertEqual("session-a", msg["from"])
+            self.assertEqual("hello", msg["body"])
+
+    def test_taey_ack_peek_does_not_clear_and_ack_drains_with_pops(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_dir = Path(tmp)
+            (fake_dir / "redis.py").write_text(FAKE_REDIS)
+            state = fake_dir / "state.json"
+            initial = {
+                "taey:session-b:inbox": [
+                    json.dumps({"from": "session-a", "type": "message", "body": "new"}),
+                    json.dumps({"from": "session-a", "type": "message", "body": "old"}),
+                ]
+            }
+            state.write_text(json.dumps(initial))
+            env = os.environ.copy()
+            env.update({
+                "PYTHONPATH": f"{fake_dir}:{ROOT}",
+                "FAKE_REDIS_STATE": str(state),
+                "TAEY_NODE_ID": "session-b",
+            })
+
+            peek = self.run_cli(["scripts/taey-ack", "--peek"], env)
+            self.assertIn("PEEK MODE", peek.stdout)
+            self.assertEqual(2, len(json.loads(state.read_text())["taey:session-b:inbox"]))
+
+            ack = self.run_cli(["scripts/taey-ack"], env)
+            self.assertIn("Drained all queues", ack.stdout)
+            self.assertEqual([], json.loads(state.read_text())["taey:session-b:inbox"])
+
+
+if __name__ == "__main__":
+    unittest.main()

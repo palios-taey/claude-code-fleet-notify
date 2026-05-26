@@ -1,0 +1,21 @@
+{
+  "name": "claude-code-fleet-notify",
+  "version": "0.1.0",
+  "description": "Autonomous wake notifications for unattended Claude Code fleets using four hooks, Redis inboxes, and tmux pointer injection.",
+  "author": {
+    "name": "PALIOS-TAEY",
+    "url": "https://github.com/palios-taey"
+  },
+  "homepage": "https://github.com/palios-taey/claude-code-fleet-notify",
+  "repository": "https://github.com/palios-taey/claude-code-fleet-notify",
+  "license": "Apache-2.0",
+  "keywords": [
+    "claude-code",
+    "hooks",
+    "notifications",
+    "tmux",
+    "redis",
+    "fleet",
+    "autonomous"
+  ]
+}

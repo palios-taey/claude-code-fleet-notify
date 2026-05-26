@@ -1,0 +1,63 @@
+#!/bin/bash
+# tmux-send: Send text + submit to a Claude Code tmux session.
+# Usage: tmux-send <host> <session> "message text"
+#        tmux-send <session> <message>  (local shorthand)
+#
+# Claude Code uses Ink TUI with Kitty keyboard protocol.
+# Enter = ESC[13u (CSI u), not legacy 0x0D (carriage return).
+# tmux send-keys "Enter" sends 0x0D which may not trigger submit.
+#
+# Submit strategy (3 tiers, all fired in sequence for reliability):
+#   1. Escape       — dismiss autocomplete overlay
+#   2. Enter        — legacy 0x0D (works when autocomplete is gone)
+#   3. CSI u hex    — ESC[13u via send-keys -H (Kitty protocol Enter)
+#
+# See: github.com/anthropics/claude-code/issues/15553
+
+set -euo pipefail
+
+if [ $# -eq 2 ]; then
+    HOST="local"
+    SESSION="$1"
+    MSG="$2"
+elif [ $# -ge 3 ]; then
+    HOST="$1"
+    SESSION="$2"
+    shift 2
+    MSG="$*"
+else
+    echo "Usage: tmux-send <host> <session> <message>" >&2
+    echo "       tmux-send <session> <message>  (local)" >&2
+    exit 1
+fi
+
+B64=$(printf '%s' "$MSG" | base64 -w0)
+
+# Local send
+if [ "$HOST" = "local" ] || [ "$HOST" = "localhost" ] || [ "$HOST" = "$(hostname -s)" ]; then
+    tmux send-keys -t "$SESSION" -- "$MSG"
+    sleep 0.5
+    tmux send-keys -t "$SESSION" Escape
+    sleep 0.2
+    tmux send-keys -t "$SESSION" Enter
+    sleep 0.1
+    tmux send-keys -t "$SESSION" -H 1b 5b 31 33 75
+    echo "OK: $SESSION (local)"
+    exit 0
+fi
+
+# Remote send via SSH
+ssh "$HOST" "
+SESSION='${SESSION}'
+MSG=\$(printf '%s' '${B64}' | base64 -d)
+
+tmux send-keys -t \"\$SESSION\" -- \"\$MSG\"
+sleep 0.5
+tmux send-keys -t \"\$SESSION\" Escape
+sleep 0.2
+tmux send-keys -t \"\$SESSION\" Enter
+sleep 0.1
+tmux send-keys -t \"\$SESSION\" -H 1b 5b 31 33 75
+"
+
+echo "OK: $SESSION"

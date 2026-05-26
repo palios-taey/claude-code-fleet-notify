@@ -1,0 +1,86 @@
+#!/usr/bin/env python3
+"""
+Read and acknowledge (clear) notifications from Redis.
+Displays all pending messages and then removes them from Redis.
+"""
+import argparse
+import json
+import os
+import sys
+import time
+from datetime import datetime
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+from identity import detect_node_id, redis_connect
+from notifications.inbox import clear_all, peek_all, set_key_prefix
+
+def format_message(msg):
+    """Format a notification/message for display."""
+    sender = msg.get('from', msg.get('platform', 'unknown'))
+    mtype = msg.get('type', msg.get('status', 'message')).upper()
+    body = msg.get('body', msg.get('message', str(msg)))
+    priority = msg.get('priority', '')
+    # NEVER use '!!!' (bash history expansion) per NOTIFICATION_PROTOCOL.md
+    prefix = "URGENT " if priority == "high" else ""
+    ts = msg.get('timestamp')
+    ts_str = ""
+    if ts:
+        ts_str = f" [{datetime.fromtimestamp(ts).strftime('%H:%M:%S')}]"
+
+    # Monitor daemon: response detection
+    if msg.get('status') in ('response_complete', 'complete'):
+        platform = msg.get('platform', 'unknown')
+        elapsed = msg.get('elapsed_seconds', '')
+        return f"  *** {platform.upper()} RESPONSE READY ({elapsed}s) ***{ts_str}"
+
+    return f"  {prefix}[{mtype} from {sender}]{ts_str}: {body}"
+
+def main():
+    parser = argparse.ArgumentParser(description="Read and clear notifications")
+    parser.add_argument("--node", help="Node ID (auto-detected if omitted)")
+    parser.add_argument("--peek", action="store_true", help="Only show messages, don't clear")
+    parser.add_argument("--redis-host", default=os.environ.get("REDIS_HOST", "127.0.0.1"))
+    parser.add_argument("--redis-port", type=int, default=int(os.environ.get("REDIS_PORT", "6379")))
+    parser.add_argument("--key-prefix", default=os.environ.get("NOTIFY_KEY_PREFIX", "taey"),
+                        help="Redis key prefix (default: NOTIFY_KEY_PREFIX or taey)")
+    args = parser.parse_args()
+
+    os.environ["NOTIFY_KEY_PREFIX"] = args.key_prefix
+    set_key_prefix(args.key_prefix)
+    node_id = args.node or detect_node_id()
+    r = redis_connect(host=args.redis_host, port=args.redis_port)
+
+    data = peek_all(r, node_id)
+    all_messages = data['inbox'] + data['notifications'] + data['orch']
+
+    if not all_messages:
+        print(f"No pending messages for {node_id}.")
+        return
+
+    print(f"\n=== PENDING MESSAGES FOR {node_id} ({len(all_messages)}) ===")
+    
+    if data['inbox']:
+        print("\n INBOX:")
+        for msg in data['inbox']:
+            print(format_message(msg))
+            
+    if data['notifications']:
+        print("\n MONITOR NOTIFICATIONS:")
+        for msg in data['notifications']:
+            print(format_message(msg))
+            
+    if data['orch']:
+        print("\n ORCHESTRATION:")
+        for msg in data['orch']:
+            print(format_message(msg))
+
+    print("\n" + "="*40)
+
+    if not args.peek:
+        clear_all(r, node_id)
+        print(f"OK: Drained all queues for {node_id}.")
+    else:
+        print(f"PEEK MODE: {len(all_messages)} messages remain in Redis.")
+
+if __name__ == "__main__":
+    main()
