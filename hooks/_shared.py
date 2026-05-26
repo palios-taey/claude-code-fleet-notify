@@ -299,17 +299,37 @@ def _notify_supervisor_of_stop(r, node_id: str, supervisor: str) -> None:
 
         summary, outcome = _current_task_summary(r, node_id)
 
-        # Capture the observed task_id BEFORE doing anything else — the
-        # Lua clear below uses this to compare-and-swap. If a concurrent
-        # dispatch() arrives between this read and the Lua, the Lua sees
-        # the new task_id and skips the clear.
+        # Capture observed task BEFORE doing anything else — the Lua clear
+        # below uses task_id to compare-and-swap. If a concurrent dispatch()
+        # arrives between this read and the Lua, the Lua sees the new
+        # task_id and skips the clear.
+        observed_task = None
         observed_task_id = None
         try:
             cur = r.get(state_key(node_id, "current_task"))
             if cur:
-                observed_task_id = json.loads(cur).get("task_id")
+                observed_task = json.loads(cur)
+                observed_task_id = observed_task.get("task_id")
         except Exception:
+            observed_task = None
             observed_task_id = None
+
+        # Audit fix (Gaia system-integration sign-off 2026-05-26, TIER-1):
+        # peer_idle MUST be self-describing — adopters without conductor-
+        # grade dispatch-state binding (treasurer, x-claude, external
+        # users) need task_id as a structured field, not buried in body
+        # text where it has to be regex-extracted. Also surface
+        # task_description / supervisor / started_at + last_outcome
+        # details so the supervisor can update their plan-graph status
+        # directly from the wire without re-querying current_task (which
+        # is about to be cleared).
+        observed_outcome_struct = None
+        try:
+            lo = r.get(state_key(node_id, "last_outcome"))
+            if lo:
+                observed_outcome_struct = json.loads(lo)
+        except Exception:
+            observed_outcome_struct = None
 
         dedup_suffix = observed_task_id or "no-task"
         dedup = f"taey:peer-idle-notified:{node_id}:{dedup_suffix}"
@@ -323,15 +343,35 @@ def _notify_supervisor_of_stop(r, node_id: str, supervisor: str) -> None:
             body = f"{node_id} stopped — no current task recorded"
             priority = "low"
 
-        msg = json.dumps({
+        msg_obj = {
             "from": node_id,
             "type": "peer_idle",
             "body": body,
-            "outcome": outcome,
+            "outcome": outcome,  # enum: done|error|interrupted|unknown
             "priority": priority,
             "msg_id": f"peer-idle-{node_id}-{dedup_suffix}-{int(time.time())}",
             "timestamp": time.time(),
-        })
+            # Self-describing fields (v0.2.3+, Gaia TIER-1 fix):
+            "task_id": observed_task_id,
+            "task_description": (observed_task.get("description") if observed_task else None),
+            "task_supervisor": (observed_task.get("supervisor") if observed_task else None),
+            "task_started_at": (observed_task.get("started_at") if observed_task else None),
+            "outcome_details": (observed_outcome_struct.get("details") if observed_outcome_struct else None),
+        }
+        # If the task carried a state_file pointer, thread its current
+        # SHA so the supervisor can verify the state file hasn't drifted
+        # from what the worker last wrote (companion to orch-cron's
+        # hash-on-fire sidecar from Phase C).
+        if observed_task and observed_task.get("state_file"):
+            state_file = observed_task["state_file"]
+            msg_obj["state_file"] = state_file
+            try:
+                with open(state_file + ".meta.json") as _mf:
+                    msg_obj["state_file_sha"] = json.load(_mf).get("last_fire_log_hash")
+            except Exception:
+                pass
+
+        msg = json.dumps(msg_obj)
         r.lpush(inbox_key(supervisor), msg)
         r.set(dedup, "1", ex=60)
 

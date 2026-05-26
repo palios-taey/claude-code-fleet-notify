@@ -5,11 +5,24 @@
 > *Real cross-instance notification + ack flow between two live Claude Code sessions. See `demo/README.md` for the recording setup.*
 
 
-Autonomous wake notifications for unattended REPL-CLI fleets — Claude Code, OpenAI codex, Google gemini, xAI grok, and any other tmux-driven REPL with a hook API.
+Turn scattered AI terminals into a supervised tmux fleet: dispatch work to Claude Code, Codex, Gemini, Grok, or any **hookable** REPL CLI, then get `done`/`error`/`interrupted` outcomes back inline so the supervisor can update the plan instead of babysitting panes.
 
-Current version: v0.2.2
+Current version: v0.2.3
 
-`claude-code-fleet-notify` gives each CLI tmux session a Redis inbox, four lifecycle hooks, and one local daemon. Active sessions receive full messages through hook `additionalContext`; stopped sessions are woken by a tmux-injected pointer prompt, while full message bodies remain in Redis.
+`claude-code-fleet-notify` gives each terminal-native, hookable CLI session a Redis inbox, four lifecycle hooks, and one local daemon. Active sessions receive full messages through hook `additionalContext`; stopped sessions are woken by a tmux-injected pointer prompt, while full message bodies remain in Redis.
+
+## Scope (what this is and what this isn't)
+
+In scope:
+- **Terminal-native REPL CLIs that expose hook events**: Claude Code, OpenAI codex, Google gemini (field-verified), xAI grok (via Claude Code config inheritance, field-verified).
+- Single-machine tmux fleets where the daemon, hooks, and supervisor sessions share one Redis.
+
+Out of scope (will fail silently or partially — adopters: don't):
+- **IDE-embedded agents** (Cursor, Continue, GitHub Copilot Workspace, etc.) — extension-host IPC sits below the tmux/process boundary our hooks observe, so critical task state transitions are missed.
+- **Many-to-many distributed graph topologies** — the supervisor↔worker abstraction here is point-to-point with optional multi-level via explicit `parent` override. Fanout/aggregate workflows need a different layer.
+- **Non-hookable REPLs** — if a CLI has no equivalent of Stop / UserPromptSubmit / Pre+PostToolUse (or comparable lifecycle events), the universal Stop+notify primitive has nothing to attach to and the daemon's pointer injection won't have a UserPromptSubmit hook on the receiving side to drain the inbox.
+
+> **Integration verification status**: Claude Code (field-verified, the original target). xAI grok (field-verified, `grok inspect` shows the 4 inherited hooks). OpenAI codex (integration-tested via the per-CLI hook variants; field-verified on the Mira fleet via per-parent peers). Google gemini (integration-tested via the per-CLI hook variants; field-verified via the same per-parent peers, with the known BeforeTool/AfterTool event-name mapping).
 
 ## Supported CLIs
 
