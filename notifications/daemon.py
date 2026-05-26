@@ -136,6 +136,66 @@ def build_pointer_summary(r, node_id: str) -> str | None:
     )
 
 
+def build_grok_full_body(r, node_id: str) -> str | None:
+    """Build the full-body injection text for grok-cli targets.
+
+    Why grok is special (validated 2026-05-26 by x-claude + treasurer
+    independently with 3-fact chains): grok-cli's prompt-time hook
+    inheritance (via ~/.claude/settings.json) DOES fire prompt_activity.py
+    + DOES drain the Redis inbox, BUT grok-cli does NOT honor the
+    ``additionalContext`` field from the hook's JSON return value the way
+    Claude Code does. Net: the drained message bodies never reach grok's
+    LLM context; grok only sees the pointer text injected by tmux-send.
+
+    Workaround: for grok-named targets, the daemon injects the FULL
+    message bodies via tmux-send instead of the pointer. Grok then sees
+    the actual content as its user prompt. The hook still drains the
+    inbox on grok's submit (idempotent — bodies were already delivered
+    inline). The Ctrl-U+Ctrl-K pre-clear in tmux-send v1.0.1 prevents
+    accumulation if the daemon polls before grok submits.
+
+    Returns the concatenated bodies (each prefixed with its from + type)
+    or None if there's nothing to deliver. Caps total size at ~6KB to
+    avoid pathological tmux injections; truncated bodies get a clear
+    ``[... truncated, read full at <key>]`` suffix pointing at Redis.
+    """
+    inbox = inbox_key(node_id)
+    notif_key = notifications_key(node_id)
+
+    # Peek tail-first (oldest first) — same convention as build_pointer_summary.
+    raw_msgs = list(reversed(r.lrange(inbox, -10, -1)))
+    raw_msgs.extend(r.lrange(notif_key, 0, 9))
+    if not raw_msgs:
+        return None
+
+    blocks = []
+    total_bytes = 0
+    MAX_BYTES = 6000
+
+    for raw in raw_msgs:
+        try:
+            msg = json.loads(raw)
+        except Exception:
+            continue
+        sender = msg.get('from', msg.get('platform', 'unknown'))
+        mtype = msg.get('type', msg.get('status', 'message')).upper()
+        body = msg.get('body', '')
+        if not body:
+            continue
+        block = f"[{mtype} from {sender}]:\n{body}"
+        if total_bytes + len(block) > MAX_BYTES:
+            block = (block[: MAX_BYTES - total_bytes - 80].rstrip()
+                     + f"\n[... message truncated; read full at redis key {inbox}]")
+            blocks.append(block)
+            break
+        blocks.append(block)
+        total_bytes += len(block)
+
+    if not blocks:
+        return None
+    return "\n\n".join(blocks)
+
+
 def run_daemon(
     redis_host: str,
     redis_port: int = 6379,
@@ -178,9 +238,22 @@ def run_daemon(
                 if not has_pending_messages(r, node_id):
                     continue
 
-                # POINTER ONLY — peek inbox, build summary, inject summary into tmux.
-                # Full message bodies stay in Redis. Recipient reads with hook on next tool call.
-                summary = build_pointer_summary(r, node_id)
+                # Grok-cli does NOT honor additionalContext from prompt hooks
+                # the way Claude Code / codex / gemini do. For *-grok targets
+                # we inject FULL message bodies via tmux instead of the
+                # pointer; for everyone else we keep the pointer pattern.
+                # Inbox still drains via the hook on grok's submit
+                # (idempotent — bodies already delivered inline).
+                # Verified 2026-05-26 by x-claude + treasurer independently
+                # with 3-fact chains showing the pointer pattern silently
+                # dropped grok's dispatched bodies.
+                if node_id.endswith("-grok"):
+                    summary = build_grok_full_body(r, node_id)
+                else:
+                    # POINTER ONLY — peek inbox, build summary, inject into tmux.
+                    # Full bodies stay in Redis; recipient reads via hook on
+                    # next tool call / prompt submit.
+                    summary = build_pointer_summary(r, node_id)
                 if not summary:
                     continue
 

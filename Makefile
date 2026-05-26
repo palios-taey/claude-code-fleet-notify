@@ -8,11 +8,15 @@ install:
 	@install -m 755 scripts/taey-notify "$(PREFIX)/bin/taey-notify"
 	@ln -sf "$(PREFIX)/bin/taey-notify" "$(PREFIX)/bin/cc-fleet-notify"
 	@install -m 755 scripts/taey-ack "$(PREFIX)/bin/taey-ack"
+	@install -m 755 scripts/tmux-send "$(PREFIX)/bin/tmux-send"
+	@install -m 755 scripts/start_notify_daemons.sh "$(PREFIX)/bin/start_notify_daemons.sh"
 	@echo "Done. Run 'taey-notify --help' and 'taey-ack --help' to verify."
 
 uninstall:
 	@echo "Removing claude-code-fleet-notify CLIs from $(PREFIX)/bin..."
-	@rm -f "$(PREFIX)/bin/taey-notify" "$(PREFIX)/bin/cc-fleet-notify" "$(PREFIX)/bin/taey-ack"
+	@rm -f "$(PREFIX)/bin/taey-notify" "$(PREFIX)/bin/cc-fleet-notify" \
+	       "$(PREFIX)/bin/taey-ack" "$(PREFIX)/bin/tmux-send" \
+	       "$(PREFIX)/bin/start_notify_daemons.sh"
 	@echo "Done."
 
 hooks-diff:
