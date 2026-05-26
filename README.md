@@ -1,5 +1,10 @@
 # claude-code-fleet-notify
 
+![demo](demo/demo.gif)
+
+> *Real cross-instance notification + ack flow between two live Claude Code sessions. See `demo/README.md` for the recording setup.*
+
+
 Autonomous wake notifications for unattended Claude Code fleets.
 
 Current version: v0.1.0
