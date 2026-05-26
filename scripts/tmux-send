@@ -1,16 +1,33 @@
 #!/bin/bash
-# tmux-send: Send text + submit to a Claude Code tmux session.
+# tmux-send: Send text + submit to a hookable REPL CLI tmux session.
 # Usage: tmux-send <host> <session> "message text"
 #        tmux-send <session> <message>  (local shorthand)
 #
-# Claude Code uses Ink TUI with Kitty keyboard protocol.
-# Enter = ESC[13u (CSI u), not legacy 0x0D (carriage return).
-# tmux send-keys "Enter" sends 0x0D which may not trigger submit.
+# Per-CLI submit strategy (auto-detected from session-name suffix):
 #
-# Submit strategy (3 tiers, all fired in sequence for reliability):
-#   1. Escape       — dismiss autocomplete overlay
-#   2. Enter        — legacy 0x0D (works when autocomplete is gone)
-#   3. CSI u hex    — ESC[13u via send-keys -H (Kitty protocol Enter)
+# Claude Code / codex (Ink TUI with Kitty keyboard protocol):
+#   Enter = ESC[13u (CSI u), not legacy 0x0D. Sequence:
+#     1. Ctrl-U + Ctrl-K     — clear any prior content in the input box
+#     2. Type message
+#     3. Escape              — dismiss autocomplete overlay (safe here)
+#     4. legacy Enter        — 0x0D (works when autocomplete is gone)
+#     5. CSI u Enter         — ESC[13u via send-keys -H (Kitty)
+#
+# Grok-Build (modal TUI — "Enter:send" vs "→:expand" modes):
+#   CRITICAL: do NOT send Escape — it toggles modes mid-sequence and
+#   breaks submit. Also do NOT send CSI u Enter — in input-ready mode
+#   it toggles to viewing-thinking mode instead of submitting. Sequence:
+#     1. Ctrl-U + Ctrl-K     — clear any prior content (prevents
+#                              accumulating injections on re-poll if
+#                              prior submit didn't land)
+#     2. Type message
+#     3. legacy Enter        — plain 0x0D submits when grok is in
+#                              input-ready mode (hint line shows
+#                              "Enter:send"). Verified live 2026-05-26.
+#
+# Detection: session-name suffix. Anything ending in -grok uses the
+# grok sequence; everything else uses the Claude Code / codex sequence.
+# Override via SEND_SEQUENCE env: SEND_SEQUENCE=grok or =claude.
 #
 # See: github.com/anthropics/claude-code/issues/15553
 
@@ -31,33 +48,70 @@ else
     exit 1
 fi
 
-B64=$(printf '%s' "$MSG" | base64 -w0)
+# Detect per-CLI submit sequence.
+detect_sequence() {
+    local sess="$1"
+    if [ -n "${SEND_SEQUENCE:-}" ]; then
+        echo "$SEND_SEQUENCE"
+        return
+    fi
+    case "$sess" in
+        *-grok) echo "grok" ;;
+        *)      echo "claude" ;;
+    esac
+}
+
+SEQ=$(detect_sequence "$SESSION")
 
 # Local send
 if [ "$HOST" = "local" ] || [ "$HOST" = "localhost" ] || [ "$HOST" = "$(hostname -s)" ]; then
+    # Pre-clear the input box for both sequences. Without this, a re-poll
+    # injection on a stuck session accumulates text (verified live
+    # 2026-05-26: x-claude-grok had three concatenated NOTIFY messages
+    # because the daemon kept re-injecting without clearing).
+    tmux send-keys -t "$SESSION" C-u C-k
+    sleep 0.1
+
     tmux send-keys -t "$SESSION" -- "$MSG"
     sleep 0.5
-    tmux send-keys -t "$SESSION" Escape
-    sleep 0.2
-    tmux send-keys -t "$SESSION" Enter
-    sleep 0.1
-    tmux send-keys -t "$SESSION" -H 1b 5b 31 33 75
-    echo "OK: $SESSION (local)"
+
+    if [ "$SEQ" = "grok" ]; then
+        # Grok modal TUI: plain Enter only. Escape + CSI u Enter both
+        # toggle modes here, breaking submit.
+        tmux send-keys -t "$SESSION" Enter
+    else
+        # Claude Code / codex (Ink TUI / Kitty protocol).
+        tmux send-keys -t "$SESSION" Escape
+        sleep 0.2
+        tmux send-keys -t "$SESSION" Enter
+        sleep 0.1
+        tmux send-keys -t "$SESSION" -H 1b 5b 31 33 75
+    fi
+    echo "OK: $SESSION (local, sequence=$SEQ)"
     exit 0
 fi
 
-# Remote send via SSH
+# Remote send via SSH — same per-CLI logic.
+B64=$(printf '%s' "$MSG" | base64 -w0)
 ssh "$HOST" "
 SESSION='${SESSION}'
+SEQ='${SEQ}'
 MSG=\$(printf '%s' '${B64}' | base64 -d)
 
+tmux send-keys -t \"\$SESSION\" C-u C-k
+sleep 0.1
 tmux send-keys -t \"\$SESSION\" -- \"\$MSG\"
 sleep 0.5
-tmux send-keys -t \"\$SESSION\" Escape
-sleep 0.2
-tmux send-keys -t \"\$SESSION\" Enter
-sleep 0.1
-tmux send-keys -t \"\$SESSION\" -H 1b 5b 31 33 75
+
+if [ \"\$SEQ\" = 'grok' ]; then
+    tmux send-keys -t \"\$SESSION\" Enter
+else
+    tmux send-keys -t \"\$SESSION\" Escape
+    sleep 0.2
+    tmux send-keys -t \"\$SESSION\" Enter
+    sleep 0.1
+    tmux send-keys -t \"\$SESSION\" -H 1b 5b 31 33 75
+fi
 "
 
-echo "OK: $SESSION"
+echo "OK: $SESSION (sequence=$SEQ)"
