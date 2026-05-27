@@ -25,10 +25,10 @@ done
 sleep 1
 
 # Pre-create both tmux sessions detached
-tmux new-session -d -s demo-alpha -x 80 -y 40 -c /path/to/repo
+tmux new-session -d -s demo-alpha -x 80 -y 40 -c "${DEMO_CWD:-$HOME}"
 tmux send-keys -t demo-alpha "claude --dangerously-skip-permissions" Enter
 
-tmux new-session -d -s demo-beta -x 80 -y 40 -c /path/to/repo
+tmux new-session -d -s demo-beta -x 80 -y 40 -c "${DEMO_CWD:-$HOME}"
 tmux send-keys -t demo-beta "claude --dangerously-skip-permissions" Enter
 
 echo "demo sessions created; waiting 16s for claude startups..."
