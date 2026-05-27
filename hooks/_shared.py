@@ -25,6 +25,8 @@ import os
 import sys
 import time
 import traceback
+import urllib.error
+import urllib.request
 from typing import Optional
 
 # ---- env + path setup ----
@@ -171,6 +173,22 @@ def _resolve_supervisor(r, node_id: str) -> Optional[str]:
 
 
 _VALID_OUTCOMES = ("done", "error", "interrupted", "unknown")
+
+
+def _resolve_blocked_on(task_id: Optional[str]) -> Optional[str]:
+    """Return the OrchTask.blocked_on value for ``task_id``, if any."""
+    if not task_id:
+        return None
+    url = f"http://127.0.0.1:5002/api/tasks/{task_id}"
+    try:
+        with urllib.request.urlopen(url, timeout=5) as resp:
+            payload = json.load(resp)
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
+        return None
+    blocked_on = payload.get("blocked_on")
+    if blocked_on in (None, "", "null"):
+        return None
+    return str(blocked_on)
 
 
 def _current_task_summary(r, node_id: str):
@@ -334,6 +352,13 @@ def _notify_supervisor_of_stop(r, node_id: str, supervisor: str) -> None:
         dedup_suffix = observed_task_id or "no-task"
         dedup = f"taey:peer-idle-notified:{node_id}:{dedup_suffix}"
         if r.exists(dedup):
+            return
+
+        blocked_on = _resolve_blocked_on(observed_task_id)
+        if blocked_on:
+            msg = f"suppressed PEER_IDLE for {node_id}: blocked_on={blocked_on}"
+            print(msg, file=sys.stderr)
+            log_debug(node_id, msg)
             return
 
         if summary:
