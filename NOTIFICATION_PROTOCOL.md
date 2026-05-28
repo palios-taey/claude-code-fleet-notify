@@ -22,6 +22,24 @@ Targets are arbitrary strings. There is no allowlist. A practical fleet might us
 - **tmux-session participants** are REPL-CLI sessions with the four hooks installed. Supported CLIs: Claude Code, OpenAI codex, Google gemini, and xAI grok (see "Per-CLI hook integration" below for config-file paths and event-name mappings). The daemon injects a pointer prompt through tmux only when the session is stopped and marked idle.
 - **headless participants** read Redis directly. They do not use hooks, tmux injection, `idle`, or `tool_running` state. They poll `${NOTIFY_KEY_PREFIX:-taey}:<name>:inbox` and reply with `taey-notify <target> --from <name>`.
 
+## Dual delivery path — the canonical dispatch pattern for tmux participants
+
+For every tmux-session participant (Claude Code / codex / gemini / grok), notifications reach the session through ONE of two paths depending on the session's current state. No subprocess invocation, no fallback paths; these two paths cover the full state space.
+
+**Path A — Active (session is making tool calls)**:
+- Notifications are delivered as `hookSpecificOutput.additionalContext` via the PostToolUse hook (`hooks/check_notifications.py`).
+- The session sees the notification body in its next prompt context without any tmux involvement.
+- This is the **injection-during-tool-use** path. Used while `idle != 1`.
+
+**Path B — Idle (session has stopped, `idle=1` set by Stop hook)**:
+- The notification daemon (`notifications/daemon.py`) polls Redis, detects pending notifications for an idle session, and uses `scripts/tmux-send` to inject a pointer prompt into the session's tmux pane.
+- The session sees the pointer (e.g., "[NOTIFY] You have N messages...") and acts on it.
+- This is the **tmux-when-idle** path. Used only while `idle == 1`. The daemon does NOT clear idle (only the UserPromptSubmit hook does, after the human or pointer prompt is submitted).
+
+**This pair is the official + canonical pattern** for dispatching work to any tmux-session CLI peer in the fleet. The earlier "subprocess invocation" pattern (e.g., calling `codex exec` / `gemini -p` directly from a parent session) was considered + dropped in `the-conductor/plans/execution_tracker_v1.md:8` (May 2026) — replaced by full peer integration with hooks. No fallback paths exist; per Jesse 2026-05-28: "There are no fallback paths. The central notification system needs to work with injections during tool use when active and tmux if not."
+
+If a tmux peer cannot be reached via this dual path (e.g., the tmux session itself is dead), the right response is to respawn the session via `peer-respawn.sh`, NOT to fall back to a subprocess invocation.
+
 ## Per-CLI hook integration
 
 All four supported CLIs run the same Redis state machine (`idle` / `tool_running` / `last_activity` / `inbox` / `notifications`). The per-CLI hook variants in `hooks/` are thin wrappers that adapt to each CLI's distinct (a) config file location + format, (b) event-name vocabulary, (c) stdin/stdout envelope shape. All four call into the shared `hooks/_shared.py` helper which is the single source of truth for `action_pre_tool` / `action_post_tool` / `action_stop` / `action_user_prompt`.
