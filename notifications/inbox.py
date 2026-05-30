@@ -284,6 +284,8 @@ def format_message(msg: Dict[str, Any]) -> str:
             lines.append(f"  title: {msg['task_title_short']}")
         if msg.get("priority") is not None:
             lines.append(f"  priority: {msg['priority']}")
+        if msg.get("task_priority") is not None:
+            lines.append(f"  task_priority: {msg['task_priority']}")
         if msg.get("available_conditions"):
             labels = ", ".join(
                 f"{cond.get('label')} [{cond.get('condition_id')} v{cond.get('version')}]"

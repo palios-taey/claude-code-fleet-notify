@@ -4,26 +4,85 @@ from __future__ import annotations
 import http.server
 import json
 import os
+import socket
 import socketserver
 import subprocess
 import sys
-import tempfile
 import threading
+import time
+import urllib.error
+import urllib.request
+import uuid
 from pathlib import Path
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
+ORCH_ROOT = Path("/path/to/repo")
+os.environ["ORCH_NEO4J_URI"] = os.environ.get("STAGE_A_TEST_NEO4J_URI", "bolt://127.0.0.1:7691")
+os.environ.setdefault("ORCH_REDIS_HOST", "127.0.0.1")
+os.environ.setdefault("ORCH_REDIS_PORT", "6379")
+os.environ.pop("ORCH_NEO4J_USER", None)
+os.environ.pop("ORCH_NEO4J_PASS", None)
 sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ORCH_ROOT))
 
 from hooks import _shared as shared  # noqa: E402
+import lib.config as orch_config_module  # noqa: E402
+from lib.config import OrchConfig, get_neo4j_driver  # noqa: E402
+from lib.orch_schema import create_phase, create_project, create_task  # noqa: E402
 from notifications.inbox import state_key  # noqa: E402
 from tests.fakes import FakeRedis  # noqa: E402
+
+REAL_CFG = OrchConfig()
+REAL_CFG.neo4j_db = "neo4j"
 
 
 def record(lines: list[str], label: str, ok: bool, evidence: str) -> None:
     line = f"{'PASS' if ok else 'FAIL'} {label} {evidence}"
     lines.append(line)
     print(line, flush=True)
+
+
+def _reset_orch_driver() -> None:
+    driver = getattr(orch_config_module, "_neo4j_driver", None)
+    if driver is not None:
+        try:
+            driver.close()
+        except Exception:
+            pass
+    orch_config_module._neo4j_driver = None
+
+
+def _cleanup_real_graph(prefix: str) -> None:
+    _reset_orch_driver()
+    driver = get_neo4j_driver(REAL_CFG)
+    with driver.session(database=REAL_CFG.neo4j_db) as session:
+        session.run("MATCH (t:OrchTask) WHERE t.id STARTS WITH $prefix DETACH DELETE t", prefix=prefix)
+        session.run("MATCH (ph:OrchPhase) WHERE ph.id STARTS WITH $prefix DETACH DELETE ph", prefix=prefix)
+        session.run("MATCH (p:OrchProject) WHERE p.id STARTS WITH $prefix DETACH DELETE p", prefix=prefix)
+
+
+def _find_free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+def _wait_for_http(url: str, timeout: float = 10.0) -> None:
+    deadline = time.time() + timeout
+    last_error = None
+    while time.time() < deadline:
+        try:
+            with urllib.request.urlopen(url, timeout=1):
+                return
+        except urllib.error.HTTPError as exc:
+            if exc.code in {200, 404}:
+                return
+            last_error = exc
+        except Exception as exc:
+            last_error = exc
+        time.sleep(0.1)
+    raise RuntimeError(f"server did not become ready: {last_error}")
 
 
 def test_allow_stop() -> tuple[bool, str]:
@@ -89,6 +148,21 @@ def test_pause_allows_stop() -> tuple[bool, str]:
     return ok, f"wake_type={decision.wake_type}"
 
 
+def test_blocked_on_done_clear() -> tuple[bool, str]:
+    r = FakeRedis()
+    r.set(state_key("worker-codex", "current_task"), json.dumps({"task_id": "task-done", "description": "Done but blocked"}))
+    r.set(state_key("worker-codex", "last_outcome"), json.dumps({"outcome": "done", "details": ""}))
+    with mock.patch.object(shared, "_resolve_supervisor", return_value="conductor"), \
+         mock.patch.object(shared, "_resolve_blocked_on", return_value="peer-response:done"):
+        shared._notify_supervisor_of_stop(r, "worker-codex", "conductor")
+    cleared = r.get(state_key("worker-codex", "current_task")) is None
+    marker_key = state_key("worker-codex", "last_clear_was_done")
+    marker_present = r.get(marker_key) == "1"
+    marker_ttl = r.expiry.get(marker_key)
+    ok = cleared and marker_present and marker_ttl == 30
+    return ok, f"current_task_cleared={cleared} marker_present={marker_present} marker_ttl={marker_ttl}"
+
+
 def test_blocked_on_regression() -> tuple[bool, str]:
     r = FakeRedis()
     r.set(state_key("worker-codex", "current_task"), json.dumps({"task_id": "task-peer", "description": "Waiting on peer"}))
@@ -98,6 +172,74 @@ def test_blocked_on_regression() -> tuple[bool, str]:
         shared._notify_supervisor_of_stop(r, "worker-codex", "conductor")
     ok = r.llen("taey:conductor:inbox") == 0
     return ok, f"inbox_len={r.llen('taey:conductor:inbox')}"
+
+
+def test_real_backend_wake_with_queue() -> tuple[bool, str]:
+    prefix = f"stage-b-real-{uuid.uuid4().hex[:8]}"
+    supervisor = f"{prefix}-supervisor"
+    project_id = prefix
+    phase_id = f"{prefix}-phase"
+    task_id = f"{prefix}-task"
+    port = _find_free_port()
+    api_base = f"http://127.0.0.1:{port}"
+    env = os.environ.copy()
+    env.update({
+        "ORCH_NEO4J_URI": os.environ["ORCH_NEO4J_URI"],
+        "ORCH_REDIS_HOST": os.environ["ORCH_REDIS_HOST"],
+        "ORCH_REDIS_PORT": os.environ["ORCH_REDIS_PORT"],
+    })
+    proc = None
+    old_api_base = shared._ORCH_API_BASE
+    try:
+        _cleanup_real_graph(prefix)
+        create_project(
+            project_id=project_id,
+            name="Stage B real wake project",
+            supervisor=supervisor,
+            priority=3,
+            config=REAL_CFG,
+        )
+        create_phase(project_id, phase_id, "Main", config=REAL_CFG)
+        create_task(
+            phase_id,
+            task_id,
+            "Real ready task",
+            priority=17,
+            owner=supervisor,
+            created_by="stage-b-real-test",
+            wake_owner_if_ready=False,
+            config=REAL_CFG,
+        )
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "uvicorn", "lib.tasks_api:app", "--host", "127.0.0.1", "--port", str(port)],
+            cwd=ORCH_ROOT,
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        _wait_for_http(f"{api_base}/api/projects/{project_id}")
+        shared._ORCH_API_BASE = api_base
+        decision = shared._evaluate_stop_discipline(FakeRedis(), supervisor, task_id)
+        ok = (
+            decision.wake_type == shared.WAKE_WITH_QUEUE
+            and decision.task_id == task_id
+            and decision.project_id == project_id
+            and decision.task_priority == 17
+        )
+        return ok, (
+            f"wake_type={decision.wake_type} task_id={decision.task_id} "
+            f"project_id={decision.project_id} task_priority={decision.task_priority}"
+        )
+    finally:
+        shared._ORCH_API_BASE = old_api_base
+        if proc is not None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5)
+        _cleanup_real_graph(prefix)
 
 
 def test_engine_error_buglock() -> tuple[bool, str]:
@@ -204,7 +346,9 @@ def main() -> int:
         ("wake_with_queue", test_wake_with_queue),
         ("wake_reason_required", test_wake_reason_required),
         ("pause_allows_stop", test_pause_allows_stop),
+        ("blocked_on_done_clear", test_blocked_on_done_clear),
         ("blocked_on_regression", test_blocked_on_regression),
+        ("real_backend_wake_with_queue", test_real_backend_wake_with_queue),
         ("engine_error_buglock", test_engine_error_buglock),
         ("heartbeat_expiry", test_heartbeat_expiry),
         ("cli_prefix_match", test_cli_prefix_match),

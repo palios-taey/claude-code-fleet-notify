@@ -80,7 +80,7 @@ class FakeRedis:
         if task.get("task_id") != observed_task_id:
             return 0
         self.delete(current_task_key, last_outcome_key)
-        self.set(marker_key, "1")
+        self.set(marker_key, "1", ex=30)
         return 1
 
     def decoded_list(self, key):

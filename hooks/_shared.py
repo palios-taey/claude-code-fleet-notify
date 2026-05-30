@@ -54,15 +54,17 @@ _ORCH_REPO_ROOT = os.environ.get("ORCH_REPO_ROOT", "/path/to/repo")
 if _ORCH_REPO_ROOT not in sys.path:
     sys.path.insert(0, _ORCH_REPO_ROOT)
 
+from notifications.inbox import (
+    WAKE_ALLOW_STOP,
+    WAKE_ENGINE_ERROR,
+    WAKE_REASON_REQUIRED,
+    WAKE_WITH_QUEUE,
+)
+
 _ORCH_API_BASE = os.environ.get("ORCH_API_BASE", "http://127.0.0.1:5002")
 _ENGINE_ERROR_WINDOW_SECS = 60
 _ENGINE_ERROR_THRESHOLD = 3
 _DEFAULT_HEARTBEAT_SECS = 300
-
-WAKE_ALLOW_STOP = "ALLOW_STOP"
-WAKE_WITH_QUEUE = "WAKE_WITH_QUEUE"
-WAKE_REASON_REQUIRED = "WAKE_REASON_REQUIRED"
-WAKE_ENGINE_ERROR = "ENGINE_ERROR"
 
 
 @dataclasses.dataclass
@@ -73,7 +75,7 @@ class StopDecision:
     phase_id: Optional[str] = None
     task_id: Optional[str] = None
     task_title_short: Optional[str] = None
-    priority: Optional[int] = None
+    task_priority: Optional[int] = None
     resume_context_pointer: Optional[str] = None
     available_conditions: Optional[list[dict[str, Any]]] = None
     next_action: Optional[str] = None
@@ -266,7 +268,10 @@ def _evaluate_stop_discipline(r, node_id: str, observed_task_id: Optional[str]) 
             return StopDecision(wake_type=WAKE_ALLOW_STOP, body="paused_by_user")
 
         audit_events = _expire_stale_in_progress_projects(r, supervisor)
-        projects = _get_session_supervised_projects(supervisor)
+        projects = sorted(
+            _get_session_supervised_projects(supervisor),
+            key=lambda project: project.get("priority") if project.get("priority") is not None else 999999999,
+        )
         for project in projects:
             status = str(project.get("status") or "active")
             project_id = str(project.get("id"))
@@ -291,7 +296,7 @@ def _evaluate_stop_discipline(r, node_id: str, observed_task_id: Optional[str]) 
                     phase_id=next_ready.get("phase_id"),
                     task_id=task_id,
                     task_title_short=task_title,
-                    priority=next_ready.get("priority"),
+                    task_priority=next_ready.get("priority"),
                     resume_context_pointer=f"/api/tasks/{task_id}" if task_id else None,
                     next_action=f"Pick up {task_id} via taey-queue next or inspect {_ORCH_API_BASE}/api/tasks/{task_id}",
                     body="ready work available",
@@ -663,6 +668,7 @@ def _notify_supervisor_of_stop(r, node_id: str, supervisor: str) -> None:
             "project_id": decision.project_id,
             "phase_id": decision.phase_id,
             "task_id": decision.task_id,
+            "task_priority": decision.task_priority,
             "stopped_task_id": observed_task_id,
             "task_title_short": decision.task_title_short,
             "resume_context_pointer": decision.resume_context_pointer,
