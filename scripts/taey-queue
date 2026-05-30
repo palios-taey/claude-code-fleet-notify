@@ -1,0 +1,18 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+
+from _stage_b_api import api_call, current_session, print_json
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--session", default=None)
+    args = parser.parse_args()
+    session = args.session or current_session()
+    print_json(api_call("GET", f"/api/sessions/{session}/next-ready"))
+
+
+if __name__ == "__main__":
+    main()
