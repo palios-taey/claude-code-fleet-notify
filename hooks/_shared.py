@@ -203,9 +203,12 @@ def _expire_stale_in_progress_projects(r, supervisor: str) -> list[str]:
 
 
 def _session_pause_active(r, supervisor: str) -> bool:
+    from notifications.inbox import state_key
+
     try:
         return bool(r.exists(state_key(supervisor, "pause")))
-    except Exception:
+    except Exception as exc:
+        log_debug(supervisor, f"pause check error: {exc}")
         return False
 
 
