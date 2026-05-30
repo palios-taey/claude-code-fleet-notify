@@ -75,6 +75,20 @@ def test_wake_reason_required() -> tuple[bool, str]:
     return ok, f"wake_type={decision.wake_type} available={len(decision.available_conditions or [])}"
 
 
+def test_pause_allows_stop() -> tuple[bool, str]:
+    r = FakeRedis()
+    r.set(state_key("conductor", "pause"), "1")
+    with mock.patch.object(shared, "_resolve_supervisor", return_value="conductor"), \
+         mock.patch.object(shared, "_resolve_blocked_on", return_value=None), \
+         mock.patch.object(shared, "_expire_stale_in_progress_projects", return_value=[]), \
+         mock.patch.object(shared, "_get_session_supervised_projects", return_value=[
+             {"id": "proj-paused", "status": "active", "user_stop_conditions": [], "stop_reason_current": None, "stop_reason_orphaned": False},
+         ]):
+        decision = shared._evaluate_stop_discipline(r, "worker-codex", None)
+    ok = decision.wake_type == shared.WAKE_ALLOW_STOP
+    return ok, f"wake_type={decision.wake_type}"
+
+
 def test_blocked_on_regression() -> tuple[bool, str]:
     r = FakeRedis()
     r.set(state_key("worker-codex", "current_task"), json.dumps({"task_id": "task-peer", "description": "Waiting on peer"}))
@@ -189,6 +203,7 @@ def main() -> int:
         ("allow_stop", test_allow_stop),
         ("wake_with_queue", test_wake_with_queue),
         ("wake_reason_required", test_wake_reason_required),
+        ("pause_allows_stop", test_pause_allows_stop),
         ("blocked_on_regression", test_blocked_on_regression),
         ("engine_error_buglock", test_engine_error_buglock),
         ("heartbeat_expiry", test_heartbeat_expiry),
