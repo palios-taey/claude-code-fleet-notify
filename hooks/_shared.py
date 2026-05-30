@@ -20,14 +20,17 @@ scripts wrap them in the right envelope.
 from __future__ import annotations
 
 import datetime
+import dataclasses
+import importlib
 import json
 import os
+import subprocess
 import sys
 import time
 import traceback
 import urllib.error
 import urllib.request
-from typing import Optional
+from typing import Any, Optional
 
 # ---- env + path setup ----
 
@@ -47,6 +50,36 @@ if os.path.isfile(_env_path):
                 _key = _key.replace("export ", "").strip()
                 os.environ.setdefault(_key, _val.strip())
 
+_ORCH_REPO_ROOT = os.environ.get("ORCH_REPO_ROOT", "/path/to/repo")
+if _ORCH_REPO_ROOT not in sys.path:
+    sys.path.insert(0, _ORCH_REPO_ROOT)
+
+_ORCH_API_BASE = os.environ.get("ORCH_API_BASE", "http://127.0.0.1:5002")
+_ENGINE_ERROR_WINDOW_SECS = 60
+_ENGINE_ERROR_THRESHOLD = 3
+_DEFAULT_HEARTBEAT_SECS = 300
+
+WAKE_ALLOW_STOP = "ALLOW_STOP"
+WAKE_WITH_QUEUE = "WAKE_WITH_QUEUE"
+WAKE_REASON_REQUIRED = "WAKE_REASON_REQUIRED"
+WAKE_ENGINE_ERROR = "ENGINE_ERROR"
+
+
+@dataclasses.dataclass
+class StopDecision:
+    wake_type: str
+    body: str = ""
+    project_id: Optional[str] = None
+    phase_id: Optional[str] = None
+    task_id: Optional[str] = None
+    task_title_short: Optional[str] = None
+    priority: Optional[int] = None
+    resume_context_pointer: Optional[str] = None
+    available_conditions: Optional[list[dict[str, Any]]] = None
+    next_action: Optional[str] = None
+    error_key: Optional[str] = None
+    audit_events: list[str] = dataclasses.field(default_factory=list)
+
 
 def log_path_for(node_id: str) -> str:
     """Per-node hook log file."""
@@ -59,6 +92,240 @@ def log_debug(node_id: str, msg: str) -> None:
             f.write(f"[{datetime.datetime.now().isoformat()}] {msg}\n")
     except Exception:
         pass
+
+
+def _api_json(path: str, method: str = "GET", payload: Optional[dict] = None, timeout: int = 5) -> dict:
+    data = None if payload is None else json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        f"{_ORCH_API_BASE}{path}",
+        data=data,
+        method=method,
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.load(resp)
+
+
+def _redis_get_many(r, keys: list[str]) -> list[Optional[str]]:
+    if hasattr(r, "mget"):
+        return list(r.mget(keys))
+    return [r.get(key) for key in keys]
+
+
+def _load_orch_modules():
+    orch_schema = importlib.import_module("lib.orch_schema")
+    orch_config = importlib.import_module("lib.config")
+    return orch_schema, orch_config
+
+
+def _get_session_supervised_projects(session_id: str) -> list[dict]:
+    orch_schema, _ = _load_orch_modules()
+    return orch_schema.get_session_supervised_projects(session_id)
+
+
+def _get_session_next_ready(session_id: str, project_id: Optional[str] = None) -> Optional[dict]:
+    orch_schema, _ = _load_orch_modules()
+    return orch_schema.get_session_next_ready(session_id, project_id=project_id)
+
+
+def _active_conditions(project: dict) -> list[dict]:
+    return [cond for cond in list(project.get("user_stop_conditions") or []) if not cond.get("deprecated_at")]
+
+
+def _project_has_valid_stop(project: dict) -> bool:
+    return bool(project.get("stop_reason_current")) and not bool(project.get("stop_reason_orphaned"))
+
+
+def _fetch_in_progress_projects(supervisor: str) -> list[dict]:
+    _, orch_config = _load_orch_modules()
+    cfg = orch_config.OrchConfig()
+    driver = orch_config.get_neo4j_driver(cfg)
+    with driver.session(database=cfg.neo4j_db) as session:
+        result = session.run(
+            """
+            MATCH (p:OrchProject)-[:HAS_PHASE]->(:OrchPhase)-[:HAS_TASK]->(t:OrchTask)
+            WHERE coalesce(p.supervisor, '') = $supervisor
+              AND coalesce(p.status, 'active') = 'in_progress'
+              AND coalesce(t.status, '') = 'in_progress'
+            RETURN p.id AS project_id,
+                   t.id AS task_id,
+                   t.owner AS owner,
+                   coalesce(t.heartbeat_exempt_secs, 0) AS heartbeat_exempt_secs
+            ORDER BY coalesce(p.priority, 999999999) ASC, t.created_at ASC
+            """
+            , supervisor=supervisor
+        )
+        return [dict(row) for row in result]
+
+
+def _mark_project_active(project_id: str) -> None:
+    _, orch_config = _load_orch_modules()
+    cfg = orch_config.OrchConfig()
+    driver = orch_config.get_neo4j_driver(cfg)
+    with driver.session(database=cfg.neo4j_db) as session:
+        session.run(
+            """
+            MATCH (p:OrchProject {id: $project_id})
+            SET p.status = 'active',
+                p.updated_at = datetime()
+            """,
+            project_id=project_id,
+        )
+
+
+def _expire_stale_in_progress_projects(r, supervisor: str) -> list[str]:
+    from notifications.inbox import state_key
+
+    rows = _fetch_in_progress_projects(supervisor)
+    if not rows:
+        return []
+    keys = [state_key(row.get("owner") or "", "last_activity") for row in rows]
+    values = _redis_get_many(r, keys)
+    now = time.time()
+    audit_events = []
+    for row, raw_last_activity in zip(rows, values):
+        owner = row.get("owner") or ""
+        if not owner:
+            continue
+        try:
+            last_activity = float(raw_last_activity) if raw_last_activity is not None else 0.0
+        except (TypeError, ValueError):
+            last_activity = 0.0
+        threshold = max(_DEFAULT_HEARTBEAT_SECS, int(row.get("heartbeat_exempt_secs") or 0))
+        stalled_for = int(now - last_activity) if last_activity else threshold + 1
+        if stalled_for <= threshold:
+            continue
+        _mark_project_active(str(row["project_id"]))
+        audit_events.append(
+            f"in_progress_expired: {row['project_id']}, owner={owner}, stalled_for={stalled_for}s"
+        )
+    return audit_events
+
+
+def _session_pause_active(r, supervisor: str) -> bool:
+    try:
+        return bool(r.exists(state_key(supervisor, "pause")))
+    except Exception:
+        return False
+
+
+def _open_orchestrator_bug_lock(reason: str, owner: str) -> None:
+    support_root = os.environ.get("CF_SUPPORT_REPO_ROOT", "/path/to/repo")
+    code = (
+        "import sys; "
+        f"sys.path.insert(0, {support_root!r}); "
+        "from lib.buglock import open_bug_lock; "
+        f"open_bug_lock('claude-code-fleet-orchestrator', {reason!r}, {owner!r})"
+    )
+    subprocess.run([sys.executable, "-c", code], check=True, timeout=10)
+
+
+def _record_engine_error(r, supervisor: str, exc: Exception) -> tuple[str, int]:
+    timestamp = time.time()
+    event_key = f"taey:engine_error:{supervisor}:{int(timestamp)}"
+    payload = {
+        "session": supervisor,
+        "error": repr(exc),
+        "traceback": traceback.format_exc(),
+        "ts": timestamp,
+    }
+    r.set(event_key, json.dumps(payload), ex=3600)
+    recent_key = f"taey:engine_error:{supervisor}:recent"
+    try:
+        recent = json.loads(r.get(recent_key) or "[]")
+    except Exception:
+        recent = []
+    recent = [float(item) for item in recent if timestamp - float(item) <= _ENGINE_ERROR_WINDOW_SECS]
+    recent.append(timestamp)
+    r.set(recent_key, json.dumps(recent), ex=3600)
+    if len(recent) >= _ENGINE_ERROR_THRESHOLD:
+        try:
+            _open_orchestrator_bug_lock(
+                reason=f"Stage B ENGINE_ERROR threshold tripped for {supervisor}: {repr(exc)}",
+                owner="claude-code-fleet-notify",
+            )
+        except Exception as buglock_exc:
+            log_debug(supervisor, f"ENGINE_ERROR bug_lock open failed: {buglock_exc}")
+    return event_key, len(recent)
+
+
+def _evaluate_stop_discipline(r, node_id: str, observed_task_id: Optional[str]) -> StopDecision:
+    blocked_on = _resolve_blocked_on(observed_task_id)
+    if blocked_on:
+        return StopDecision(
+            wake_type=WAKE_ALLOW_STOP,
+            body=f"blocked_on={blocked_on}",
+        )
+
+    supervisor = _resolve_supervisor(r, node_id) or node_id
+    try:
+        if _session_pause_active(r, supervisor):
+            return StopDecision(wake_type=WAKE_ALLOW_STOP, body="paused_by_user")
+
+        audit_events = _expire_stale_in_progress_projects(r, supervisor)
+        projects = _get_session_supervised_projects(supervisor)
+        for project in projects:
+            status = str(project.get("status") or "active")
+            project_id = str(project.get("id"))
+            if status == "completed":
+                continue
+            if status == "in_progress":
+                continue
+
+            active_conditions = _active_conditions(project)
+            valid_stop = _project_has_valid_stop(project)
+            if not active_conditions and project.get("user_stop_conditions"):
+                log_debug(node_id, f"deprecated-only conditions on {project_id}; allowing stop")
+                continue
+
+            next_ready = _get_session_next_ready(supervisor, project_id=project_id)
+            if next_ready:
+                task_id = next_ready.get("task_id") or next_ready.get("id")
+                task_title = str(next_ready.get("description") or "")[:80]
+                return StopDecision(
+                    wake_type=WAKE_WITH_QUEUE,
+                    project_id=project_id,
+                    phase_id=next_ready.get("phase_id"),
+                    task_id=task_id,
+                    task_title_short=task_title,
+                    priority=next_ready.get("priority"),
+                    resume_context_pointer=f"/api/tasks/{task_id}" if task_id else None,
+                    next_action=f"Pick up {task_id} via taey-queue next or inspect {_ORCH_API_BASE}/api/tasks/{task_id}",
+                    body="ready work available",
+                    audit_events=audit_events,
+                )
+
+            if status == "stopped" and valid_stop:
+                continue
+            if valid_stop:
+                continue
+
+            return StopDecision(
+                wake_type=WAKE_REASON_REQUIRED,
+                project_id=project_id,
+                available_conditions=[
+                    {
+                        "condition_id": cond.get("id"),
+                        "version": cond.get("version"),
+                        "label": cond.get("label"),
+                    }
+                    for cond in active_conditions
+                ],
+                next_action=f"Set a stop reason for {project_id} with taey-stop-reason set {project_id} --condition <prefix> --detail \"...\"",
+                body="no ready work and no valid stop_reason",
+                audit_events=audit_events,
+            )
+
+        return StopDecision(wake_type=WAKE_ALLOW_STOP, audit_events=audit_events)
+    except Exception as exc:
+        error_key, recent_count = _record_engine_error(r, supervisor, exc)
+        return StopDecision(
+            wake_type=WAKE_ENGINE_ERROR,
+            body=f"{type(exc).__name__}: {exc}",
+            next_action="Investigate orchestrator connectivity and clear the bug-lock only after root cause is fixed.",
+            error_key=error_key,
+            audit_events=[f"recent_engine_errors={recent_count}"],
+        )
 
 
 def read_stdin_json() -> dict:
@@ -354,11 +621,24 @@ def _notify_supervisor_of_stop(r, node_id: str, supervisor: str) -> None:
         if r.exists(dedup):
             return
 
-        blocked_on = _resolve_blocked_on(observed_task_id)
-        if blocked_on:
-            msg = f"suppressed PEER_IDLE for {node_id}: blocked_on={blocked_on}"
+        decision = _evaluate_stop_discipline(r, node_id, observed_task_id)
+        if decision.wake_type == WAKE_ALLOW_STOP:
+            msg = f"suppressed PEER_IDLE for {node_id}: {decision.body or 'allow_stop'}"
             print(msg, file=sys.stderr)
             log_debug(node_id, msg)
+            if outcome == "done" and observed_task_id:
+                try:
+                    cleared = r.eval(
+                        _CAS_CLEAR_DONE_LUA, 3,
+                        state_key(node_id, "current_task"),
+                        state_key(node_id, "last_outcome"),
+                        state_key(node_id, "last_clear_was_done"),
+                        observed_task_id,
+                    )
+                    if not cleared:
+                        log_debug(node_id, f"STOP CAS skipped clear for allow_stop observed={observed_task_id}")
+                except Exception as cas_exc:
+                    log_debug(node_id, f"STOP CAS clear failed: {cas_exc}")
             return
 
         if summary:
@@ -370,14 +650,24 @@ def _notify_supervisor_of_stop(r, node_id: str, supervisor: str) -> None:
 
         msg_obj = {
             "from": node_id,
-            "type": "peer_idle",
-            "body": body,
+            "type": "wake",
+            "wake_type": decision.wake_type,
+            "body": body if not decision.body else f"{body}; {decision.body}",
             "outcome": outcome,  # enum: done|error|interrupted|unknown
-            "priority": priority,
-            "msg_id": f"peer-idle-{node_id}-{dedup_suffix}-{int(time.time())}",
+            "priority": "high" if decision.wake_type in (WAKE_REASON_REQUIRED, WAKE_ENGINE_ERROR) else priority,
+            "msg_id": f"wake-{node_id}-{dedup_suffix}-{int(time.time())}",
             "timestamp": time.time(),
+            "project_id": decision.project_id,
+            "phase_id": decision.phase_id,
+            "task_id": decision.task_id,
+            "stopped_task_id": observed_task_id,
+            "task_title_short": decision.task_title_short,
+            "resume_context_pointer": decision.resume_context_pointer,
+            "available_conditions": decision.available_conditions,
+            "next_action": decision.next_action,
+            "error_key": decision.error_key,
+            "audit_events": decision.audit_events,
             # Self-describing fields (v0.2.3+, Gaia TIER-1 fix):
-            "task_id": observed_task_id,
             "task_description": (observed_task.get("description") if observed_task else None),
             "task_supervisor": (observed_task.get("supervisor") if observed_task else None),
             "task_started_at": (observed_task.get("started_at") if observed_task else None),
