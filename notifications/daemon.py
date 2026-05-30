@@ -22,6 +22,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import json
 
 from notifications.inbox import (
+    WAKE_TYPES,
+    flatten_sources,
+    format_notification_block,
     has_pending_messages,
     inbox_key,
     is_node_idle,
@@ -101,6 +104,29 @@ def build_pointer_summary(r, node_id: str) -> str | None:
     total = r.llen(inbox) + r.llen(notif_key)
     if total == 0:
         return None
+
+    wake_messages = []
+    for raw in reversed(inbox_raw):
+        try:
+            msg = json.loads(raw)
+        except Exception:
+            continue
+        if msg.get("wake_type") in WAKE_TYPES:
+            wake_messages.append(msg)
+    for raw in notif_raw:
+        try:
+            msg = json.loads(raw)
+        except Exception:
+            continue
+        if msg.get("wake_type") in WAKE_TYPES:
+            wake_messages.append(msg)
+    if wake_messages:
+        return _clip_message(
+            format_notification_block(
+                wake_messages,
+                header="=== WAKE ===",
+            )
+        )
 
     senders = set()
     first_type = None

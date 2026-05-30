@@ -27,6 +27,11 @@ from typing import Any, Dict, Iterable, Optional
 
 DEFAULT_TOOL_TTL = 60
 DEFAULT_KEY_PREFIX = os.environ.get("NOTIFY_KEY_PREFIX", "taey")
+WAKE_ALLOW_STOP = "ALLOW_STOP"
+WAKE_WITH_QUEUE = "WAKE_WITH_QUEUE"
+WAKE_REASON_REQUIRED = "WAKE_REASON_REQUIRED"
+WAKE_ENGINE_ERROR = "ENGINE_ERROR"
+WAKE_TYPES = {WAKE_ALLOW_STOP, WAKE_WITH_QUEUE, WAKE_REASON_REQUIRED, WAKE_ENGINE_ERROR}
 # No TTL on idle. Stopped means stopped until UserPromptSubmit clears it.
 # State doesn't decay just because time passed — a session at rest stays at rest.
 
@@ -267,6 +272,34 @@ def format_message(msg: Dict[str, Any]) -> str:
             f"  *** {platform.upper()} RESPONSE READY{elapsed_text} ***\n"
             f"  ACTION: taey_quick_extract(platform='{platform}', complete=True)"
         )
+
+    wake_type = msg.get("wake_type")
+    if wake_type in WAKE_TYPES:
+        lines = [f"  *** {wake_type} from {sender} ***"]
+        if msg.get("project_id"):
+            lines.append(f"  project: {msg['project_id']}")
+        if msg.get("task_id"):
+            lines.append(f"  task: {msg['task_id']}")
+        if msg.get("task_title_short"):
+            lines.append(f"  title: {msg['task_title_short']}")
+        if msg.get("priority") is not None:
+            lines.append(f"  priority: {msg['priority']}")
+        if msg.get("task_priority") is not None:
+            lines.append(f"  task_priority: {msg['task_priority']}")
+        if msg.get("available_conditions"):
+            labels = ", ".join(
+                f"{cond.get('label')} [{cond.get('condition_id')} v{cond.get('version')}]"
+                for cond in msg.get("available_conditions", [])
+            )
+            lines.append(f"  available_conditions: {labels}")
+        if msg.get("resume_context_pointer"):
+            lines.append(f"  resume_context_pointer: {msg['resume_context_pointer']}")
+        if msg.get("next_action"):
+            lines.append(f"  ACTION: {msg['next_action']}")
+        body = msg.get("body")
+        if body:
+            lines.append(f"  detail: {body}")
+        return "\n".join(lines)
 
     mtype = str(msg.get("type", msg.get("status", "message"))).upper()
     body = msg.get("body", msg.get("message", msg.get("raw", str(msg))))
