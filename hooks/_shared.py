@@ -565,6 +565,25 @@ return 0
 """
 
 
+def _stage_b_enabled() -> bool:
+    """Stage B engine activation check. Two sources, OR-combined:
+
+    1. Env var CF_STAGE_B_ENABLED=="1" (daemon-spawned contexts only — hook subprocesses
+       do NOT inherit daemon env, so this rarely fires in practice for fleet sessions)
+    2. File /home/mira/.taey/stage_b_enabled exists (fleet-wide flag — set independently
+       of process env, picked up by all existing sessions without restart)
+
+    File-based path is the primary mechanism for fleet-wide activation. Env-var path
+    preserved for testability + daemon-internal contexts.
+    """
+    if os.environ.get("CF_STAGE_B_ENABLED") == "1":
+        return True
+    try:
+        return os.path.exists("/home/mira/.taey/stage_b_enabled")
+    except Exception:
+        return False
+
+
 def _notify_supervisor_of_stop(r, node_id: str, supervisor: str) -> None:
     """Push a peer_idle message to the supervisor's inbox when this worker
     stops. Body includes the just-completed task summary + outcome enum,
@@ -629,7 +648,7 @@ def _notify_supervisor_of_stop(r, node_id: str, supervisor: str) -> None:
         if r.exists(dedup):
             return
 
-        if os.environ.get("CF_STAGE_B_ENABLED") != "1":
+        if not _stage_b_enabled():
             blocked_on = _resolve_blocked_on(observed_task_id)
             if blocked_on:
                 msg = f"suppressed PEER_IDLE for {node_id}: blocked_on={blocked_on}"
