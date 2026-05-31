@@ -3,3 +3,8 @@ __pycache__/
 .claude/
 AGENTS.md
 CLAUDE.md
+
+# Local deployment config — secrets/topology. Use .env.example as template.
+.env
+.env.local
+.env.*.local
