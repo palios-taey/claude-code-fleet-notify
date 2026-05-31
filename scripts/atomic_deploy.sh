@@ -72,11 +72,19 @@ rollback() {
     # transparency." The rollback path is best-effort — we want to record
     # what was attempted regardless of whether each step succeeded.
     set +e
+    # Horizon v1.3.0 full audit AMENDMENT 5: explicit stop of any daemon
+    # currently running against the failed target before reverting the
+    # symlink. start_notify_daemons.sh's start is idempotent (refuses if
+    # pidfile shows alive), so without an explicit stop a partially-started
+    # daemon on the failed code path may persist while we flip the symlink
+    # back, leaving fleet in a mixed state. Stop first → flip → start clean.
+    bash "${DAEMON_CONTROL:-$LIVE_PATH/scripts/start_notify_daemons.sh}" stop >/dev/null
+    DAEMON_STOP_RC=$?
     ln -sfn "$PREVIOUS_TARGET" "$LIVE_PATH"
     bash "${DAEMON_CONTROL:-$LIVE_PATH/scripts/start_notify_daemons.sh}" start >/dev/null
     DAEMON_RC=$?
-    printf '{"ts":"%s","target":"%s","previous":"%s","outcome":"rollback","daemon_restart_rc":%d}\n' \
-        "$(date -u +%FT%TZ)" "$TARGET_SHA" "$PREVIOUS_TARGET" "$DAEMON_RC" >> "$DEPLOY_LOG"
+    printf '{"ts":"%s","target":"%s","previous":"%s","outcome":"rollback","daemon_stop_rc":%d,"daemon_restart_rc":%d}\n' \
+        "$(date -u +%FT%TZ)" "$TARGET_SHA" "$PREVIOUS_TARGET" "$DAEMON_STOP_RC" "$DAEMON_RC" >> "$DEPLOY_LOG"
 }
 
 trap 'rollback' ERR
