@@ -174,6 +174,66 @@ def test_blocked_on_regression() -> tuple[bool, str]:
     return ok, f"inbox_len={r.llen('taey:conductor:inbox')}"
 
 
+def test_cf_stage_b_disabled_falls_through_to_legacy() -> tuple[bool, str]:
+    r = FakeRedis()
+    r.set(state_key("worker-codex", "current_task"), json.dumps({"task_id": "task-legacy", "description": "legacy path"}))
+    r.set(state_key("worker-codex", "last_outcome"), json.dumps({"outcome": "unknown", "details": ""}))
+    old = os.environ.pop("CF_STAGE_B_ENABLED", None)
+    try:
+        with mock.patch.object(shared, "_resolve_supervisor", return_value="conductor"), \
+             mock.patch.object(shared, "_evaluate_stop_discipline", side_effect=AssertionError("engine should not run")), \
+             mock.patch.object(shared, "_resolve_blocked_on", return_value=None):
+            shared._notify_supervisor_of_stop(r, "worker-codex", "conductor")
+    finally:
+        if old is not None:
+            os.environ["CF_STAGE_B_ENABLED"] = old
+    msg = r.decoded_list("taey:conductor:inbox")[0]
+    ok = msg.get("type") == "peer_idle"
+    return ok, f"type={msg.get('type')}"
+
+
+def test_cf_stage_b_enabled_invokes_engine() -> tuple[bool, str]:
+    r = FakeRedis()
+    r.set(state_key("worker-codex", "current_task"), json.dumps({"task_id": "task-engine", "description": "engine path"}))
+    r.set(state_key("worker-codex", "last_outcome"), json.dumps({"outcome": "unknown", "details": ""}))
+    old = os.environ.get("CF_STAGE_B_ENABLED")
+    os.environ["CF_STAGE_B_ENABLED"] = "1"
+    try:
+        with mock.patch.object(shared, "_resolve_supervisor", return_value="conductor"), \
+             mock.patch.object(shared, "_evaluate_stop_discipline", return_value=shared.StopDecision(wake_type=shared.WAKE_REASON_REQUIRED, body="needs reason")) as engine:
+            shared._notify_supervisor_of_stop(r, "worker-codex", "conductor")
+            called = engine.called
+    finally:
+        if old is None:
+            os.environ.pop("CF_STAGE_B_ENABLED", None)
+        else:
+            os.environ["CF_STAGE_B_ENABLED"] = old
+    msg = r.decoded_list("taey:conductor:inbox")[0]
+    ok = called and msg.get("wake_type") == shared.WAKE_REASON_REQUIRED
+    return ok, f"engine_called={called} wake_type={msg.get('wake_type')}"
+
+
+def test_cf_stage_b_zero_treated_as_disabled() -> tuple[bool, str]:
+    r = FakeRedis()
+    r.set(state_key("worker-codex", "current_task"), json.dumps({"task_id": "task-zero", "description": "zero path"}))
+    r.set(state_key("worker-codex", "last_outcome"), json.dumps({"outcome": "unknown", "details": ""}))
+    old = os.environ.get("CF_STAGE_B_ENABLED")
+    os.environ["CF_STAGE_B_ENABLED"] = "0"
+    try:
+        with mock.patch.object(shared, "_resolve_supervisor", return_value="conductor"), \
+             mock.patch.object(shared, "_evaluate_stop_discipline", side_effect=AssertionError("engine should not run")), \
+             mock.patch.object(shared, "_resolve_blocked_on", return_value=None):
+            shared._notify_supervisor_of_stop(r, "worker-codex", "conductor")
+    finally:
+        if old is None:
+            os.environ.pop("CF_STAGE_B_ENABLED", None)
+        else:
+            os.environ["CF_STAGE_B_ENABLED"] = old
+    msg = r.decoded_list("taey:conductor:inbox")[0]
+    ok = msg.get("type") == "peer_idle"
+    return ok, f"type={msg.get('type')}"
+
+
 def test_real_backend_wake_with_queue() -> tuple[bool, str]:
     prefix = f"stage-b-real-{uuid.uuid4().hex[:8]}"
     supervisor = f"{prefix}-supervisor"
@@ -348,6 +408,9 @@ def main() -> int:
         ("pause_allows_stop", test_pause_allows_stop),
         ("blocked_on_done_clear", test_blocked_on_done_clear),
         ("blocked_on_regression", test_blocked_on_regression),
+        ("cf_stage_b_disabled_falls_through_to_legacy", test_cf_stage_b_disabled_falls_through_to_legacy),
+        ("cf_stage_b_enabled_invokes_engine", test_cf_stage_b_enabled_invokes_engine),
+        ("cf_stage_b_zero_treated_as_disabled", test_cf_stage_b_zero_treated_as_disabled),
         ("real_backend_wake_with_queue", test_real_backend_wake_with_queue),
         ("engine_error_buglock", test_engine_error_buglock),
         ("heartbeat_expiry", test_heartbeat_expiry),

@@ -629,6 +629,56 @@ def _notify_supervisor_of_stop(r, node_id: str, supervisor: str) -> None:
         if r.exists(dedup):
             return
 
+        if os.environ.get("CF_STAGE_B_ENABLED") != "1":
+            blocked_on = _resolve_blocked_on(observed_task_id)
+            if blocked_on:
+                msg = f"suppressed PEER_IDLE for {node_id}: blocked_on={blocked_on}"
+                print(msg, file=sys.stderr)
+                log_debug(node_id, msg)
+                if outcome == "done" and observed_task_id:
+                    try:
+                        r.eval(
+                            _CAS_CLEAR_DONE_LUA, 3,
+                            state_key(node_id, "current_task"),
+                            state_key(node_id, "last_outcome"),
+                            state_key(node_id, "last_clear_was_done"),
+                            observed_task_id,
+                        )
+                    except Exception as cas_exc:
+                        log_debug(node_id, f"STOP CAS clear failed: {cas_exc}")
+                return
+
+            body = f"{node_id} stopped — {summary}" if summary else f"{node_id} stopped — no current task recorded"
+            priority = "high" if summary and outcome in ("error", "interrupted") else ("normal" if summary else "low")
+            msg = json.dumps({
+                "from": node_id,
+                "type": "peer_idle",
+                "body": body,
+                "outcome": outcome,
+                "priority": priority,
+                "msg_id": f"peer-idle-{node_id}-{dedup_suffix}-{int(time.time())}",
+                "timestamp": time.time(),
+                "task_id": observed_task_id,
+                "task_description": (observed_task.get("description") if observed_task else None),
+                "task_supervisor": (observed_task.get("supervisor") if observed_task else None),
+                "task_started_at": (observed_task.get("started_at") if observed_task else None),
+                "outcome_details": (observed_outcome_struct.get("details") if observed_outcome_struct else None),
+            })
+            r.lpush(inbox_key(supervisor), msg)
+            r.set(dedup, "1", ex=60)
+            if outcome == "done" and observed_task_id:
+                try:
+                    r.eval(
+                        _CAS_CLEAR_DONE_LUA, 3,
+                        state_key(node_id, "current_task"),
+                        state_key(node_id, "last_outcome"),
+                        state_key(node_id, "last_clear_was_done"),
+                        observed_task_id,
+                    )
+                except Exception as cas_exc:
+                    log_debug(node_id, f"STOP CAS clear failed: {cas_exc}")
+            return
+
         decision = _evaluate_stop_discipline(r, node_id, observed_task_id)
         if decision.wake_type == WAKE_ALLOW_STOP:
             msg = f"suppressed PEER_IDLE for {node_id}: {decision.body or 'allow_stop'}"
