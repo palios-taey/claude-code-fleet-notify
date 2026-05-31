@@ -65,10 +65,18 @@ elif [ -d "$LIVE_PATH" ]; then
 fi
 
 rollback() {
+    # Audit-resilience: disable set -e inside rollback so a failed daemon
+    # start cannot prevent the JSONL log line from being written. Cosmos
+    # v1.3.0 full audit (2026-05-31) AMENDMENT 1: "a system that silently
+    # drops its audit log during a failure state violates our foundational
+    # transparency." The rollback path is best-effort — we want to record
+    # what was attempted regardless of whether each step succeeded.
+    set +e
     ln -sfn "$PREVIOUS_TARGET" "$LIVE_PATH"
     bash "${DAEMON_CONTROL:-$LIVE_PATH/scripts/start_notify_daemons.sh}" start >/dev/null
-    printf '{"ts":"%s","target":"%s","previous":"%s","outcome":"rollback"}\n' \
-        "$(date -u +%FT%TZ)" "$TARGET_SHA" "$PREVIOUS_TARGET" >> "$DEPLOY_LOG"
+    DAEMON_RC=$?
+    printf '{"ts":"%s","target":"%s","previous":"%s","outcome":"rollback","daemon_restart_rc":%d}\n' \
+        "$(date -u +%FT%TZ)" "$TARGET_SHA" "$PREVIOUS_TARGET" "$DAEMON_RC" >> "$DEPLOY_LOG"
 }
 
 trap 'rollback' ERR
