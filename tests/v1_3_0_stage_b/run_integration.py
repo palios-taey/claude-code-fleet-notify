@@ -178,15 +178,13 @@ def test_cf_stage_b_disabled_falls_through_to_legacy() -> tuple[bool, str]:
     r = FakeRedis()
     r.set(state_key("worker-codex", "current_task"), json.dumps({"task_id": "task-legacy", "description": "legacy path"}))
     r.set(state_key("worker-codex", "last_outcome"), json.dumps({"outcome": "unknown", "details": ""}))
-    old = os.environ.pop("CF_STAGE_B_ENABLED", None)
-    try:
-        with mock.patch.object(shared, "_resolve_supervisor", return_value="conductor"), \
-             mock.patch.object(shared, "_evaluate_stop_discipline", side_effect=AssertionError("engine should not run")), \
-             mock.patch.object(shared, "_resolve_blocked_on", return_value=None):
-            shared._notify_supervisor_of_stop(r, "worker-codex", "conductor")
-    finally:
-        if old is not None:
-            os.environ["CF_STAGE_B_ENABLED"] = old
+    # Mock _stage_b_enabled directly so test isolation is independent of both env var
+    # AND production file flag at /path/to/repo (which exists post-DEPLOY).
+    with mock.patch.object(shared, "_stage_b_enabled", return_value=False), \
+         mock.patch.object(shared, "_resolve_supervisor", return_value="conductor"), \
+         mock.patch.object(shared, "_evaluate_stop_discipline", side_effect=AssertionError("engine should not run")), \
+         mock.patch.object(shared, "_resolve_blocked_on", return_value=None):
+        shared._notify_supervisor_of_stop(r, "worker-codex", "conductor")
     msg = r.decoded_list("taey:conductor:inbox")[0]
     ok = msg.get("type") == "peer_idle"
     return ok, f"type={msg.get('type')}"
@@ -196,31 +194,30 @@ def test_cf_stage_b_enabled_invokes_engine() -> tuple[bool, str]:
     r = FakeRedis()
     r.set(state_key("worker-codex", "current_task"), json.dumps({"task_id": "task-engine", "description": "engine path"}))
     r.set(state_key("worker-codex", "last_outcome"), json.dumps({"outcome": "unknown", "details": ""}))
-    old = os.environ.get("CF_STAGE_B_ENABLED")
-    os.environ["CF_STAGE_B_ENABLED"] = "1"
-    try:
-        with mock.patch.object(shared, "_resolve_supervisor", return_value="conductor"), \
-             mock.patch.object(shared, "_evaluate_stop_discipline", return_value=shared.StopDecision(wake_type=shared.WAKE_REASON_REQUIRED, body="needs reason")) as engine:
-            shared._notify_supervisor_of_stop(r, "worker-codex", "conductor")
-            called = engine.called
-    finally:
-        if old is None:
-            os.environ.pop("CF_STAGE_B_ENABLED", None)
-        else:
-            os.environ["CF_STAGE_B_ENABLED"] = old
+    # Mock _stage_b_enabled directly for isolation from env var + file flag state.
+    with mock.patch.object(shared, "_stage_b_enabled", return_value=True), \
+         mock.patch.object(shared, "_resolve_supervisor", return_value="conductor"), \
+         mock.patch.object(shared, "_evaluate_stop_discipline", return_value=shared.StopDecision(wake_type=shared.WAKE_REASON_REQUIRED, body="needs reason")) as engine:
+        shared._notify_supervisor_of_stop(r, "worker-codex", "conductor")
+        called = engine.called
     msg = r.decoded_list("taey:conductor:inbox")[0]
     ok = called and msg.get("wake_type") == shared.WAKE_REASON_REQUIRED
     return ok, f"engine_called={called} wake_type={msg.get('wake_type')}"
 
 
 def test_cf_stage_b_zero_treated_as_disabled() -> tuple[bool, str]:
+    # The "0" treatment is internal logic of _stage_b_enabled(). To test it
+    # specifically (rather than just the gate), call the function directly with
+    # env var manipulated AND file flag mocked absent. This isolates the env-var
+    # branch entirely from production file flag state.
     r = FakeRedis()
     r.set(state_key("worker-codex", "current_task"), json.dumps({"task_id": "task-zero", "description": "zero path"}))
     r.set(state_key("worker-codex", "last_outcome"), json.dumps({"outcome": "unknown", "details": ""}))
     old = os.environ.get("CF_STAGE_B_ENABLED")
     os.environ["CF_STAGE_B_ENABLED"] = "0"
     try:
-        with mock.patch.object(shared, "_resolve_supervisor", return_value="conductor"), \
+        with mock.patch.object(shared.os.path, "exists", return_value=False), \
+             mock.patch.object(shared, "_resolve_supervisor", return_value="conductor"), \
              mock.patch.object(shared, "_evaluate_stop_discipline", side_effect=AssertionError("engine should not run")), \
              mock.patch.object(shared, "_resolve_blocked_on", return_value=None):
             shared._notify_supervisor_of_stop(r, "worker-codex", "conductor")
