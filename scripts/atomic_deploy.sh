@@ -38,7 +38,7 @@ if git -C "$TARGET_DIR" rev-parse --git-dir >/dev/null 2>&1; then
     CURRENT_TARGET_SHA="$(git -C "$TARGET_DIR" rev-parse HEAD 2>/dev/null || true)"
 fi
 if [ "$CURRENT_TARGET_SHA" != "$TARGET_SHA" ]; then
-    if [ -L "$LIVE_PATH" ] && [ "$(readlink -f "$LIVE_PATH")" = "$TARGET_DIR" ]; then
+    if [ -L "$LIVE_PATH" ] && [ "$(readlink -f "$LIVE_PATH")" = "$(readlink -f "$TARGET_DIR")" ]; then
         echo "Refusing: $TARGET_DIR is currently live but HEAD ($CURRENT_TARGET_SHA) != target ($TARGET_SHA)" >&2
         exit 1
     fi
