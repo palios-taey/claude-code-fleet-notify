@@ -72,15 +72,23 @@ if [ "$HOST" = "local" ] || [ "$HOST" = "localhost" ] || [ "$HOST" = "$(hostname
     tmux send-keys -t "$SESSION" C-u C-k
     sleep 0.1
 
-    tmux send-keys -t "$SESSION" -- "$MSG"
-    sleep 0.5
-
     if [ "$SEQ" = "grok" ]; then
-        # Grok modal TUI: plain Enter only. Escape + CSI u Enter both
-        # toggle modes here, breaking submit.
+        # Grok modal TUI: Enter = SUBMIT. Embedded \n in $MSG sent via
+        # send-keys would fragment a multi-line dispatch into multiple
+        # partial submits (verified live 2026-05-31: 7-attack-vector audit
+        # prompt got chopped per line, left trailing fragment in input
+        # box, grok never received the full prompt). Use bracketed paste
+        # so the TUI inserts the whole block as text without interpreting
+        # embedded newlines as Enter. Then plain Enter submits.
+        printf '%s' "$MSG" | tmux load-buffer -
+        tmux paste-buffer -t "$SESSION" -p -d
+        sleep 0.5
         tmux send-keys -t "$SESSION" Enter
     else
-        # Claude Code / codex (Ink TUI / Kitty protocol).
+        # Claude Code / codex (Ink TUI / Kitty protocol): embedded \n is
+        # newline-in-input not submit, so direct send-keys is fine.
+        tmux send-keys -t "$SESSION" -- "$MSG"
+        sleep 0.5
         tmux send-keys -t "$SESSION" Escape
         sleep 0.2
         tmux send-keys -t "$SESSION" Enter
@@ -100,12 +108,16 @@ MSG=\$(printf '%s' '${B64}' | base64 -d)
 
 tmux send-keys -t \"\$SESSION\" C-u C-k
 sleep 0.1
-tmux send-keys -t \"\$SESSION\" -- \"\$MSG\"
-sleep 0.5
 
 if [ \"\$SEQ\" = 'grok' ]; then
+    # Bracketed paste — see local-send branch above for full reasoning.
+    printf '%s' \"\$MSG\" | tmux load-buffer -
+    tmux paste-buffer -t \"\$SESSION\" -p -d
+    sleep 0.5
     tmux send-keys -t \"\$SESSION\" Enter
 else
+    tmux send-keys -t \"\$SESSION\" -- \"\$MSG\"
+    sleep 0.5
     tmux send-keys -t \"\$SESSION\" Escape
     sleep 0.2
     tmux send-keys -t \"\$SESSION\" Enter
