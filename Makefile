@@ -1,6 +1,9 @@
-.PHONY: install uninstall test hooks-diff hooks-install daemon-start daemon-stop daemon-status
+.PHONY: install uninstall test hooks-diff hooks-install hooks-safe-edit daemon-start daemon-stop daemon-status
 
 PREFIX ?= /usr/local
+# Live hooks-loading path the fleet daemon + hook subprocesses read from.
+# Override per-adopter if your live path differs from the Mira default.
+LIVE_HOOKS_PATH ?= /home/mira/claude-code-fleet-notify
 
 install:
 	@echo "Installing claude-code-fleet-notify CLIs to $(PREFIX)/bin..."
@@ -24,6 +27,27 @@ hooks-diff:
 
 hooks-install:
 	@bash scripts/install-hooks.sh --apply
+
+# Hot-deploy class guard (Logos Stage B suggestion 2): refuse to operate on the
+# live hooks-loading path. Hooks reload from disk on every Stop event, so
+# editing in-place activates code without restart. Use a worktree instead:
+#   git worktree add ~/.dev-worktrees/<name> <branch>
+# Resolves symlinks on both sides so a flipped live symlink is still detected.
+# Override LIVE_HOOKS_PATH to match your deploy if different from Mira default.
+hooks-safe-edit:
+	@PWD_RESOLVED=$$(pwd -P); \
+	if [ -e "$(LIVE_HOOKS_PATH)" ]; then \
+		LIVE_RESOLVED=$$(cd "$(LIVE_HOOKS_PATH)" && pwd -P); \
+	else \
+		LIVE_RESOLVED=""; \
+	fi; \
+	if [ -n "$$LIVE_RESOLVED" ] && [ "$$PWD_RESOLVED" = "$$LIVE_RESOLVED" ]; then \
+		echo "REFUSED: cwd ($$PWD_RESOLVED) is the live hooks-loading path." >&2; \
+		echo "Hooks reload from disk every Stop event — in-place edits activate without restart." >&2; \
+		echo "Edit in a worktree instead: git worktree add ~/.dev-worktrees/<name> <branch>" >&2; \
+		exit 1; \
+	fi; \
+	echo "Safe to edit: cwd=$$PWD_RESOLVED is NOT the live hooks path ($(LIVE_HOOKS_PATH))"
 
 daemon-start:
 	@bash scripts/start_notify_daemons.sh start
