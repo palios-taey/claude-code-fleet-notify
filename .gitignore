@@ -8,3 +8,5 @@ CLAUDE.md
 .env
 .env.local
 .env.*.local
+*.pyc
+hooks/__pycache__/
