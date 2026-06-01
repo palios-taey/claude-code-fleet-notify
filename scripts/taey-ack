@@ -12,7 +12,6 @@ from datetime import datetime
 
 # Search standard installed locations for the fleet-notify package.
 for _p in ('/usr/local/lib/claude-code-fleet-notify',
-          '/path/to/repo',
           os.path.join(os.path.dirname(os.path.realpath(__file__)), '..')):
     if os.path.isdir(_p) and os.path.isfile(os.path.join(_p, 'identity.py')):
         sys.path.insert(0, _p)

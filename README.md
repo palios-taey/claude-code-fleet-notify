@@ -69,6 +69,25 @@ export NOTIFY_KEY_PREFIX=taey
 
 `NOTIFY_KEY_PREFIX` defaults to `taey`. Use a different value when several fleets share one Redis instance.
 
+Create a `.env` from [.env.example](.env.example) when you want hook subprocesses to pick up the same settings automatically.
+
+### Orchestrator integration
+
+The Stage B stop-discipline hooks need access to `claude-code-fleet-orchestrator`.
+
+Use one of these two approaches:
+
+1. Install the orchestrator package so `lib.orch_schema` and `lib.config` are importable.
+2. Set `ORCH_REPO_ROOT=/absolute/path/to/claude-code-fleet-orchestrator`.
+
+If neither is true, importing `hooks/_shared.py` fails loud with a named `OrchestratorImportError`.
+
+Optional integration settings:
+
+- `ORCH_API_BASE` for the tasks API base URL
+- `CF_SUPPORT_REPO_ROOT` only if you want repeated Stage B engine failures to open a support bug lock
+- `CF_STAGE_B_ENABLED=1` or `CF_STAGE_B_MARKER_PATH=/path/to/marker` to activate Stage B
+
 ## Install Hooks
 
 Default behavior is Claude Code only (which also enables Grok by inheritance, see CLI table above):

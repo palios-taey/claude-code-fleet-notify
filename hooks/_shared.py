@@ -24,6 +24,7 @@ import dataclasses
 import importlib
 import json
 import os
+from pathlib import Path
 import subprocess
 import sys
 import time
@@ -50,9 +51,41 @@ if os.path.isfile(_env_path):
                 _key = _key.replace("export ", "").strip()
                 os.environ.setdefault(_key, _val.strip())
 
-_ORCH_REPO_ROOT = os.environ.get("ORCH_REPO_ROOT", "/path/to/repo")
-if _ORCH_REPO_ROOT not in sys.path:
-    sys.path.insert(0, _ORCH_REPO_ROOT)
+class OrchestratorImportError(SystemExit):
+    pass
+
+
+class SupportRepoConfigError(RuntimeError):
+    pass
+
+
+def _ensure_orchestrator_importable() -> None:
+    try:
+        importlib.import_module("lib.orch_schema")
+        importlib.import_module("lib.config")
+        return
+    except Exception:
+        pass
+
+    orch_root = os.environ.get("ORCH_REPO_ROOT", "").strip()
+    if not orch_root:
+        raise OrchestratorImportError(
+            "OrchestratorImportError: install fleet-orchestrator so 'lib.orch_schema' is importable, "
+            "or set ORCH_REPO_ROOT to a claude-code-fleet-orchestrator checkout"
+        )
+
+    if orch_root not in sys.path:
+        sys.path.insert(0, orch_root)
+    try:
+        importlib.import_module("lib.orch_schema")
+        importlib.import_module("lib.config")
+    except Exception as exc:
+        raise OrchestratorImportError(
+            f"OrchestratorImportError: could not import orchestrator from ORCH_REPO_ROOT={orch_root!r}: {exc}"
+        )
+
+
+_ensure_orchestrator_importable()
 
 from notifications.inbox import (
     WAKE_ALLOW_STOP,
@@ -215,7 +248,11 @@ def _session_pause_active(r, supervisor: str) -> bool:
 
 
 def _open_orchestrator_bug_lock(reason: str, owner: str) -> None:
-    support_root = os.environ.get("CF_SUPPORT_REPO_ROOT", "/path/to/repo")
+    support_root = os.environ.get("CF_SUPPORT_REPO_ROOT", "").strip()
+    if not support_root:
+        raise SupportRepoConfigError(
+            "CF_SUPPORT_REPO_ROOT must be set to a claude-code-fleet-support checkout when bug-lock integration is enabled"
+        )
     code = (
         "import sys; "
         f"sys.path.insert(0, {support_root!r}); "
@@ -570,7 +607,7 @@ def _stage_b_enabled() -> bool:
 
     1. Env var CF_STAGE_B_ENABLED=="1" (daemon-spawned contexts only — hook subprocesses
        do NOT inherit daemon env, so this rarely fires in practice for fleet sessions)
-    2. File /path/to/repo exists (fleet-wide flag — set independently
+    2. File at CF_STAGE_B_MARKER_PATH exists (fleet-wide flag — set independently
        of process env, picked up by all existing sessions without restart)
 
     File-based path is the primary mechanism for fleet-wide activation. Env-var path
@@ -579,7 +616,8 @@ def _stage_b_enabled() -> bool:
     if os.environ.get("CF_STAGE_B_ENABLED") == "1":
         return True
     try:
-        return os.path.exists("/path/to/repo")
+        marker = os.environ.get("CF_STAGE_B_MARKER_PATH", str(Path.home() / ".taey" / "stage_b_enabled"))
+        return os.path.exists(marker)
     except Exception:
         return False
 

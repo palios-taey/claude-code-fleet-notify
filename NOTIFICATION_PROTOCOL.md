@@ -36,7 +36,7 @@ For every tmux-session participant (Claude Code / codex / gemini / grok), notifi
 - The session sees the pointer (e.g., "[NOTIFY] You have N messages...") and acts on it.
 - This is the **tmux-when-idle** path. Used only while `idle == 1`. The daemon does NOT clear idle (only the UserPromptSubmit hook does, after the human or pointer prompt is submitted).
 
-**This pair is the official + canonical pattern** for dispatching work to any tmux-session CLI peer in the fleet. The earlier "subprocess invocation" pattern (e.g., calling `codex exec` / `gemini -p` directly from a parent session) was considered + dropped in `the-conductor/plans/execution_tracker_v1.md:8` (May 2026) — replaced by full peer integration with hooks. No fallback paths exist; per Jesse 2026-05-28: "There are no fallback paths. The central notification system needs to work with injections during tool use when active and tmux if not."
+**This pair is the official + canonical pattern** for dispatching work to any tmux-session CLI peer in the fleet. An earlier subprocess-invocation approach was dropped in favor of full peer integration with hooks. No fallback paths exist; the central notification system is designed to use injections during tool use when active and tmux only when idle.
 
 If a tmux peer cannot be reached via this dual path (e.g., the tmux session itself is dead), the right response is to respawn the session via `peer-respawn.sh`, NOT to fall back to a subprocess invocation.
 

@@ -2,8 +2,8 @@
 
 PREFIX ?= /usr/local
 # Live hooks-loading path the fleet daemon + hook subprocesses read from.
-# Override per-adopter if your live path differs from the Mira default.
-LIVE_HOOKS_PATH ?= /path/to/repo
+# Override per-adopter to the deployed hooks checkout you want to protect.
+LIVE_HOOKS_PATH ?=
 
 install:
 	@echo "Installing claude-code-fleet-notify CLIs to $(PREFIX)/bin..."
@@ -33,9 +33,14 @@ hooks-install:
 # editing in-place activates code without restart. Use a worktree instead:
 #   git worktree add ~/.dev-worktrees/<name> <branch>
 # Resolves symlinks on both sides so a flipped live symlink is still detected.
-# Override LIVE_HOOKS_PATH to match your deploy if different from Mira default.
+# Set LIVE_HOOKS_PATH to match your deploy when you want this guard enabled.
 hooks-safe-edit:
 	@PWD_RESOLVED=$$(pwd -P); \
+	if [ -z "$(LIVE_HOOKS_PATH)" ]; then \
+		echo "REFUSED: LIVE_HOOKS_PATH is unset." >&2; \
+		echo "Set LIVE_HOOKS_PATH to the deployed hooks checkout you want to protect." >&2; \
+		exit 1; \
+	fi; \
 	if [ -e "$(LIVE_HOOKS_PATH)" ]; then \
 		LIVE_RESOLVED=$$(cd "$(LIVE_HOOKS_PATH)" && pwd -P); \
 	else \

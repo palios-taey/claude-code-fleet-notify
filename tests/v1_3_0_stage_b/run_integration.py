@@ -17,7 +17,7 @@ from pathlib import Path
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
-ORCH_ROOT = Path("/path/to/repo")
+ORCH_ROOT = Path(os.environ.get("STAGE_A_TEST_ORCH_ROOT", "../claude-code-fleet-orchestrator")).resolve()
 os.environ["ORCH_NEO4J_URI"] = os.environ.get("STAGE_A_TEST_NEO4J_URI", "bolt://127.0.0.1:7691")
 os.environ.setdefault("ORCH_REDIS_HOST", "127.0.0.1")
 os.environ.setdefault("ORCH_REDIS_PORT", "6379")
@@ -179,7 +179,7 @@ def test_cf_stage_b_disabled_falls_through_to_legacy() -> tuple[bool, str]:
     r.set(state_key("worker-codex", "current_task"), json.dumps({"task_id": "task-legacy", "description": "legacy path"}))
     r.set(state_key("worker-codex", "last_outcome"), json.dumps({"outcome": "unknown", "details": ""}))
     # Mock _stage_b_enabled directly so test isolation is independent of both env var
-    # AND production file flag at /path/to/repo (which exists post-DEPLOY).
+    # and any operator-managed marker file.
     with mock.patch.object(shared, "_stage_b_enabled", return_value=False), \
          mock.patch.object(shared, "_resolve_supervisor", return_value="conductor"), \
          mock.patch.object(shared, "_evaluate_stop_discipline", side_effect=AssertionError("engine should not run")), \

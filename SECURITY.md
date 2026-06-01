@@ -20,7 +20,7 @@ We target acknowledgment of security reports within 24 hours when systems are he
 3. Develop + verify a fix in production
 4. Coordinate disclosure timing with you (default: fix-then-disclose, embargo respected)
 5. Publish a GitHub Security Advisory crediting you (or anonymously if you prefer)
-6. Ship the fix and announce per [RELEASE_DISTRIBUTION_PLAYBOOK](https://github.com/palios-taey/the-conductor/blob/main/RELEASE_DISTRIBUTION_PLAYBOOK.md)
+6. Ship the fix and publish release guidance with the advisory
 
 ## Scope
 

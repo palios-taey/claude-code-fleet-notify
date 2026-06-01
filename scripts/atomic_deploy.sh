@@ -3,8 +3,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SOURCE_REPO="${SOURCE_REPO:-$SCRIPT_DIR/..}"
-LIVE_PATH="${LIVE_PATH:-/path/to/repo}"
-VERSION_ROOT="${VERSION_ROOT:-/path/to/repo}"
+LIVE_PATH="${LIVE_PATH:-$HOME/.local/share/claude-code-fleet-notify/live}"
+VERSION_ROOT="${VERSION_ROOT:-$HOME/.local/share/claude-code-fleet-notify/versions}"
 DEPLOY_LOG="${DEPLOY_LOG:-$HOME/.taey/deploy-log.jsonl}"
 TARGET_REF="${1:-}"
 
