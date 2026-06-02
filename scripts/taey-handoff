@@ -1,0 +1,99 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+
+
+REDIS_HOST = os.environ.get("REDIS_HOST", "127.0.0.1")
+REDIS_PORT = int(os.environ.get("REDIS_PORT", "6379"))
+NOTIFY_KEY_PREFIX = os.environ.get("NOTIFY_KEY_PREFIX", "taey")
+
+
+def detect_from_node() -> str:
+    explicit = os.environ.get("TAEY_NODE_ID")
+    if explicit:
+        return explicit
+    try:
+        result = subprocess.run(
+            ["tmux", "display-message", "-p", "#S"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+    except Exception:
+        pass
+    import socket
+
+    return socket.gethostname()
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Create an explicit handoff record plus inbox message")
+    parser.add_argument("target")
+    parser.add_argument("message")
+    parser.add_argument("--type", "-t", default="command")
+    parser.add_argument("--priority", "-p", default="normal", choices=["high", "normal", "low"])
+    parser.add_argument("--from", dest="from_node", default=None)
+    parser.add_argument("--dispatcher-task-id", default=None)
+    parser.add_argument("--actionable-inputs", default="{}")
+    parser.add_argument(
+        "--ack-deadline-secs",
+        type=int,
+        default=300,
+        help="Long safety backstop in seconds; short pickup window comes from CF_HANDOFF_PICKUP_POLL_BUDGET",
+    )
+    parser.add_argument("--redis-host", default=REDIS_HOST)
+    parser.add_argument("--redis-port", type=int, default=REDIS_PORT)
+    parser.add_argument("--key-prefix", default=NOTIFY_KEY_PREFIX)
+    args = parser.parse_args()
+
+    from_node = args.from_node or detect_from_node()
+    try:
+        actionable_inputs = json.loads(args.actionable_inputs)
+    except json.JSONDecodeError as exc:
+        print(f"ERROR: --actionable-inputs must be valid JSON: {exc}", file=sys.stderr)
+        return 1
+    if not isinstance(actionable_inputs, dict):
+        print("ERROR: --actionable-inputs must decode to a JSON object", file=sys.stderr)
+        return 1
+
+    import redis
+
+    r = redis.Redis(
+        host=args.redis_host,
+        port=args.redis_port,
+        decode_responses=True,
+        socket_timeout=2,
+    )
+    try:
+        r.ping()
+    except Exception as exc:
+        print(f"ERROR: Cannot connect to Redis at {args.redis_host}:{args.redis_port}: {exc}", file=sys.stderr)
+        return 1
+
+    from notifications.handoff import create_explicit_handoff
+
+    payload = create_explicit_handoff(
+        r,
+        prefix=args.key_prefix,
+        dispatcher_session_id=from_node,
+        target_session_id=args.target,
+        body=args.message,
+        msg_type=args.type,
+        priority=args.priority,
+        dispatcher_task_id=args.dispatcher_task_id,
+        actionable_inputs=actionable_inputs,
+        ack_deadline_secs=args.ack_deadline_secs,
+    )
+    print(f"OK: handoff sent to {args.target} [{args.type}] from {from_node} msg_id={payload['msg_id']}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

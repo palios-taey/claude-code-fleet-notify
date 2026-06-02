@@ -20,6 +20,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import json
+import socket
 
 from notifications.inbox import (
     WAKE_TYPES,
@@ -31,6 +32,7 @@ from notifications.inbox import (
     key_prefix,
     notifications_key,
 )
+from notifications.handoff import mark_session_machine, record_delivery_signal, session_machine_key
 
 logging.basicConfig(
     level=logging.INFO,
@@ -256,8 +258,21 @@ def run_daemon(
 
     while True:
         try:
-            for session_name in get_local_tmux_sessions():
+            local_sessions = get_local_tmux_sessions()
+            local_session_set = set(local_sessions)
+            machine = socket.gethostname()
+
+            for session_name in local_sessions:
                 node_id = session_name
+                try:
+                    mark_session_machine(
+                        r,
+                        prefix=key_prefix(),
+                        session_id=node_id,
+                        machine=machine,
+                    )
+                except Exception:
+                    pass
 
                 if not is_node_idle(r, node_id):
                     continue
@@ -297,12 +312,59 @@ def run_daemon(
                 # Double-delivery is therefore prevented by the hook, not by the
                 # daemon pre-emptively clearing a flag it cannot validate.
                 logger.info("Notifying %s: %s", session_name, summary)
-                if not inject_via_tmux(session_name, summary):
+                ok = inject_via_tmux(session_name, summary)
+                try:
+                    from notifications.trace import trace
+                    trace(r, "inject", node=session_name, ok=ok)
+                except Exception:
+                    pass
+                try:
+                    record_delivery_signal(
+                        r,
+                        prefix=key_prefix(),
+                        target_session_id=node_id,
+                        signal="inject_ok" if ok else "inject_failed",
+                        signal_source="notify-daemon",
+                        machine=machine,
+                    )
+                except Exception:
+                    pass
+                if not ok:
                     logger.error(
                         "Injection failed for %s; idle left set, will retry next poll",
                         session_name,
                     )
 
+            inbox_pattern = f"{key_prefix()}:*:inbox"
+            for inbox in r.scan_iter(match=inbox_pattern):
+                parts = str(inbox).split(":")
+                if len(parts) < 3:
+                    continue
+                target_session_id = parts[-2]
+                if target_session_id in local_session_set:
+                    continue
+                if not has_pending_messages(r, target_session_id):
+                    continue
+                machine_key = session_machine_key(key_prefix(), target_session_id)
+                if r.get(machine_key) != machine:
+                    continue
+                try:
+                    record_delivery_signal(
+                        r,
+                        prefix=key_prefix(),
+                        target_session_id=target_session_id,
+                        signal="tmux_missing",
+                        signal_source="notify-daemon",
+                        machine=machine,
+                    )
+                except Exception:
+                    pass
+
+            try:
+                from notifications.trace import trim_trace
+                trim_trace(r)
+            except Exception:
+                pass
             time.sleep(poll_interval)
         except KeyboardInterrupt:
             logger.info("Daemon stopped")

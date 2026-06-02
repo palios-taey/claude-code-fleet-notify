@@ -1,0 +1,82 @@
+#!/usr/bin/env python3
+"""Read the notification-delivery trace (taey:notify_trace).
+
+Shows the full delivery chain per event so a missed wake is traceable:
+  enqueue -> idle_set / stop_blocked -> inject(ok?) | drain -> idle_clear
+
+Usage:
+  taey-trace                  # last 60 events, all nodes
+  taey-trace -n conductor     # filter to one node
+  taey-trace -t 200           # last 200 events
+  taey-trace -f               # follow (poll) new events
+"""
+import argparse
+import os
+import sys
+import time
+from datetime import datetime
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+
+
+def _connect():
+    host = os.environ.get("ORCH_REDIS_HOST", os.environ.get("REDIS_HOST", "127.0.0.1"))
+    port = int(os.environ.get("ORCH_REDIS_PORT", os.environ.get("REDIS_PORT", "6379")))
+    import redis
+    return redis.Redis(host=host, port=port, decode_responses=True)
+
+
+def _fmt(entry_id, fields):
+    wall = fields.get("wall")
+    try:
+        ts = datetime.fromtimestamp(float(wall)).strftime("%H:%M:%S")
+    except Exception:
+        ts = (entry_id or "").split("-")[0]
+    ev = fields.get("ev", "?")
+    node = fields.get("node", "")
+    extra = " ".join(
+        f"{k}={v}" for k, v in fields.items() if k not in ("ev", "node", "wall")
+    )
+    return f"{ts}  {node:18.18}  {ev:14.14}  {extra}"
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("-n", "--node", help="filter to one node")
+    ap.add_argument("-t", "--tail", type=int, default=60, help="number of recent events")
+    ap.add_argument("-f", "--follow", action="store_true", help="follow new events")
+    args = ap.parse_args()
+
+    r = _connect()
+    stream = "taey:notify_trace"
+
+    rows = r.xrevrange(stream, "+", "-", count=args.tail)
+    rows = list(reversed(rows))
+    for entry_id, fields in rows:
+        if args.node and fields.get("node") != args.node:
+            continue
+        print(_fmt(entry_id, fields))
+
+    if not args.follow:
+        return
+    last = rows[-1][0] if rows else "$"
+    if last == "$":
+        last = "0-0"
+    while True:
+        try:
+            res = r.xread({stream: last}, block=2000, count=50)
+        except KeyboardInterrupt:
+            return
+        if not res:
+            time.sleep(0.2)
+            continue
+        for _stream, entries in res:
+            for entry_id, fields in entries:
+                last = entry_id
+                if args.node and fields.get("node") != args.node:
+                    continue
+                print(_fmt(entry_id, fields))
+
+
+if __name__ == "__main__":
+    main()

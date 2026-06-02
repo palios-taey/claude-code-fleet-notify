@@ -9,6 +9,7 @@ from contextlib import redirect_stdout
 from unittest import mock
 
 from notifications.inbox import inbox_key, notifications_key, state_key
+from notifications.handoff import explicit_ack_key, pending_receipts_key
 from tests.fakes import FakeRedis
 
 
@@ -56,6 +57,44 @@ class UserPromptSubmitHookTests(HookTestCase):
         self.assertEqual(0, r.llen(inbox_key("session-b")))
         context = result["hookSpecificOutput"]["additionalContext"]
         self.assertIn("hello", context)
+
+    def test_user_prompt_writes_passive_receipt_only_on_next_prompt(self):
+        r = FakeRedis()
+        msg = {
+            "from": "conductor-codex",
+            "type": "command",
+            "body": "handoff body",
+            "msg_id": "123e4567-e89b-12d3-a456-426614174000",
+            "handoff_kind": "explicit_handoff",
+            "dispatcher_session_id": "conductor-codex",
+            "target_session_id": "session-b",
+            "message_hash": "hash-1",
+        }
+        with mock.patch.dict(
+            "os.environ",
+            {
+                "CF_HANDOFF_ACK_PASSIVE": "1",
+                "CF_HANDOFF_ACK_PASSIVE_SESSIONS": "session-b",
+            },
+            clear=False,
+        ):
+            r.lpush(inbox_key("session-b"), json.dumps(msg))
+            first = self.run_hook("hooks.prompt_activity", r, "")
+            self.assertIn("handoff body", first["hookSpecificOutput"]["additionalContext"])
+            self.assertNotIn(
+                explicit_ack_key("taey", "conductor-codex", "session-b", msg["msg_id"]),
+                r.store,
+            )
+            self.assertIn(pending_receipts_key("taey", "session-b"), r.store)
+
+            second = self.run_hook("hooks.prompt_activity", r, "")
+            self.assertEqual({}, second)
+            ack_key = explicit_ack_key("taey", "conductor-codex", "session-b", msg["msg_id"])
+            self.assertIn(ack_key, r.store)
+            self.assertEqual(
+                {"ack_by": "session-b", "message_hash": "hash-1"},
+                json.loads(r.store[ack_key]),
+            )
 
 
 class PreToolUseHookTests(HookTestCase):

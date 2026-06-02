@@ -49,11 +49,11 @@ All four supported CLIs run the same Redis state machine (`idle` / `tool_running
 | Claude Code | `~/.claude/settings.json` | JSON | `PreToolUse` / `PostToolUse` / `Stop` / `UserPromptSubmit` | `pre_tool_activity.py` / `check_notifications.py` / `stop_idle.py` / `prompt_activity.py` |
 | OpenAI codex | `~/.codex/hooks.json` | JSON | `PreToolUse` / `PostToolUse` / `Stop` / `UserPromptSubmit` | `codex_pre_tool.py` / `codex_post_tool.py` / `codex_stop.py` / `codex_user_prompt.py` |
 | Google gemini | `~/.gemini/settings.json` | JSON | `BeforeTool` / `AfterTool` / `AfterAgent` / `BeforeAgent` | `gemini_before_tool.py` / `gemini_after_tool.py` / `gemini_after_agent.py` / `gemini_before_agent.py` |
-| xAI grok | inherits `~/.claude/settings.json` | n/a (auto-inherits) | `PreToolUse` / `PostToolUse` / `Stop` / `UserPromptSubmit` | same Claude Code scripts (no separate grok variants needed) |
+| xAI grok | `~/.grok/hooks/cf-notify.json` | global file, no project trust required | `SessionStart` / `PreToolUse` / `PostToolUse` / `Stop` / `UserPromptSubmit` | `grok_session_start.py`, `grok_stop.py`, `grok_user_prompt.py` plus shared tool hooks |
 
 Use `bash scripts/install-hooks.sh --help` for the full installation matrix. `--apply` writes a timestamped backup of each affected config file before changing it; without `--apply` the script is a dry-run that prints unified diffs and exits.
 
-> **Grok inheritance**: xAI's `grok-cli` reads its hook configuration from `~/.claude/settings.json` automatically, verified via `grok inspect` which reports `Hooks (4)` sourced from that file. Installing Claude Code hooks therefore enables Grok at the same time. There is no `~/.grok/hooks.json` or grok-specific config — and no separate `grok_*.py` hook scripts in this package, because Grok and Claude Code share the same event names + envelope shape.
+> **Grok global hooks**: use the dedicated `~/.grok/hooks/cf-notify.json` file. This is the only way to close the boot gap cleanly, because `SessionStart` can mark `idle=1` before the first prompt. Global Grok hooks do not require project trust.
 
 ### Universal Stop+notify (v0.2.0+)
 
@@ -136,7 +136,7 @@ bash scripts/install-hooks.sh --apply         # write after review
 Add `--codex` / `--gemini` / `--all` to install additional CLIs' hooks in the same invocation:
 
 ```bash
-bash scripts/install-hooks.sh --all --apply   # all four (claude + codex + gemini + grok-by-inheritance)
+bash scripts/install-hooks.sh --all --apply   # claude + codex + gemini
 ```
 
 Each CLI's config file gets a timestamped backup before being written. `bash scripts/install-hooks.sh --help` for the full flag list.

@@ -63,6 +63,14 @@ def main():
     parser.add_argument('--redis-port', type=int, default=REDIS_PORT)
     parser.add_argument('--key-prefix', default=NOTIFY_KEY_PREFIX,
                         help='Redis key prefix (default: NOTIFY_KEY_PREFIX or taey)')
+    parser.add_argument('--handoff', action='store_true',
+                        help='Create an explicit handoff record plus inbox message')
+    parser.add_argument('--dispatcher-task-id', default=None,
+                        help='Dispatcher task id for explicit handoff records')
+    parser.add_argument('--actionable-inputs', default=None,
+                        help='JSON object written into the explicit handoff record')
+    parser.add_argument('--ack-deadline-secs', type=int, default=300,
+                        help='Long safety backstop in seconds for explicit handoffs; short pickup window comes from CF_HANDOFF_PICKUP_POLL_BUDGET (default: 300)')
     args = parser.parse_args()
 
     from_node = args.from_node or detect_from_node()
@@ -87,17 +95,52 @@ def main():
         print(f"ERROR: Cannot connect to Redis at {args.redis_host}:{args.redis_port}: {e}",
               file=sys.stderr)
         sys.exit(1)
+    if args.handoff:
+        from notifications.handoff import create_explicit_handoff
 
-    msg = json.dumps({
-        "from": from_node,
-        "type": args.type,
-        "body": args.message,
-        "timestamp": time.time(),
-        "priority": args.priority,
-        "msg_id": uuid.uuid4().hex[:12],
-    })
-
-    r.lpush(f"{args.key_prefix}:{args.target}:inbox", msg)
+        actionable_inputs = {}
+        if args.actionable_inputs:
+            try:
+                actionable_inputs = json.loads(args.actionable_inputs)
+            except json.JSONDecodeError as exc:
+                print(f"ERROR: --actionable-inputs must be valid JSON: {exc}", file=sys.stderr)
+                sys.exit(1)
+            if not isinstance(actionable_inputs, dict):
+                print("ERROR: --actionable-inputs must decode to a JSON object", file=sys.stderr)
+                sys.exit(1)
+        payload = create_explicit_handoff(
+            r,
+            prefix=args.key_prefix,
+            dispatcher_session_id=from_node,
+            target_session_id=args.target,
+            body=args.message,
+            msg_type=args.type,
+            priority=args.priority,
+            dispatcher_task_id=args.dispatcher_task_id,
+            actionable_inputs=actionable_inputs,
+            ack_deadline_secs=args.ack_deadline_secs,
+        )
+        msg_id = payload["msg_id"]
+    else:
+        msg = json.dumps({
+            "from": from_node,
+            "type": args.type,
+            "body": args.message,
+            "timestamp": time.time(),
+            "priority": args.priority,
+            "msg_id": uuid.uuid4().hex[:12],
+        })
+        r.lpush(f"{args.key_prefix}:{args.target}:inbox", msg)
+        msg_id = json.loads(msg)["msg_id"]
+    try:
+        r.xadd(
+            f"{args.key_prefix}:notify_trace",
+            {"ev": "enqueue", "node": args.target, "src": "taey-notify",
+             "type": args.type, "frm": from_node, "wall": f"{time.time():.3f}", "msg_id": msg_id},
+            maxlen=50000, approximate=True,
+        )
+    except Exception:
+        pass
     print(f"OK: sent to {args.target} [{args.type}] from {from_node}")
 
 

@@ -6,9 +6,8 @@ set -euo pipefail
 # Default: Claude Code only (~/.claude/settings.json).
 # Flags select additional CLIs whose hook configs should also be wired.
 #
-# Grok (~/.grok/) needs NO separate install — grok-cli reads hook configs
-# from ~/.claude/settings.json automatically (verified via `grok inspect`).
-# So installing Claude Code hooks also enables Grok by inheritance.
+# Grok uses its own dedicated global hook file at ~/.grok/hooks/cf-notify.json.
+# This script does not install it; see docs/grok-hooks.md.
 
 APPLY=0
 INSTALL_CLAUDE=1
@@ -60,17 +59,16 @@ CLIs (each writes to its own config file format):
   --gemini            Google gemini→ ~/.gemini/settings.json (JSON, different event names)
   --all               codex + gemini
 
-Grok (xAI grok-cli) needs NO separate install — it reads hooks from
-~/.claude/settings.json automatically, so installing Claude Code hooks
-also enables Grok by inheritance. Verified via `grok inspect`.
+Grok (xAI grok-cli) should use ~/.grok/hooks/cf-notify.json.
+This installer does not wire Grok; see docs/grok-hooks.md.
 
 Without --apply, no files are written (dry-run). With --apply, a
 timestamped backup is created before updating each settings file.
 
 Examples:
   install-hooks.sh                       # dry-run Claude Code only
-  install-hooks.sh --apply               # install Claude Code only (+ Grok by inheritance)
-  install-hooks.sh --all --apply         # install all four CLIs
+  install-hooks.sh --apply               # install Claude Code only
+  install-hooks.sh --all --apply         # install Claude Code + codex + gemini
   install-hooks.sh --codex --gemini      # dry-run codex + gemini (skip Claude Code)
                                          #  -- use with --claude-only=false implicitly
 USAGE
@@ -231,11 +229,11 @@ if not any_enabled:
           "--codex --gemini --all", file=sys.stderr)
     sys.exit(2)
 
-# Grok inheritance note — always print so users know.
+# Grok note — always print so users know where to wire it.
 print("")
-print("[grok] No separate install required. xAI grok-cli reads hooks from")
-print("       ~/.claude/settings.json automatically (verified via `grok inspect`).")
-print("       Installing Claude Code hooks also enables Grok by inheritance.")
+print("[grok] Separate wiring required: use ~/.grok/hooks/cf-notify.json")
+print("       and point it at hooks/grok_session_start.py, grok_stop.py,")
+print("       and grok_user_prompt.py. See docs/grok-hooks.md.")
 
 if not apply:
     print("")

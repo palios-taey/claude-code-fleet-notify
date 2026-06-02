@@ -123,6 +123,53 @@ class CliTests(unittest.TestCase):
             msg = json.loads(raw)
             self.assertEqual("session-a", msg["from"])
             self.assertEqual("hello", msg["body"])
+            self.assertEqual([], [key for key in data if ":handoff:" in key])
+
+    def test_taey_notify_handoff_creates_scoped_record_with_uuid(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_dir = Path(tmp)
+            (fake_dir / "redis.py").write_text(FAKE_REDIS)
+            state = fake_dir / "state.json"
+            env = os.environ.copy()
+            env.update({
+                "PYTHONPATH": f"{fake_dir}:{ROOT}",
+                "FAKE_REDIS_STATE": str(state),
+                "TAEY_NODE_ID": "conductor-codex",
+                "CF_HANDOFF_ENFORCE": "1",
+                "CF_HANDOFF_ENFORCE_SESSIONS": "conductor-codex",
+            })
+
+            self.run_cli(
+                [
+                    "scripts/taey-notify",
+                    "worker-codex",
+                    "please take this task",
+                    "--handoff",
+                    "--dispatcher-task-id",
+                    "task-123",
+                    "--actionable-inputs",
+                    '{"packet_hash":"abc"}',
+                ],
+                env,
+            )
+
+            data = json.loads(state.read_text())
+            inbox_raw = data["taey:worker-codex:inbox"][0]
+            inbox_msg = json.loads(inbox_raw)
+            self.assertEqual("explicit_handoff", inbox_msg["handoff_kind"])
+            self.assertRegex(
+                inbox_msg["msg_id"],
+                r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+            )
+            record_key = f"taey:handoff:conductor-codex:{inbox_msg['msg_id']}"
+            self.assertIn(record_key, data)
+            record = json.loads(data[record_key])
+            self.assertEqual("explicit_handoff", record["kind"])
+            self.assertEqual("worker-codex", record["target_session_id"])
+            self.assertEqual("task-123", record["dispatcher_task_id"])
+            self.assertEqual(5, record["pickup_poll_budget"])
+            self.assertEqual("queued", record["delivery_state"])
+            self.assertIn("ack_backstop_at", record)
 
     def test_taey_ack_peek_does_not_clear_and_ack_drains_with_pops(self):
         with tempfile.TemporaryDirectory() as tmp:

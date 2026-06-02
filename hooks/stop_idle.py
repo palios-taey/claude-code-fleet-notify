@@ -65,6 +65,11 @@ def main():
     if decision:
         _cache_stop_decision(r, node_id, decision)
         if decision.get("block"):
+            try:
+                from notifications.trace import trace
+                trace(r, "stop_blocked", node=node_id, wake_type=decision.get("wake_type"))
+            except Exception:
+                pass
             print(json.dumps({"decision": "block", "reason": decision.get("reason")}))
             sys.exit(0)
 

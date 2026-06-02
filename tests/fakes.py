@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from fnmatch import fnmatch
 
 
 class FakeRedis:
@@ -69,6 +70,17 @@ class FakeRedis:
 
     def exists(self, key):
         return 1 if key in self.store else 0
+
+    def scan_iter(self, match=None, count=None):
+        del count
+        keys = list(self.store.keys())
+        if match is None:
+            for key in keys:
+                yield key
+            return
+        for key in keys:
+            if fnmatch(key, match):
+                yield key
 
     def eval(self, script, numkeys, *args):
         current_task_key, last_outcome_key, marker_key = args[:3]

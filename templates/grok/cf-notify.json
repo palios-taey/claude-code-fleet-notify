@@ -1,0 +1,37 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ${CF_NOTIFY_REPO_ROOT:-$HOME/claude-code-fleet-notify}/hooks/grok_session_start.py",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ${CF_NOTIFY_REPO_ROOT:-$HOME/claude-code-fleet-notify}/hooks/grok_stop.py",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ${CF_NOTIFY_REPO_ROOT:-$HOME/claude-code-fleet-notify}/hooks/grok_user_prompt.py",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

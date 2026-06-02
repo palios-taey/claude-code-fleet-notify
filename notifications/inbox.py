@@ -148,6 +148,11 @@ def send(
         **extra,
     )
     redis_client.lpush(inbox_key(target_node), _encode_message(payload))
+    try:
+        from notifications.trace import trace
+        trace(redis_client, "enqueue", node=target_node, src="inbox", type=msg_type, frm=from_node)
+    except Exception:
+        pass
     return True
 
 
@@ -169,6 +174,11 @@ def send_notification(
         **extra,
     )
     redis_client.rpush(notifications_key(target_node), _encode_message(payload))
+    try:
+        from notifications.trace import trace
+        trace(redis_client, "enqueue", node=target_node, src="notifications", type=msg_type, frm=from_node)
+    except Exception:
+        pass
     return True
 
 
@@ -221,11 +231,19 @@ def drain_all(redis_client, node_id: str, max_count: Optional[int] = None) -> di
 
     Returned lists are ordered oldest → newest so callers can render them directly.
     """
-    return {
+    result = {
         "inbox": _pop_many(redis_client, inbox_key(node_id), "rpop", max_count),
         "notifications": _pop_many(redis_client, notifications_key(node_id), "lpop", max_count),
         "orch": _pop_many(redis_client, orch_key(node_id), "lpop", max_count),
     }
+    try:
+        n = len(result["inbox"]) + len(result["notifications"]) + len(result["orch"])
+        if n:
+            from notifications.trace import trace
+            trace(redis_client, "drain", node=node_id, count=n)
+    except Exception:
+        pass
+    return result
 
 
 def requeue_all(redis_client, node_id: str, messages_by_source: dict) -> None:

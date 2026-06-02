@@ -14,7 +14,7 @@ Current version: v1.0.2
 ## Scope (what this is and what this isn't)
 
 In scope:
-- **Terminal-native REPL CLIs that expose hook events**: Claude Code, OpenAI codex, Google gemini (field-verified), xAI grok (via Claude Code config inheritance, field-verified).
+- **Terminal-native REPL CLIs that expose hook events**: Claude Code, OpenAI codex, Google gemini (field-verified), xAI grok (field-verified with dedicated Grok hooks).
 - Single-machine tmux fleets where the daemon, hooks, and supervisor sessions share one Redis.
 
 Out of scope (will fail silently or partially — adopters: don't):
@@ -22,7 +22,7 @@ Out of scope (will fail silently or partially — adopters: don't):
 - **Many-to-many distributed graph topologies** — the supervisor↔worker abstraction here is point-to-point with optional multi-level via explicit `parent` override. Fanout/aggregate workflows need a different layer.
 - **Non-hookable REPLs** — if a CLI has no equivalent of Stop / UserPromptSubmit / Pre+PostToolUse (or comparable lifecycle events), the universal Stop+notify primitive has nothing to attach to and the daemon's pointer injection won't have a UserPromptSubmit hook on the receiving side to drain the inbox.
 
-> **Integration verification status**: Claude Code (field-verified, the original target). xAI grok (field-verified, `grok inspect` shows the 4 inherited hooks). OpenAI codex (integration-tested via the per-CLI hook variants; field-verified on the Mira fleet via per-parent peers). Google gemini (integration-tested via the per-CLI hook variants; field-verified via the same per-parent peers, with the known BeforeTool/AfterTool event-name mapping).
+> **Integration verification status**: Claude Code (field-verified, the original target). xAI grok (field-verified with dedicated `~/.grok/hooks/cf-notify.json`, including boot-time `SessionStart` idle marking). OpenAI codex (integration-tested via the per-CLI hook variants; field-verified on the Mira fleet via per-parent peers). Google gemini (integration-tested via the per-CLI hook variants; field-verified via the same per-parent peers, with the known BeforeTool/AfterTool event-name mapping).
 
 ## Supported CLIs
 
@@ -31,7 +31,7 @@ Out of scope (will fail silently or partially — adopters: don't):
 | Claude Code | `~/.claude/settings.json` | `PreToolUse` / `PostToolUse` / `Stop` / `UserPromptSubmit` | `install-hooks.sh --apply` |
 | OpenAI codex | `~/.codex/hooks.json` | same as Claude Code | `install-hooks.sh --codex --apply` |
 | Google gemini | `~/.gemini/settings.json` | `BeforeTool` / `AfterTool` / `BeforeAgent` / `AfterAgent` | `install-hooks.sh --gemini --apply` |
-| xAI grok | inherits `~/.claude/settings.json` automatically | same as Claude Code | *(no separate install; covered by Claude Code install)* |
+| xAI grok | `~/.grok/hooks/cf-notify.json` | `SessionStart` / `UserPromptSubmit` / `PreToolUse` / `PostToolUse` / `Stop` | copy `templates/grok/cf-notify.json`; see `docs/grok-hooks.md` |
 
 All four CLIs share the same Redis state machine via per-CLI hook variants that route through one shared `hooks/_shared.py` helper. The supervisor-worker primitive (v0.2.0 universal Stop+notify) works identically across them: when a worker stops, its Stop hook resolves the supervisor (via `taey:<worker>:parent` override or `<name>-codex` / `<name>-gemini` / `<name>-grok` suffix-strip), reads `taey:<worker>:current_task` (set by the dispatcher) + `taey:<worker>:last_outcome` (optionally set by the worker), and pushes a single `peer_idle` message with the outcome inline.
 
@@ -90,7 +90,7 @@ Optional integration settings:
 
 ## Install Hooks
 
-Default behavior is Claude Code only (which also enables Grok by inheritance, see CLI table above):
+Default behavior is Claude Code only:
 
 ```bash
 bash scripts/install-hooks.sh                # dry-run, print diff
@@ -102,12 +102,12 @@ For codex and/or gemini, pass the corresponding flags:
 ```bash
 bash scripts/install-hooks.sh --codex --apply             # + codex
 bash scripts/install-hooks.sh --gemini --apply            # + gemini
-bash scripts/install-hooks.sh --all --apply               # claude + codex + gemini (+ grok by inheritance)
+bash scripts/install-hooks.sh --all --apply               # claude + codex + gemini
 ```
 
 Each CLI's settings file gets a timestamped backup before being written. Without `--apply`, the installer is dry-run only — it prints the unified diff and writes nothing. `bash scripts/install-hooks.sh --help` for the full flag list.
 
-> **Grok** (xAI `grok-cli`) requires no separate install. It reads its hook configuration from `~/.claude/settings.json` automatically — verified via `grok inspect` which shows `Hooks (4)` sourced from the Claude Code path. Installing Claude Code hooks therefore enables Grok as well.
+> **Grok** (xAI `grok-cli`) should use the dedicated global hook file `~/.grok/hooks/cf-notify.json` so `SessionStart` can mark idle at boot. See `docs/grok-hooks.md`.
 
 ## Run The Daemon
 

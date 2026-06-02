@@ -55,6 +55,89 @@ class DaemonTests(unittest.TestCase):
         self.assertEqual(1, r.llen(inbox_key("session-b")))
         self.assertTrue(r.exists(state_key("session-b", "idle")))
 
+    def test_handoff_injection_success_records_poll_signal(self):
+        r = FakeRedis()
+        r.set(state_key("worker-codex", "idle"), "1")
+        payload = {
+            "from": "conductor-codex",
+            "type": "command",
+            "body": "handoff body",
+            "msg_id": "123e4567-e89b-12d3-a456-426614174000",
+            "handoff_kind": "explicit_handoff",
+            "dispatcher_session_id": "conductor-codex",
+            "target_session_id": "worker-codex",
+            "message_hash": "hash-1",
+        }
+        record_key = "taey:handoff:conductor-codex:123e4567-e89b-12d3-a456-426614174000"
+        r.lpush(inbox_key("worker-codex"), json.dumps(payload))
+        r.set(record_key, json.dumps({
+            "kind": "explicit_handoff",
+            "dispatcher_session_id": "conductor-codex",
+            "target_session_id": "worker-codex",
+            "dispatcher_task_id": "task-123",
+            "msg_id": payload["msg_id"],
+            "message_hash": "hash-1",
+            "created_at": 1.0,
+            "ack_deadline_at": 9999999999.0,
+            "ack_backstop_at": 9999999999.0,
+            "pickup_poll_budget": 5,
+            "delivery_poll_count": 0,
+            "delivery_state": "queued",
+        }))
+
+        fake_redis_module = SimpleNamespace(Redis=lambda **kwargs: r)
+        with mock.patch.dict(sys.modules, {"redis": fake_redis_module}):
+            with mock.patch.object(daemon, "get_local_tmux_sessions", return_value=["worker-codex"]):
+                with mock.patch.object(daemon, "inject_via_tmux", return_value=True):
+                    with mock.patch.object(daemon.time, "sleep", side_effect=KeyboardInterrupt):
+                        daemon.run_daemon("127.0.0.1", 6379, 1)
+
+        record = json.loads(r.get(record_key))
+        self.assertEqual("injected_waiting_ack", record["delivery_state"])
+        self.assertEqual("inject_ok", record["last_delivery_signal"])
+        self.assertEqual(1, record["delivery_poll_count"])
+
+    def test_missing_tmux_marks_local_handoff_not_deliverable(self):
+        r = FakeRedis()
+        payload = {
+            "from": "conductor-codex",
+            "type": "command",
+            "body": "handoff body",
+            "msg_id": "223e4567-e89b-12d3-a456-426614174000",
+            "handoff_kind": "explicit_handoff",
+            "dispatcher_session_id": "conductor-codex",
+            "target_session_id": "worker-codex",
+            "message_hash": "hash-2",
+        }
+        record_key = "taey:handoff:conductor-codex:223e4567-e89b-12d3-a456-426614174000"
+        r.set("taey:worker-codex:machine", "test-host")
+        r.lpush(inbox_key("worker-codex"), json.dumps(payload))
+        r.set(record_key, json.dumps({
+            "kind": "explicit_handoff",
+            "dispatcher_session_id": "conductor-codex",
+            "target_session_id": "worker-codex",
+            "dispatcher_task_id": "task-456",
+            "msg_id": payload["msg_id"],
+            "message_hash": "hash-2",
+            "created_at": 1.0,
+            "ack_deadline_at": 9999999999.0,
+            "ack_backstop_at": 9999999999.0,
+            "pickup_poll_budget": 5,
+            "delivery_poll_count": 0,
+            "delivery_state": "queued",
+        }))
+
+        fake_redis_module = SimpleNamespace(Redis=lambda **kwargs: r)
+        with mock.patch.dict(sys.modules, {"redis": fake_redis_module}):
+            with mock.patch.object(daemon, "get_local_tmux_sessions", return_value=[]):
+                with mock.patch.object(daemon.socket, "gethostname", return_value="test-host"):
+                    with mock.patch.object(daemon.time, "sleep", side_effect=KeyboardInterrupt):
+                        daemon.run_daemon("127.0.0.1", 6379, 1)
+
+        record = json.loads(r.get(record_key))
+        self.assertEqual("not_deliverable", record["delivery_state"])
+        self.assertEqual("tmux_missing", record["delivery_failure_reason"])
+
 
 if __name__ == "__main__":
     unittest.main()

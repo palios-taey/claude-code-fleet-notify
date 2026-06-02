@@ -55,6 +55,11 @@ from notifications.inbox import (
     WAKE_REASON_REQUIRED,
     WAKE_WITH_QUEUE,
 )
+from notifications.handoff import (
+    handoff_flags_for_session,
+    flush_pending_receipts,
+    queue_pending_receipts,
+)
 
 _ORCH_API_BASE = os.environ.get("ORCH_API_BASE", "http://127.0.0.1:5002")
 _DEFAULT_HEARTBEAT_SECS = 300
@@ -209,9 +214,15 @@ def action_post_tool(r, node_id: str, tool_name: str = "") -> str:
     # Drain message queues
     messages = []
     try:
-        from notifications.inbox import drain_all, flatten_sources
+        from notifications.inbox import drain_all, flatten_sources, key_prefix
         drained = drain_all(r, node_id)
         messages = flatten_sources(drained)
+        queue_pending_receipts(
+            r,
+            prefix=key_prefix(),
+            target_session_id=node_id,
+            messages=messages,
+        )
         log_debug(node_id, f"POST-TOOL: drained {len(messages)} msgs (tool={tool_name})")
     except Exception as e:
         log_debug(node_id, f"drain error: {e}\n{traceback.format_exc()}")
@@ -632,12 +643,36 @@ def action_stop(r, node_id: str) -> None:
         r.delete(state_key(node_id, "tool_running"))
         r.set(state_key(node_id, "last_activity"), str(time.time()))
         log_debug(node_id, "STOP: idle=1")
+        try:
+            from notifications.trace import trace
+            trace(r, "idle_set", node=node_id)
+        except Exception:
+            pass
 
         supervisor = _resolve_supervisor(r, node_id)
         if supervisor:
             _notify_supervisor_of_stop(r, node_id, supervisor)
     except Exception as e:
         log_debug(node_id, f"action_stop error: {e}")
+
+
+def action_session_start(r, node_id: str) -> None:
+    """SessionStart: mark a fresh session idle so daemon delivery works
+    before the first user or bootstrap prompt."""
+    try:
+        from notifications.inbox import state_key
+
+        r.set(state_key(node_id, "idle"), "1")
+        r.delete(state_key(node_id, "tool_running"))
+        r.set(state_key(node_id, "last_activity"), str(time.time()))
+        log_debug(node_id, "SESSION-START: idle=1")
+        try:
+            from notifications.trace import trace
+            trace(r, "idle_set", node=node_id, src="grok_session_start")
+        except Exception:
+            pass
+    except Exception as e:
+        log_debug(node_id, f"action_session_start error: {e}")
 
 
 def action_user_prompt(r, node_id: str) -> str:
@@ -657,14 +692,34 @@ def action_user_prompt(r, node_id: str) -> str:
 
         r.delete(state_key(node_id, "idle"))
         r.set(state_key(node_id, "last_activity"), str(time.time()))
+        try:
+            from notifications.trace import trace
+            trace(r, "idle_clear", node=node_id)
+        except Exception:
+            pass
     except Exception as e:
         log_debug(node_id, f"action_user_prompt error: {e}")
 
     messages = []
     try:
-        from notifications.inbox import drain_all, flatten_sources
+        from notifications.inbox import drain_all, flatten_sources, key_prefix
+        flags = handoff_flags_for_session(node_id)
+        written = flush_pending_receipts(
+            r,
+            prefix=key_prefix(),
+            target_session_id=node_id,
+            ack_passive_enabled=flags["ack_passive"],
+        )
+        if written:
+            log_debug(node_id, f"USER-PROMPT: wrote {len(written)} passive handoff receipts")
         drained = drain_all(r, node_id)
         messages = flatten_sources(drained)
+        queue_pending_receipts(
+            r,
+            prefix=key_prefix(),
+            target_session_id=node_id,
+            messages=messages,
+        )
         log_debug(node_id, f"USER-PROMPT: idle cleared, drained {len(messages)} msgs")
     except Exception as e:
         log_debug(node_id, f"USER-PROMPT drain error: {e}")
