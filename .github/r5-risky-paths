@@ -1,0 +1,23 @@
+# R5 risky surfaces for claude-code-fleet-notify — a PR touching ANY of these
+# requires both adversarial auditors (audit/grok + audit/gatekeeper) to post a
+# success commit status before it can merge (enforced by r5-audit-gate.yml).
+#
+# DESIGN: broad default-covering GLOBS, not a drift-prone allowlist (the
+# orchestrator's allowlist omitted real buggy files — same lesson here).
+# Over-gate trivial changes for safety > under-gate a fleet-wide-blast surface.
+#
+# The hook layer — a bad hook command disabled every tool on the machine once
+# (the 2026-06-11 outage class); changes here drive every session:
+hooks/*.py
+# The delivery library (inbox/daemon/handoff/trace):
+notifications/*.py
+# The installer (wires the hooks; the outage came through here) + daemon + deploy:
+scripts/install-hooks.sh
+scripts/start_notify_daemons.sh
+scripts/atomic_deploy.sh
+scripts/_stage_b_api.py
+# CI / gate config itself (self-protecting):
+.github/workflows/*.yml
+.github/r5-risky-paths
+# Packaging:
+setup.py
