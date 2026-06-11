@@ -20,6 +20,12 @@ import sys
 import time
 import uuid
 
+# Symlink-safe repo-root bootstrap (matches taey-handoff): the --handoff path
+# lazily imports `notifications.handoff`, which fails with ModuleNotFoundError
+# when this CLI is invoked via its /usr/local/bin symlink (sys.path[0] is the
+# symlink's dir). realpath resolves to the real scripts/ dir; parent = repo.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+
 REDIS_HOST = os.environ.get('REDIS_HOST', '127.0.0.1')
 REDIS_PORT = int(os.environ.get('REDIS_PORT', '6379'))
 NOTIFY_KEY_PREFIX = os.environ.get('NOTIFY_KEY_PREFIX', 'taey')
