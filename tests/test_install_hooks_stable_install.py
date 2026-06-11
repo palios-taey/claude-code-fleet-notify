@@ -184,6 +184,53 @@ class StableInstallShape(unittest.TestCase):
             rc = subprocess.run(["sh", "-c", cmd]).returncode
             self.assertEqual(rc, 2)
 
+    def test_foreign_hooks_mentioning_script_names_survive(self):
+        # Audit finding (grok R5 @88fa484): a substring dedupe would drop
+        # foreign hooks whose command merely mentions one of our script
+        # names inside a longer token. Match must be by argv-token basename.
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            checkout = _make_checkout(td)
+            foreign = [
+                "python3 /backups/stop_idle.py.bak",
+                "tail -n 5 /var/log/stop_idle.py.log",
+                "python3 /x/pre_tool_activity.py.disabled",
+            ]
+            pre = {"hooks": {"Stop": [
+                {"hooks": [{"type": "command", "command": cmd, "timeout": 1000}
+                           for cmd in foreign]},
+                {"hooks": [{"type": "command",
+                            "command": "python3 /old/hooks/stop_idle.py",
+                            "timeout": 5000}]},
+            ]}}
+            (td / "settings.json").write_text(json.dumps(pre))
+            _run_installer(checkout, td)
+            cmds = _commands(_settings(td), "Stop")
+            for cmd in foreign:
+                self.assertIn(cmd, cmds, f"foreign hook dropped: {cmd}")
+            ours = [c for c in cmds if c.endswith("stop_idle.py'")
+                    or shlex.split(c)[-1].endswith("/stop_idle.py")]
+            self.assertEqual(len(ours), 1, cmds)
+
+    def test_incomplete_checkout_refuses_before_writing_anything(self):
+        # Audit finding (grok R5 @88fa484): an incomplete source checkout
+        # must fail loud BEFORE any copy or settings write — never emit a
+        # command for a runtime file that will not exist.
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            checkout = _make_checkout(td)
+            (checkout / "hooks" / "stop_idle.py").unlink()
+            original = '{"keep": "me"}'
+            (td / "settings.json").write_text(original)
+            with self.assertRaises(subprocess.CalledProcessError) as ctx:
+                _run_installer(checkout, td)
+            self.assertIn("incomplete checkout", ctx.exception.stderr)
+            self.assertIn("stop_idle.py", ctx.exception.stderr)
+            self.assertEqual((td / "settings.json").read_text(), original,
+                             "settings were modified despite refusal")
+            self.assertFalse((td / "runtime").exists(),
+                             "runtime files were written despite refusal")
+
     def test_second_run_is_a_noop(self):
         with tempfile.TemporaryDirectory() as td:
             td = Path(td)

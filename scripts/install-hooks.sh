@@ -130,6 +130,27 @@ hooks_src = repo_dir / "hooks"
 hooks_dir = install_root / "hooks"
 
 
+def runs_script(command: str, script_name: str) -> bool:
+    """True if a settings hook command executes this hook script.
+
+    Matches by argv-token basename so every historical form is caught
+    (bare checkout paths, guard-wrapped compounds, any directory), while
+    commands that merely mention the name inside a longer token
+    (stop_idle.py.bak, stop_idle.py.log) are NOT ours and must survive.
+    """
+    if script_name not in command:
+        return False
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        # Unparseable command that mentions our script: do not guess.
+        # Leave it untouched and say so — the operator decides.
+        print(f"WARNING: unparseable hook command left untouched: {command}",
+              file=sys.stderr)
+        return False
+    return any(Path(token).name == script_name for token in tokens)
+
+
 def sync_runtime() -> list[str]:
     """Refresh runtime hook copies; seed .env only on first install.
 
@@ -242,7 +263,7 @@ def patch_one(cli_name: str, spec: dict) -> tuple[str, str, str]:
                 continue
             group_hooks = [
                 hook for hook in group.get("hooks", [])
-                if script_name not in str(hook.get("command", ""))
+                if not runs_script(str(hook.get("command", "")), script_name)
             ]
             if group_hooks:
                 new_group = dict(group)
@@ -277,6 +298,23 @@ def apply_one(cli_name: str, spec: dict, original_text: str, new_text: str) -> N
     settings_path.write_text(new_text)
     print(f"[{cli_name}] Applied. Backup: {backup_path}")
 
+
+# Completeness gate: every script any enabled CLI's settings will reference
+# must exist in the source checkout BEFORE anything is copied or written.
+# An incomplete checkout must fail loud here — never emit a command for a
+# file that will not exist at the runtime root (the outage class this
+# installer exists to make unreachable).
+required = sorted({
+    script_name
+    for spec in CLI_SPECS.values() if spec["enabled"]
+    for script_name, _timeout in spec["hooks"].values()
+} | {"_shared.py"})  # imported by every hook script
+missing = [name for name in required if not (hooks_src / name).is_file()]
+if missing:
+    raise SystemExit(
+        f"ERROR: incomplete checkout — required hook scripts missing from "
+        f"{hooks_src}: {', '.join(missing)}. Nothing was copied or written."
+    )
 
 # Sync runtime copies FIRST: settings must never point at files that were
 # not written. On dry-run this only reports what would be copied.
