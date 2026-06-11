@@ -16,6 +16,10 @@ INSTALL_GEMINI=0
 CLAUDE_SETTINGS="${CLAUDE_SETTINGS_PATH:-$HOME/.claude/settings.json}"
 CODEX_HOOKS="${CODEX_HOOKS_PATH:-$HOME/.codex/hooks.json}"
 GEMINI_SETTINGS="${GEMINI_SETTINGS_PATH:-$HOME/.gemini/settings.json}"
+# Stable runtime root. Hook commands in settings files reference ONLY this
+# location — never the checkout this script runs from — so moving, renaming,
+# or deleting a source checkout can never break a CLI's hook execution.
+INSTALL_ROOT="${CF_INSTALL_DIR:-$HOME/.local/share/claude-code-fleet-notify/hooks-runtime}"
 
 for arg in "$@"; do
     case "$arg" in
@@ -45,13 +49,24 @@ for arg in "$@"; do
         --gemini-settings=*)
             GEMINI_SETTINGS="${arg#--gemini-settings=}"
             ;;
+        --install-dir=*)
+            INSTALL_ROOT="${arg#--install-dir=}"
+            ;;
         -h|--help)
             cat <<'USAGE'
 Usage: scripts/install-hooks.sh [--apply] [--codex] [--gemini] [--all]
                                 [--settings=...] [--codex-settings=...]
-                                [--gemini-settings=...]
+                                [--gemini-settings=...] [--install-dir=...]
 
 Install fleet-notify hooks for the chosen REPL CLIs.
+
+Hook scripts are copied to a stable runtime root (default
+~/.local/share/claude-code-fleet-notify/hooks-runtime, override with
+--install-dir= or CF_INSTALL_DIR). Settings files reference ONLY the
+runtime copies, so moving or deleting a source checkout never affects
+hook execution. A .env beside the runtime hooks is seeded from the
+checkout's .env on first install and never overwritten afterwards —
+edit <install-dir>/.env to change live hook configuration.
 
 CLIs (each writes to its own config file format):
   Default (always)    Claude Code  → ~/.claude/settings.json (JSON)
@@ -85,11 +100,12 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_DIR="$(dirname "$SCRIPT_DIR")"
 
 python3 - "$REPO_DIR" "$APPLY" "$CLAUDE_SETTINGS" "$CODEX_HOOKS" "$GEMINI_SETTINGS" \
-        "$INSTALL_CLAUDE" "$INSTALL_CODEX" "$INSTALL_GEMINI" <<'PY'
+        "$INSTALL_CLAUDE" "$INSTALL_CODEX" "$INSTALL_GEMINI" "$INSTALL_ROOT" <<'PY'
 from __future__ import annotations
 
 import difflib
 import json
+import shlex
 import shutil
 import sys
 import time
@@ -103,8 +119,48 @@ gemini_path = Path(sys.argv[5]).expanduser()
 do_claude = sys.argv[6] == "1"
 do_codex = sys.argv[7] == "1"
 do_gemini = sys.argv[8] == "1"
+install_root = Path(sys.argv[9]).expanduser()
 
-hooks_dir = repo_dir / "hooks"
+# Source of hook code: the checkout this script runs from.
+# Runtime location referenced by settings files: the stable install root.
+# The split is the point — settings must never depend on a movable checkout
+# (2026-06-11: a dangling checkout path turned every hook command into
+# `python3 <missing file>` = exit 2 = every tool on the machine blocked).
+hooks_src = repo_dir / "hooks"
+hooks_dir = install_root / "hooks"
+
+
+def sync_runtime() -> list[str]:
+    """Refresh runtime hook copies; seed .env only on first install.
+
+    Hook .py files are always refreshed from the checkout (an install IS
+    the update mechanism). The runtime .env is durable operator state:
+    seeded from the checkout's .env when absent, never overwritten.
+    Returns human-readable action lines (empty = nothing to do).
+    """
+    actions: list[str] = []
+    for src in sorted(hooks_src.glob("*.py")):
+        dest = hooks_dir / src.name
+        if dest.exists() and dest.read_bytes() == src.read_bytes():
+            continue
+        actions.append(f"copy {src.name} -> {dest}")
+        if apply:
+            hooks_dir.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dest)
+    env_src = repo_dir / ".env"
+    env_dest = install_root / ".env"
+    if not env_dest.exists():
+        if env_src.exists():
+            actions.append(f"seed .env -> {env_dest} (first install; never overwritten after)")
+            if apply:
+                install_root.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(env_src, env_dest)
+        else:
+            actions.append(
+                f"NOTE: no .env at {env_dest} and no {env_src} to seed it from; "
+                "hooks will rely on process environment only (see .env.example)"
+            )
+    return actions
 
 # Per-CLI hook specs. Each entry: (config file, format, event-to-script map, timeout)
 # All three CLIs read JSON; only event names + script names differ.
@@ -161,7 +217,10 @@ def patch_one(cli_name: str, spec: dict) -> tuple[str, str, str]:
 
     settings.setdefault("hooks", {})
     for event, (script_name, timeout) in hook_specs.items():
-        command = f"python3 {hooks_dir / script_name}"
+        # Plain argv command — a quoted path and nothing else. No shell
+        # compounds, no conditionals: the hook's own exit code (including an
+        # intentional Stop block) passes through untouched.
+        command = f"python3 {shlex.quote(str(hooks_dir / script_name))}"
         entry = {
             "hooks": [
                 {
@@ -172,14 +231,27 @@ def patch_one(cli_name: str, spec: dict) -> tuple[str, str, str]:
             ]
         }
         event_entries = settings["hooks"].setdefault(event, [])
-        existing = [
-            hook.get("command")
-            for group in event_entries
-            for hook in group.get("hooks", [])
-            if isinstance(group, dict)
-        ]
-        if command not in existing:
-            event_entries.append(entry)
+        # Migration + dedupe: drop every existing hook that runs this script
+        # under ANY historical path or wrapping (old checkout paths,
+        # guard-wrapped forms, duplicates), preserve unrelated hooks and
+        # group attributes, then append exactly one canonical entry.
+        kept = []
+        for group in event_entries:
+            if not isinstance(group, dict):
+                kept.append(group)
+                continue
+            group_hooks = [
+                hook for hook in group.get("hooks", [])
+                if script_name not in str(hook.get("command", ""))
+            ]
+            if group_hooks:
+                new_group = dict(group)
+                new_group["hooks"] = group_hooks
+                kept.append(new_group)
+            elif "hooks" not in group:
+                kept.append(group)
+        kept.append(entry)
+        settings["hooks"][event] = kept
 
     new_text = json.dumps(settings, indent=2, sort_keys=False) + "\n"
     diff_text = "".join(
@@ -205,6 +277,17 @@ def apply_one(cli_name: str, spec: dict, original_text: str, new_text: str) -> N
     settings_path.write_text(new_text)
     print(f"[{cli_name}] Applied. Backup: {backup_path}")
 
+
+# Sync runtime copies FIRST: settings must never point at files that were
+# not written. On dry-run this only reports what would be copied.
+sync_actions = sync_runtime()
+if sync_actions:
+    suffix = "" if apply else " (dry-run, nothing written)"
+    print(f"=== runtime sync: {install_root}{suffix} ===")
+    for line in sync_actions:
+        print(line)
+else:
+    print(f"[runtime] Hook copies at {install_root} are current.")
 
 # Process each enabled CLI.
 any_enabled = False
@@ -232,8 +315,9 @@ if not any_enabled:
 # Grok note — always print so users know where to wire it.
 print("")
 print("[grok] Separate wiring required: use ~/.grok/hooks/cf-notify.json")
-print("       and point it at hooks/grok_session_start.py, grok_stop.py,")
-print("       and grok_user_prompt.py. See docs/grok-hooks.md.")
+print(f"       and point it at {hooks_dir}/grok_session_start.py,")
+print(f"       grok_stop.py, and grok_user_prompt.py (the runtime copies,")
+print(f"       not the checkout). See docs/grok-hooks.md.")
 
 if not apply:
     print("")

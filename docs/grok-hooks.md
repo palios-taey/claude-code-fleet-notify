@@ -12,14 +12,17 @@ the cold-start idle gap.
 mkdir -p ~/.grok/hooks
 ```
 
-2. Copy the template and point it at the fleet-notify checkout you want Grok to run:
+2. Copy the template:
 
 ```bash
 cp templates/grok/cf-notify.json ~/.grok/hooks/cf-notify.json
 ```
 
 3. Either edit the commands in `~/.grok/hooks/cf-notify.json` to absolute paths,
-or export `CF_NOTIFY_REPO_ROOT` before launching Grok.
+or export `CF_NOTIFY_REPO_ROOT` before launching Grok. Point them at the
+stable runtime copies written by `scripts/install-hooks.sh --apply` (default
+`~/.local/share/claude-code-fleet-notify/hooks-runtime/hooks/`), not at a
+checkout — checkout paths can move; the runtime copies cannot.
 
 ## Trust
 
