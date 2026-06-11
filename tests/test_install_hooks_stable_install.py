@@ -39,10 +39,14 @@ def _make_checkout(td: Path) -> Path:
     checkout = td / "checkout" / "claude-code-fleet-notify"
     (checkout / "scripts").mkdir(parents=True)
     (checkout / "hooks").mkdir()
+    (checkout / "notifications").mkdir()
     shutil.copy2(REAL_REPO / "scripts" / "install-hooks.sh",
                  checkout / "scripts" / "install-hooks.sh")
     for src in (REAL_REPO / "hooks").glob("*.py"):
         shutil.copy2(src, checkout / "hooks" / src.name)
+    for src in (REAL_REPO / "notifications").glob("*.py"):
+        shutil.copy2(src, checkout / "notifications" / src.name)
+    shutil.copy2(REAL_REPO / "identity.py", checkout / "identity.py")
     # Probe script: lets tests execute a runtime copy without needing the
     # real hooks' runtime dependencies (redis, orchestrator package).
     (checkout / "hooks" / "probe_stable_install.py").write_text(
@@ -230,6 +234,56 @@ class StableInstallShape(unittest.TestCase):
                              "settings were modified despite refusal")
             self.assertFalse((td / "runtime").exists(),
                              "runtime files were written despite refusal")
+
+    def test_runtime_hooks_import_cleanly_from_runtime_root(self):
+        # 2026-06-11 rollout failure: a hooks-only runtime copy shipped and
+        # every hook crashed importing the `notifications` package — tests
+        # and two audits passed because nothing ever EXECUTED a real hook
+        # from the runtime root. This does.
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            checkout = _make_checkout(td)
+            _run_installer(checkout, td)
+            for script in ("stop_idle.py", "check_notifications.py"):
+                target = td / "runtime" / "hooks" / script
+                probe = (
+                    "import importlib.util\n"
+                    f"spec = importlib.util.spec_from_file_location('p', {str(target)!r})\n"
+                    "m = importlib.util.module_from_spec(spec)\n"
+                    "spec.loader.exec_module(m)\n"
+                )
+                proc = subprocess.run(["python3", "-c", probe],
+                                      capture_output=True, text=True,
+                                      stdin=subprocess.DEVNULL)
+                self.assertEqual(proc.returncode, 0,
+                                 f"{script} does not boot from runtime root:\n{proc.stderr}")
+
+    def test_missing_package_module_fails_boot_gate_settings_untouched(self):
+        # The drift case a static file-list cannot see: the package exists
+        # (static gate passes) but a module the hooks import is gone. Only
+        # the boot gate catches this — and it must refuse before settings.
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            checkout = _make_checkout(td)
+            (checkout / "notifications" / "inbox.py").unlink()
+            original = '{"keep": "me"}'
+            (td / "settings.json").write_text(original)
+            with self.assertRaises(subprocess.CalledProcessError) as ctx:
+                _run_installer(checkout, td)
+            self.assertIn("boot gate failed", ctx.exception.stderr)
+            self.assertEqual((td / "settings.json").read_text(), original,
+                             "settings were modified despite boot-gate refusal")
+
+    def test_missing_package_entirely_refused_by_static_gate(self):
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            checkout = _make_checkout(td)
+            shutil.rmtree(checkout / "notifications")
+            with self.assertRaises(subprocess.CalledProcessError) as ctx:
+                _run_installer(checkout, td)
+            self.assertIn("incomplete checkout", ctx.exception.stderr)
+            self.assertIn("notifications/__init__.py", ctx.exception.stderr)
+            self.assertFalse((td / "runtime").exists())
 
     def test_second_run_is_a_noop(self):
         with tempfile.TemporaryDirectory() as td:
