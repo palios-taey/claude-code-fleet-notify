@@ -161,7 +161,15 @@ def patch_one(cli_name: str, spec: dict) -> tuple[str, str, str]:
 
     settings.setdefault("hooks", {})
     for event, (script_name, timeout) in hook_specs.items():
-        command = f"python3 {hooks_dir / script_name}"
+        script_path = hooks_dir / script_name
+        bare_command = f"python3 {script_path}"
+        # Fail-open ONLY when the hook FILE is missing: a moved/deleted checkout
+        # must never block every tool machine-wide (python3 on a missing file
+        # exits 2 = BLOCKING; 2026-06-11 this disabled all tools of all sessions
+        # at once). When the file EXISTS, the hook's own exit code passes through
+        # untouched — including the Stop hook's intentional exit-2 block, which
+        # is the keep-going mechanism and must never be swallowed.
+        command = f'if [ -f "{script_path}" ]; then python3 "{script_path}"; else exit 0; fi'
         entry = {
             "hooks": [
                 {
@@ -172,13 +180,19 @@ def patch_one(cli_name: str, spec: dict) -> tuple[str, str, str]:
             ]
         }
         event_entries = settings["hooks"].setdefault(event, [])
-        existing = [
-            hook.get("command")
-            for group in event_entries
-            for hook in group.get("hooks", [])
-            if isinstance(group, dict)
-        ]
-        if command not in existing:
+        # Migration + idempotency: an entry for this script may exist in the OLD
+        # bare format. Rewrite it in place (never append a second one — a format
+        # change must not double-fire hooks fleet-wide).
+        migrated = False
+        for group in event_entries:
+            if not isinstance(group, dict):
+                continue
+            for hook in group.get("hooks", []):
+                if hook.get("command") in (bare_command, command):
+                    hook["command"] = command
+                    hook["timeout"] = timeout
+                    migrated = True
+        if not migrated:
             event_entries.append(entry)
 
     new_text = json.dumps(settings, indent=2, sort_keys=False) + "\n"
