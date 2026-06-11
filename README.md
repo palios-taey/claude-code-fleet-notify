@@ -7,9 +7,21 @@
 
 Turn scattered AI terminals into a supervised tmux fleet: dispatch work to Claude Code, Codex, Gemini, Grok, or any **hookable** REPL CLI, then get `done`/`error`/`interrupted` outcomes back inline so the supervisor can update the plan instead of babysitting panes.
 
-Current version: v1.0.2
+Latest release: see [Releases](https://github.com/palios-taey/claude-code-fleet-notify/releases) (the README never hardcodes a version — it goes stale).
 
 `claude-code-fleet-notify` gives each terminal-native, hookable CLI session a Redis inbox, four lifecycle hooks, and one local daemon. Active sessions receive full messages through hook `additionalContext`; stopped sessions are woken by a tmux-injected pointer prompt, while full message bodies remain in Redis.
+
+## Set it up with Claude Code (AI-native)
+
+Point your Claude Code (or any agent) at this repo and tell it: **"set up claude-code-fleet-notify on this machine."** Everything it needs is below and is exercised verbatim by CI, so an agent can follow it end to end:
+
+1. `git clone` this repo and `cd` in.
+2. Install Redis + tmux (runtime deps), then `pip install redis python-dotenv`.
+3. `bash scripts/install-hooks.sh --apply` — copies hooks to a stable runtime root, runs a boot gate that proves every hook imports before writing any settings, and wires your CLI's hook config.
+4. `bash scripts/start_notify_daemons.sh start` — one local daemon per machine.
+5. Smoke test: `taey-notify <target> "hello"` then `taey-ack --node <target> --peek`.
+
+The **`readme-as-a-stranger`** CI gate runs these exact steps on a fresh GitHub VM on every PR — if the setup above is wrong, that check goes red and the change can't merge. That gate *is* the guarantee an agent can stand this up from zero.
 
 ## Scope (what this is and what this isn't)
 
