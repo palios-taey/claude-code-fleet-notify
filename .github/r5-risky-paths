@@ -2,20 +2,23 @@
 # requires both adversarial auditors (audit/grok + audit/gatekeeper) to post a
 # success commit status before it can merge (enforced by r5-audit-gate.yml).
 #
-# DESIGN: broad default-covering GLOBS, not a drift-prone allowlist (the
-# orchestrator's allowlist omitted real buggy files — same lesson here).
-# Over-gate trivial changes for safety > under-gate a fleet-wide-blast surface.
+# DESIGN: broad default-covering GLOBS, NOT a drift-prone allowlist. (Gatekeeper
+# PR#25 BLOCK: the first port enumerated scripts/ — exactly the allowlist trap —
+# missing the 10 fleet CLIs incl taey-notify, and missed root-level identity.py
+# which every hook imports. Over-gate trivial changes > under-gate a blast surface.)
 #
 # The hook layer — a bad hook command disabled every tool on the machine once
-# (the 2026-06-11 outage class); changes here drive every session:
+# (the 2026-06-11 outage); changes here drive every session:
 hooks/*.py
+# identity.py — top-level module imported by EVERY hook; part of the import
+# closure behind that same outage (PR#18). Root-level, so not under hooks/*.
+identity.py
 # The delivery library (inbox/daemon/handoff/trace):
 notifications/*.py
-# The installer (wires the hooks; the outage came through here) + daemon + deploy:
-scripts/install-hooks.sh
-scripts/start_notify_daemons.sh
-scripts/atomic_deploy.sh
-scripts/_stage_b_api.py
+# ALL scripts — the installer (the outage came through it), the daemon, the
+# deploy, AND the fleet CLIs (taey-notify is the inter-session messaging
+# backbone the whole fleet runs on). Glob, not an enumerated list:
+scripts/*
 # CI / gate config itself (self-protecting):
 .github/workflows/*.yml
 .github/r5-risky-paths
