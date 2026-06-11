@@ -66,7 +66,8 @@ Hook scripts are copied to a stable runtime root (default
 runtime copies, so moving or deleting a source checkout never affects
 hook execution. A .env beside the runtime hooks is seeded from the
 checkout's .env on first install and never overwritten afterwards —
-edit <install-dir>/.env to change live hook configuration.
+edit $CF_INSTALL_DIR/.env (or the --install-dir path) to change live hook
+configuration.
 
 CLIs (each writes to its own config file format):
   Default (always)    Claude Code  → ~/.claude/settings.json (JSON)
