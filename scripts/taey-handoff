@@ -7,6 +7,13 @@ import os
 import subprocess
 import sys
 
+# Symlink-safe repo-root bootstrap: this CLI is installed as a symlink in
+# /usr/local/bin, where sys.path[0] is the SYMLINK's dir, not the repo — so
+# `from notifications...` raised ModuleNotFoundError on every installed
+# invocation (2026-06-11; the receipt-validation CLI was unusable installed).
+# realpath resolves the symlink to the real scripts/ dir; its parent is the repo.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+
 
 REDIS_HOST = os.environ.get("REDIS_HOST", "127.0.0.1")
 REDIS_PORT = int(os.environ.get("REDIS_PORT", "6379"))
