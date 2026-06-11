@@ -45,19 +45,26 @@ The architectural split is the wake invariant: `Stop` sets durable idle, `UserPr
 
 ## Install
 
+### Fresh Clone Smoke Install
+
+This is the same workflow enforced by `.github/workflows/stranger-install.yml` on a fresh GitHub Actions VM.
+
 ```bash
 git clone https://github.com/palios-taey/claude-code-fleet-notify.git
 cd claude-code-fleet-notify
+python3 -m pip install redis python-dotenv
+export PATH="$PWD/scripts:$PATH"
+```
+
+Redis and tmux are runtime requirements. For a first smoke, start Redis however your machine does it; on Ubuntu that is commonly `sudo apt-get install redis-server tmux && redis-server --daemonize yes`.
+
+Optional system-wide CLI install:
+
+```bash
 sudo make install
 ```
 
-This installs:
-
-- `taey-notify`
-- `cc-fleet-notify`, an alias for `taey-notify`
-- `taey-ack`
-
-Redis and tmux are runtime requirements.
+This installs `taey-notify`, `cc-fleet-notify`, `taey-ack`, `tmux-send`, and `start_notify_daemons.sh` into `${PREFIX:-/usr/local}/bin`.
 
 ## Configure
 
@@ -70,6 +77,15 @@ export NOTIFY_KEY_PREFIX=taey
 `NOTIFY_KEY_PREFIX` defaults to `taey`. Use a different value when several fleets share one Redis instance.
 
 Create a `.env` from [.env.example](.env.example) when you want hook subprocesses to pick up the same settings automatically.
+
+For a sandboxed hook install that does not touch your real CLI settings:
+
+```bash
+export CF_INSTALL_DIR="$PWD/.sandbox/hooks-runtime"
+export CLAUDE_SETTINGS_PATH="$PWD/.sandbox/claude/settings.json"
+export CODEX_HOOKS_PATH="$PWD/.sandbox/codex/hooks.json"
+export GEMINI_SETTINGS_PATH="$PWD/.sandbox/gemini/settings.json"
+```
 
 ### Orchestrator integration
 
@@ -107,7 +123,9 @@ bash scripts/install-hooks.sh --all --apply               # claude + codex + gem
 
 Each CLI's settings file gets a timestamped backup before being written. Without `--apply`, the installer is dry-run only — it prints the unified diff and writes nothing. `bash scripts/install-hooks.sh --help` for the full flag list.
 
-The installer copies `hooks/*.py` to a stable runtime root (default `~/.local/share/claude-code-fleet-notify/hooks-runtime`, override with `--install-dir=` or `CF_INSTALL_DIR`) and writes hook commands that reference **only the runtime copies** — never the checkout you ran the installer from. Moving, renaming, or deleting a checkout therefore cannot affect hook execution. Re-running the installer refreshes the runtime copies; that is the update mechanism. A `.env` beside the runtime hooks is seeded from the checkout's `.env` on first install and never overwritten afterwards — edit `<install-dir>/.env` to change live hook configuration.
+The installer copies `hooks/*.py`, `notifications/*.py`, and `identity.py` to a stable runtime root (default `~/.local/share/claude-code-fleet-notify/hooks-runtime`, override with `--install-dir=` or `CF_INSTALL_DIR`) and writes hook commands that reference **only the runtime copies** — never the checkout you ran the installer from. Moving, renaming, or deleting a checkout therefore cannot affect hook execution. Re-running the installer refreshes the runtime copies; that is the update mechanism. A `.env` beside the runtime hooks is seeded from the checkout's `.env` on first install and never overwritten afterwards — edit `<install-dir>/.env` to change live hook configuration.
+
+In `--apply` mode the installer also runs a boot gate before writing settings: every runtime hook that would be referenced by a settings file must import cleanly from the runtime root with no checkout `PYTHONPATH` help. If the boot gate fails, no settings file is written.
 
 > **Grok** (xAI `grok-cli`) should use the dedicated global hook file `~/.grok/hooks/cf-notify.json` so `SessionStart` can mark idle at boot. See `docs/grok-hooks.md`.
 
@@ -119,6 +137,14 @@ Run one daemon per machine that hosts Claude Code tmux sessions:
 bash scripts/start_notify_daemons.sh start
 bash scripts/start_notify_daemons.sh status
 bash scripts/start_notify_daemons.sh stop
+```
+
+Smoke the Redis round trip:
+
+```bash
+taey-notify session-b "README stranger round-trip" --from session-a
+taey-ack --node session-b --peek
+taey-ack --node session-b
 ```
 
 ## Usage
