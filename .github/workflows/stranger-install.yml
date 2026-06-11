@@ -1,0 +1,80 @@
+# Stranger-install gate: GitHub's own runner follows README.md as a first-time
+# user would. Green means the documented install + hook runtime + daemon +
+# Redis round-trip work from a clean clone; red means the README or installer is
+# lying and should be fixed, not papered over.
+name: stranger-install
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  readme-as-a-stranger:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      redis:
+        image: redis:7
+        ports: ["6379:6379"]
+    steps:
+      - name: checkout this repo (the stranger's clone)
+        uses: actions/checkout@v4
+
+      - name: README Requirements — Python package dependencies
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install redis python-dotenv
+
+      - name: README Install — checkout-local CLIs on PATH
+        run: |
+          echo "$PWD/scripts" >> "$GITHUB_PATH"
+
+      - name: README Configure — Redis and stable hook runtime root
+        run: |
+          cp .env.example .env
+          {
+            echo "REDIS_HOST=127.0.0.1"
+            echo "REDIS_PORT=6379"
+            echo "NOTIFY_KEY_PREFIX=stranger"
+            echo "TAEY_NODE_ID=stranger-sender"
+            echo "CF_INSTALL_DIR=$RUNNER_TEMP/cf-hooks-runtime"
+            echo "CLAUDE_SETTINGS_PATH=$RUNNER_TEMP/home/.claude/settings.json"
+            echo "CODEX_HOOKS_PATH=$RUNNER_TEMP/home/.codex/hooks.json"
+            echo "GEMINI_SETTINGS_PATH=$RUNNER_TEMP/home/.gemini/settings.json"
+          } >> "$GITHUB_ENV"
+
+      - name: README Install Hooks — sandboxed apply plus boot gate
+        run: |
+          bash scripts/install-hooks.sh --all --apply
+          test -f "$CF_INSTALL_DIR/hooks/stop_idle.py"
+          test -f "$CF_INSTALL_DIR/notifications/inbox.py"
+          test -f "$CF_INSTALL_DIR/identity.py"
+          ! grep -R "$PWD/hooks" "$CLAUDE_SETTINGS_PATH" "$CODEX_HOOKS_PATH" "$GEMINI_SETTINGS_PATH"
+
+      - name: README Run The Daemon — start and status
+        run: |
+          bash scripts/start_notify_daemons.sh start
+          bash scripts/start_notify_daemons.sh status
+
+      - name: README Notify round-trip smoke
+        run: |
+          taey-notify stranger-target "README stranger round-trip" --from stranger-sender
+          taey-ack --node stranger-target --peek | tee "$RUNNER_TEMP/roundtrip.txt"
+          grep -F "README stranger round-trip" "$RUNNER_TEMP/roundtrip.txt"
+          taey-ack --node stranger-target | tee "$RUNNER_TEMP/drain.txt"
+          grep -F "OK: Drained all queues for stranger-target." "$RUNNER_TEMP/drain.txt"
+
+      - name: Stop daemon
+        if: always()
+        run: bash scripts/start_notify_daemons.sh stop || true
+
+      - name: diagnostics on failure
+        if: failure()
+        run: |
+          echo "=== /tmp/notify-daemon.log ==="
+          cat /tmp/notify-daemon.log 2>/dev/null || echo "(absent)"
+          echo "=== sandbox home ==="
+          find "$RUNNER_TEMP/home" -maxdepth 4 -type f -print -exec sed -n '1,80p' {} \; 2>/dev/null || true
