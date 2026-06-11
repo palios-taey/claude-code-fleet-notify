@@ -37,6 +37,10 @@ All four CLIs share the same Redis state machine via per-CLI hook variants that 
 
 > The supervisor-worker dispatch + plan/task tracking + recurring-runner pieces ship in the companion product [`claude-code-fleet-orchestrator`](https://github.com/palios-taey/claude-code-fleet-orchestrator), which depends on this package.
 
+For the live status of notify, daemon, handoff, trace, wake-packet integration,
+and delegated orchestrator capabilities, see
+[docs/CAPABILITIES.md](docs/CAPABILITIES.md).
+
 ## claudemesh
 
 This is complementary to claudemesh, not a replacement. If you want interactive multi-session coordination, see claudemesh. If you want autonomous wake for unattended Claude Code fleets, use this.
