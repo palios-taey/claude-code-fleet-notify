@@ -18,9 +18,9 @@ mkdir -p ~/.grok/hooks
 cp templates/grok/cf-notify.json ~/.grok/hooks/cf-notify.json
 ```
 
-3. Either edit the commands in `~/.grok/hooks/cf-notify.json` to absolute paths,
-or export `CF_NOTIFY_REPO_ROOT` before launching Grok. Point them at the
-stable runtime copies written by `scripts/install-hooks.sh --apply` (default
+3. Either use the template default or set `CF_NOTIFY_HOOK_ROOT` before launching
+Grok. It must point at the stable runtime hook copies written by
+`scripts/install-hooks.sh --apply` (default
 `~/.local/share/claude-code-fleet-notify/hooks-runtime/hooks/`), not at a
 checkout — checkout paths can move; the runtime copies cannot.
 

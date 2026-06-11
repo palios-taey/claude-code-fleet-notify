@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 ${CF_NOTIFY_REPO_ROOT:-$HOME/claude-code-fleet-notify}/hooks/grok_session_start.py",
+            "command": "python3 ${CF_NOTIFY_HOOK_ROOT:-$HOME/.local/share/claude-code-fleet-notify/hooks-runtime/hooks}/grok_session_start.py",
             "timeout": 10
           }
         ]
@@ -16,7 +16,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 ${CF_NOTIFY_REPO_ROOT:-$HOME/claude-code-fleet-notify}/hooks/grok_stop.py",
+            "command": "python3 ${CF_NOTIFY_HOOK_ROOT:-$HOME/.local/share/claude-code-fleet-notify/hooks-runtime/hooks}/grok_stop.py",
             "timeout": 10
           }
         ]
@@ -27,7 +27,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 ${CF_NOTIFY_REPO_ROOT:-$HOME/claude-code-fleet-notify}/hooks/grok_user_prompt.py",
+            "command": "python3 ${CF_NOTIFY_HOOK_ROOT:-$HOME/.local/share/claude-code-fleet-notify/hooks-runtime/hooks}/grok_user_prompt.py",
             "timeout": 10
           }
         ]
