@@ -105,8 +105,10 @@ from __future__ import annotations
 
 import difflib
 import json
+import os
 import shlex
 import shutil
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -128,6 +130,16 @@ install_root = Path(sys.argv[9]).expanduser()
 # `python3 <missing file>` = exit 2 = every tool on the machine blocked).
 hooks_src = repo_dir / "hooks"
 hooks_dir = install_root / "hooks"
+
+# The hooks import beyond their own directory: the `notifications` package
+# and root-level `identity.py` (hooks/_shared.py bootstraps sys.path to the
+# runtime root's parent layout, mirroring the repo). The runtime root must
+# carry the FULL import closure — 2026-06-11 rollout proved a hooks-only
+# copy boots to ModuleNotFoundError on every hook (silent fleet-wide
+# notification loss). The boot gate below is the drift-proof invariant;
+# this list is the known layout.
+RUNTIME_PACKAGES = ["notifications"]
+RUNTIME_ROOT_FILES = ["identity.py"]
 
 
 def runs_script(command: str, script_name: str) -> bool:
@@ -160,14 +172,28 @@ def sync_runtime() -> list[str]:
     Returns human-readable action lines (empty = nothing to do).
     """
     actions: list[str] = []
-    for src in sorted(hooks_src.glob("*.py")):
-        dest = hooks_dir / src.name
-        if dest.exists() and dest.read_bytes() == src.read_bytes():
-            continue
-        actions.append(f"copy {src.name} -> {dest}")
-        if apply:
-            hooks_dir.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src, dest)
+
+    def copy_tree(src_dir: Path, dest_dir: Path, label: str) -> None:
+        for src in sorted(src_dir.glob("*.py")):
+            dest = dest_dir / src.name
+            if dest.exists() and dest.read_bytes() == src.read_bytes():
+                continue
+            actions.append(f"copy {label}{src.name} -> {dest}")
+            if apply:
+                dest_dir.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src, dest)
+
+    copy_tree(hooks_src, hooks_dir, "")
+    for package in RUNTIME_PACKAGES:
+        copy_tree(repo_dir / package, install_root / package, f"{package}/")
+    for name in RUNTIME_ROOT_FILES:
+        src = repo_dir / name
+        dest = install_root / name
+        if not (dest.exists() and dest.read_bytes() == src.read_bytes()):
+            actions.append(f"copy {name} -> {dest}")
+            if apply:
+                install_root.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src, dest)
     env_src = repo_dir / ".env"
     env_dest = install_root / ".env"
     if not env_dest.exists():
@@ -310,10 +336,16 @@ required = sorted({
     for script_name, _timeout in spec["hooks"].values()
 } | {"_shared.py"})  # imported by every hook script
 missing = [name for name in required if not (hooks_src / name).is_file()]
+missing += [
+    f"{package}/__init__.py" for package in RUNTIME_PACKAGES
+    if not (repo_dir / package / "__init__.py").is_file()
+]
+missing += [name for name in RUNTIME_ROOT_FILES
+            if not (repo_dir / name).is_file()]
 if missing:
     raise SystemExit(
-        f"ERROR: incomplete checkout — required hook scripts missing from "
-        f"{hooks_src}: {', '.join(missing)}. Nothing was copied or written."
+        f"ERROR: incomplete checkout — required runtime sources missing from "
+        f"{repo_dir}: {', '.join(missing)}. Nothing was copied or written."
     )
 
 # Sync runtime copies FIRST: settings must never point at files that were
@@ -326,6 +358,48 @@ if sync_actions:
         print(line)
 else:
     print(f"[runtime] Hook copies at {install_root} are current.")
+
+# Boot gate (apply mode): every runtime hook a settings file will reference
+# must PROVE it imports cleanly from the runtime root before any settings
+# file is written. A static copy-list drifts (2026-06-11: hooks-only copy
+# shipped, every hook crashed on a missing package import while tests and
+# two audits passed); execution does not drift. All hook scripts are
+# __main__-guarded, so importing the module exercises the full import
+# closure without running hook logic.
+if apply:
+    boot_failures = []
+    probed = 0
+    for script_name in required:
+        if not script_name.endswith(".py") or script_name.startswith("_"):
+            continue
+        probed += 1
+        runtime_script = hooks_dir / script_name
+        probe = (
+            "import importlib.util\n"
+            f"spec = importlib.util.spec_from_file_location('cf_boot_probe', {str(runtime_script)!r})\n"
+            "module = importlib.util.module_from_spec(spec)\n"
+            "spec.loader.exec_module(module)\n"
+        )
+        # Faithful to real hook execution: a CLI runs hooks from an
+        # arbitrary cwd with no PYTHONPATH help. Probe from a neutral cwd
+        # so the checkout (often the installer's cwd) cannot satisfy an
+        # import the runtime root is missing — that would false-pass the
+        # gate and crash at real exec time.
+        probe_env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+        proc = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True, text=True,
+            stdin=subprocess.DEVNULL, cwd="/", env=probe_env,
+        )
+        if proc.returncode != 0:
+            boot_failures.append(f"{script_name}:\n{proc.stderr.strip()}")
+    if boot_failures:
+        raise SystemExit(
+            "ERROR: runtime boot gate failed — these hooks do not import "
+            "cleanly from the runtime root; NO settings were written:\n\n"
+            + "\n\n".join(boot_failures)
+        )
+    print(f"[boot-gate] {probed} runtime hooks import cleanly.")
 
 # Process each enabled CLI.
 any_enabled = False
