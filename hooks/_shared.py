@@ -194,12 +194,14 @@ def get_redis_and_node():
 
 def action_pre_tool(r, node_id: str, tool_name: str = "") -> None:
     """PreToolUse / BeforeTool: set tool_running flag with 60s TTL safety net,
-    stamp last_activity. Same semantics as Claude's pre_tool_activity.py."""
+    stamp activity keys. Same semantics as Claude's pre_tool_activity.py."""
     try:
         from notifications.inbox import state_key
 
+        now = str(time.time())
         r.set(state_key(node_id, "tool_running"), "1", ex=60)
-        r.set(state_key(node_id, "last_activity"), str(time.time()))
+        r.set(state_key(node_id, "last_activity"), now)
+        r.set(state_key(node_id, "last_tool_activity"), now)
         log_debug(node_id, f"PRE-TOOL: tool={tool_name}")
     except Exception as e:
         log_debug(node_id, f"action_pre_tool error: {e}")
@@ -212,8 +214,10 @@ def action_post_tool(r, node_id: str, tool_name: str = "") -> str:
     try:
         from notifications.inbox import state_key
 
+        now = str(time.time())
         r.delete(state_key(node_id, "tool_running"))
-        r.set(state_key(node_id, "last_activity"), str(time.time()))
+        r.set(state_key(node_id, "last_activity"), now)
+        r.set(state_key(node_id, "last_tool_activity"), now)
     except Exception as e:
         log_debug(node_id, f"post_tool clear error: {e}")
 
