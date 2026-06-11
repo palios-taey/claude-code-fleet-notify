@@ -107,6 +107,8 @@ bash scripts/install-hooks.sh --all --apply               # claude + codex + gem
 
 Each CLI's settings file gets a timestamped backup before being written. Without `--apply`, the installer is dry-run only — it prints the unified diff and writes nothing. `bash scripts/install-hooks.sh --help` for the full flag list.
 
+The installer copies `hooks/*.py` to a stable runtime root (default `~/.local/share/claude-code-fleet-notify/hooks-runtime`, override with `--install-dir=` or `CF_INSTALL_DIR`) and writes hook commands that reference **only the runtime copies** — never the checkout you ran the installer from. Moving, renaming, or deleting a checkout therefore cannot affect hook execution. Re-running the installer refreshes the runtime copies; that is the update mechanism. A `.env` beside the runtime hooks is seeded from the checkout's `.env` on first install and never overwritten afterwards — edit `<install-dir>/.env` to change live hook configuration.
+
 > **Grok** (xAI `grok-cli`) should use the dedicated global hook file `~/.grok/hooks/cf-notify.json` so `SessionStart` can mark idle at boot. See `docs/grok-hooks.md`.
 
 ## Run The Daemon
