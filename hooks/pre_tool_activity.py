@@ -27,7 +27,9 @@ def main():
         r = redis_connect()
         node_id = detect_node_id()
         r.set(state_key(node_id, "tool_running"), "1", ex=60)  # 60s TTL, not 300
-        r.set(state_key(node_id, "last_activity"), str(time.time()))
+        now = str(time.time())
+        r.set(state_key(node_id, "last_activity"), now)
+        r.set(state_key(node_id, "last_tool_activity"), now)
         # NOTE: Do NOT delete idle here — only UserPromptSubmit clears idle
     except Exception:
         pass

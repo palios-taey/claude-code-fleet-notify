@@ -43,6 +43,7 @@ class StopHookTests(HookTestCase):
         self.assertEqual("1", r.store[state_key("session-b", "idle")])
         self.assertIn(state_key("session-b", "tool_running"), r.deleted)
         self.assertIn(state_key("session-b", "last_activity"), r.store)
+        self.assertNotIn(state_key("session-b", "last_tool_activity"), r.store)
 
 
 class UserPromptSubmitHookTests(HookTestCase):
@@ -55,6 +56,7 @@ class UserPromptSubmitHookTests(HookTestCase):
 
         self.assertIn(state_key("session-b", "idle"), r.deleted)
         self.assertEqual(0, r.llen(inbox_key("session-b")))
+        self.assertNotIn(state_key("session-b", "last_tool_activity"), r.store)
         context = result["hookSpecificOutput"]["additionalContext"]
         self.assertIn("hello", context)
 
@@ -107,6 +109,8 @@ class PreToolUseHookTests(HookTestCase):
         self.assertEqual("PreToolUse", result["hookSpecificOutput"]["hookEventName"])
         self.assertEqual("1", r.store[state_key("session-b", "tool_running")])
         self.assertEqual(60, r.expiry[state_key("session-b", "tool_running")])
+        self.assertIn(state_key("session-b", "last_activity"), r.store)
+        self.assertIn(state_key("session-b", "last_tool_activity"), r.store)
         self.assertNotIn(state_key("session-b", "idle"), r.deleted)
 
 
@@ -120,6 +124,8 @@ class PostToolUseHookTests(HookTestCase):
         result = self.run_hook("hooks.check_notifications", r, '{"tool_name":"Bash"}')
 
         self.assertIn(state_key("session-b", "tool_running"), r.deleted)
+        self.assertIn(state_key("session-b", "last_activity"), r.store)
+        self.assertIn(state_key("session-b", "last_tool_activity"), r.store)
         self.assertEqual(0, r.llen(inbox_key("session-b")))
         self.assertEqual(0, r.llen(notifications_key("session-b")))
         context = result["hookSpecificOutput"]["additionalContext"]
