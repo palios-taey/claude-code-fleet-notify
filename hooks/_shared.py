@@ -233,13 +233,47 @@ def action_post_tool(r, node_id: str, tool_name: str = "") -> str:
 
     try:
         from notifications.inbox import format_notification_block
-        return format_notification_block(messages)
+        context = format_notification_block(messages)
     except Exception as e:
         log_debug(node_id, f"format error: {e}")
         # Fallback: minimal text
-        body = "\n".join(f"[{m.get('type','msg')} from {m.get('from','?')}]: {m.get('body','')[:200]}"
-                          for m in messages)
-        return body
+        context = "\n".join(f"[{m.get('type','msg')} from {m.get('from','?')}]: {m.get('body','')[:200]}"
+                            for m in messages)
+
+    # A wake is the moment a session most needs state. If the orchestrator's
+    # wake-packet endpoint is live (ORCH_WAKE_PACKET_ENABLED on the API side),
+    # append the assembled wake-state packet (current work, refs, memory, rules
+    # — provenance-hashed) so the session wakes WITH context instead of
+    # rebuilding it by file-scanning. Strictly fail-open: any error, timeout,
+    # or disabled endpoint leaves the normal notification block untouched.
+    # Only runs on real wake deliveries (messages non-empty), never per tool call.
+    packet = _fetch_wake_packet(node_id)
+    if packet:
+        context = f"{context}\n\n=== WAKE STATE PACKET (orchestrator) ===\n{packet}"
+    return context
+
+
+def _fetch_wake_packet(node_id: str) -> str:
+    """Fetch the assembled wake-state packet for ``node_id`` from the
+    orchestrator API. Returns "" on ANY failure (fail-open: a wake must never
+    break or block on this — the catastrophe would be corrupting delivery,
+    not a missing packet)."""
+    try:
+        cli = "claude"
+        for suffix in ("codex", "gemini", "grok"):
+            if node_id.endswith(f"-{suffix}"):
+                cli = suffix
+                break
+        payload = _api_json(
+            f"/api/sessions/{urllib.parse.quote(node_id)}/wake-packet",
+            query={"cli": cli},
+            timeout=3,
+        )
+        if payload.get("ok") and payload.get("enabled") and payload.get("packet"):
+            return str(payload["packet"])
+    except Exception as e:
+        log_debug(node_id, f"wake-packet fetch skipped: {e}")
+    return ""
 
 
 def _resolve_supervisor(r, node_id: str) -> Optional[str]:
