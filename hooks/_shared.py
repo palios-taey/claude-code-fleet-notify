@@ -514,6 +514,9 @@ def _notify_supervisor_of_stop(r, node_id: str, supervisor: str) -> None:
             lo = r.get(state_key(node_id, "last_outcome"))
             if lo:
                 observed_outcome_struct = json.loads(lo)
+                if outcome is None:
+                    candidate_outcome = observed_outcome_struct.get("outcome", "unknown")
+                    outcome = candidate_outcome if candidate_outcome in _VALID_OUTCOMES else "unknown"
         except Exception:
             observed_outcome_struct = None
 
@@ -575,7 +578,27 @@ def _notify_supervisor_of_stop(r, node_id: str, supervisor: str) -> None:
             return
 
         if decision.get("wake_type") == WAKE_ALLOW_STOP:
-            log_debug(node_id, f"suppressed PEER_IDLE for {node_id}: {decision.get('blocked_on') or 'allow_stop'}")
+            if not observed_task and not observed_outcome_struct:
+                log_debug(node_id, f"suppressed PEER_IDLE for {node_id}: {decision.get('blocked_on') or 'allow_stop'}")
+                return
+            body = f"{node_id} stopped — {summary}" if summary else f"{node_id} stopped — no current task recorded"
+            priority = "high" if outcome in ("error", "interrupted") else "normal"
+            msg = json.dumps({
+                "from": node_id,
+                "type": "peer_idle",
+                "body": body,
+                "outcome": outcome or "unknown",
+                "priority": priority,
+                "msg_id": f"peer-idle-{node_id}-{dedup_suffix}-{int(time.time())}",
+                "timestamp": time.time(),
+                "task_id": observed_task_id,
+                "task_description": (observed_task.get("description") if observed_task else None),
+                "task_supervisor": (observed_task.get("supervisor") if observed_task else None),
+                "task_started_at": (observed_task.get("started_at") if observed_task else None),
+                "outcome_details": (observed_outcome_struct.get("details") if observed_outcome_struct else None),
+            })
+            r.lpush(inbox_key(supervisor), msg)
+            r.set(dedup, "1", ex=60)
             if outcome == "done" and observed_task_id:
                 try:
                     cleared = r.eval(
@@ -589,6 +612,9 @@ def _notify_supervisor_of_stop(r, node_id: str, supervisor: str) -> None:
                         log_debug(node_id, f"STOP CAS skipped clear for allow_stop observed={observed_task_id}")
                 except Exception as cas_exc:
                     log_debug(node_id, f"STOP CAS clear failed: {cas_exc}")
+            log_debug(node_id,
+                      f"STOP: notified supervisor={supervisor} outcome={outcome or 'unknown'} "
+                      f"observed_task_id={observed_task_id} wake_type=ALLOW_STOP body=\"{body}\"")
             return
 
         if summary:

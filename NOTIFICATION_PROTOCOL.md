@@ -67,6 +67,10 @@ When a worker stops, its Stop hook runs `_shared.py:action_stop` which:
 
 Any outcome other than `done` leaves `current_task` in place as the "previous dispatch did not complete cleanly" signal for the supervisor's next dispatch attempt.
 
+`ALLOW_STOP` from the orchestrator stop-decision API means "do not block this worker from idling." It does **not** suppress lifecycle notification: if the worker still has `current_task` or `last_outcome` dispatch context, the Stop/AfterAgent hook still enqueues `peer_idle`.
+
+The notify daemon also runs a backstop for cases where a CLI stalls before firing Stop/AfterAgent. If a local peer still has `current_task` but its `last_tool_activity` is stale (`CF_PEER_INACTIVE_STALE_SECS`, default 300s), the daemon enqueues a high-priority `peer_idle` to the dispatcher with `backstop=stale_last_tool_activity`.
+
 ## How messages are delivered
 
 Two paths:

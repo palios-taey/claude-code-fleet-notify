@@ -97,6 +97,30 @@ class DaemonTests(unittest.TestCase):
         self.assertEqual("inject_ok", record["last_delivery_signal"])
         self.assertEqual(1, record["delivery_poll_count"])
 
+    def test_stale_peer_with_current_task_notifies_dispatcher_even_without_idle(self):
+        r = FakeRedis()
+        r.set(state_key("worker-codex", "parent"), "conductor")
+        r.set(state_key("worker-codex", "last_tool_activity"), "1000")
+        r.set(state_key("worker-codex", "current_task"), json.dumps({
+            "task_id": "task-59",
+            "description": "stalled quota menu",
+            "supervisor": "conductor",
+            "started_at": "900",
+        }))
+
+        fake_redis_module = SimpleNamespace(Redis=lambda **kwargs: r)
+        with mock.patch.dict(sys.modules, {"redis": fake_redis_module}):
+            with mock.patch.object(daemon, "get_local_tmux_sessions", return_value=["worker-codex"]):
+                with mock.patch.object(daemon.time, "time", return_value=1400):
+                    with mock.patch.object(daemon.time, "sleep", side_effect=KeyboardInterrupt):
+                        daemon.run_daemon("127.0.0.1", 6379, 1)
+
+        msg = r.decoded_list(inbox_key("conductor"))[0]
+        self.assertEqual("peer_idle", msg["type"])
+        self.assertEqual("task-59", msg["task_id"])
+        self.assertEqual("stale_last_tool_activity", msg["backstop"])
+        self.assertEqual(400, msg["inactive_for_sec"])
+
     def test_missing_tmux_marks_local_handoff_not_deliverable(self):
         r = FakeRedis()
         payload = {

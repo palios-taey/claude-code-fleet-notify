@@ -8,6 +8,7 @@ import unittest
 from contextlib import redirect_stdout
 from unittest import mock
 
+from hooks import _shared as shared
 from notifications.inbox import inbox_key, notifications_key, state_key
 from notifications.handoff import explicit_ack_key, pending_receipts_key
 from tests.fakes import FakeRedis
@@ -44,6 +45,31 @@ class StopHookTests(HookTestCase):
         self.assertIn(state_key("session-b", "tool_running"), r.deleted)
         self.assertIn(state_key("session-b", "last_activity"), r.store)
         self.assertNotIn(state_key("session-b", "last_tool_activity"), r.store)
+
+    def test_allow_stop_still_notifies_supervisor_when_current_task_exists(self):
+        r = FakeRedis()
+        r.set(state_key("worker-codex", "current_task"), json.dumps({
+            "task_id": "task-59",
+            "description": "diagnose lifecycle",
+            "supervisor": "conductor",
+            "started_at": "1000",
+        }))
+        r.set(state_key("worker-codex", "last_outcome"), json.dumps({
+            "outcome": "unknown",
+            "details": "stopped at prompt",
+        }))
+
+        with mock.patch.object(shared, "fetch_stop_decision", return_value={
+            "wake_type": shared.WAKE_ALLOW_STOP,
+            "block": False,
+            "reason": None,
+        }):
+            shared._notify_supervisor_of_stop(r, "worker-codex", "conductor")
+
+        msg = r.decoded_list(inbox_key("conductor"))[0]
+        self.assertEqual("peer_idle", msg["type"])
+        self.assertEqual("task-59", msg["task_id"])
+        self.assertEqual("unknown", msg["outcome"])
 
 
 class UserPromptSubmitHookTests(HookTestCase):
