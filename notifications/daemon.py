@@ -33,7 +33,12 @@ from notifications.inbox import (
     notifications_key,
     state_key,
 )
-from notifications.handoff import mark_session_machine, record_delivery_signal, session_machine_key
+from notifications.handoff import (
+    mark_session_machine,
+    record_delivery_signal,
+    session_machine_key,
+    validate_handoff_activation,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -352,6 +357,11 @@ def run_daemon(
             peer_inactive_stale_secs = int(
                 os.environ.get("CF_PEER_INACTIVE_STALE_SECS", str(DEFAULT_PEER_INACTIVE_STALE_SECS))
             )
+
+            try:
+                validate_handoff_activation(r, prefix=key_prefix())
+            except Exception as exc:
+                logger.error("handoff activation validation failed: %s", exc)
 
             for session_name in local_sessions:
                 node_id = session_name

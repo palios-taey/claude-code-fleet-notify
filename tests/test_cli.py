@@ -81,6 +81,9 @@ class Redis:
         self._save(data)
         return True
 
+    def get(self, key):
+        return self._load().get(key)
+
     def delete(self, *keys):
         data = self._load()
         count = 0

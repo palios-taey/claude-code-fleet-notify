@@ -8,6 +8,7 @@ from unittest import mock
 
 from notifications import daemon
 from notifications.inbox import inbox_key, state_key
+from notifications.handoff import create_explicit_handoff, explicit_ack_key, explicit_handoff_key
 from tests.fakes import FakeRedis
 
 
@@ -120,6 +121,113 @@ class DaemonTests(unittest.TestCase):
         self.assertEqual("task-59", msg["task_id"])
         self.assertEqual("stale_last_tool_activity", msg["backstop"])
         self.assertEqual(400, msg["inactive_for_sec"])
+
+    def test_dispatch_activation_failure_notifies_dispatcher(self):
+        r = FakeRedis()
+        with mock.patch.object(daemon.time, "time", return_value=1000):
+            payload = create_explicit_handoff(
+                r,
+                prefix="taey",
+                dispatcher_session_id="conductor",
+                target_session_id="worker-codex",
+                body="dispatch body",
+                msg_type="command",
+                priority="normal",
+                dispatcher_task_id="task-59",
+            )
+        fake_redis_module = SimpleNamespace(Redis=lambda **kwargs: r)
+        with mock.patch.dict(sys.modules, {"redis": fake_redis_module}):
+            with mock.patch.object(daemon, "get_local_tmux_sessions", return_value=[]):
+                with mock.patch.object(daemon.time, "time", return_value=1061):
+                    with mock.patch.object(daemon.time, "sleep", side_effect=KeyboardInterrupt):
+                        daemon.run_daemon("127.0.0.1", 6379, 1)
+
+        record = json.loads(r.get(explicit_handoff_key("taey", "conductor", payload["msg_id"])))
+        msg = r.decoded_list(inbox_key("conductor"))[0]
+        self.assertEqual("failed", record["activation_state"])
+        self.assertEqual("dispatch_activation_failed", msg["type"])
+        self.assertEqual("worker-codex", msg["target_session_id"])
+        self.assertEqual("task-59", msg["dispatcher_task_id"])
+
+    def test_dispatch_activation_heartbeat_marks_record_activated(self):
+        r = FakeRedis()
+        r.set(state_key("worker-codex", "last_tool_activity"), "900")
+        with mock.patch.object(daemon.time, "time", return_value=1000):
+            payload = create_explicit_handoff(
+                r,
+                prefix="taey",
+                dispatcher_session_id="conductor",
+                target_session_id="worker-codex",
+                body="dispatch body",
+                msg_type="command",
+                priority="normal",
+                dispatcher_task_id="task-59",
+            )
+        r.set(state_key("worker-codex", "last_tool_activity"), "1005")
+        fake_redis_module = SimpleNamespace(Redis=lambda **kwargs: r)
+        with mock.patch.dict(sys.modules, {"redis": fake_redis_module}):
+            with mock.patch.object(daemon, "get_local_tmux_sessions", return_value=[]):
+                with mock.patch.object(daemon.time, "time", return_value=1006):
+                    with mock.patch.object(daemon.time, "sleep", side_effect=KeyboardInterrupt):
+                        daemon.run_daemon("127.0.0.1", 6379, 1)
+
+        record = json.loads(r.get(explicit_handoff_key("taey", "conductor", payload["msg_id"])))
+        self.assertEqual("activated", record["activation_state"])
+        self.assertEqual("heartbeat", record["activation_source"])
+        self.assertEqual(0, r.llen(inbox_key("conductor")))
+
+    def test_dispatch_activation_ack_marks_record_activated(self):
+        r = FakeRedis()
+        with mock.patch.object(daemon.time, "time", return_value=1000):
+            payload = create_explicit_handoff(
+                r,
+                prefix="taey",
+                dispatcher_session_id="conductor",
+                target_session_id="worker-codex",
+                body="dispatch body",
+                msg_type="command",
+                priority="normal",
+                dispatcher_task_id="task-59",
+            )
+        r.set(explicit_ack_key("taey", "conductor", "worker-codex", payload["msg_id"]), "{}")
+        fake_redis_module = SimpleNamespace(Redis=lambda **kwargs: r)
+        with mock.patch.dict(sys.modules, {"redis": fake_redis_module}):
+            with mock.patch.object(daemon, "get_local_tmux_sessions", return_value=[]):
+                with mock.patch.object(daemon.time, "time", return_value=1006):
+                    with mock.patch.object(daemon.time, "sleep", side_effect=KeyboardInterrupt):
+                        daemon.run_daemon("127.0.0.1", 6379, 1)
+
+        record = json.loads(r.get(explicit_handoff_key("taey", "conductor", payload["msg_id"])))
+        self.assertEqual("activated", record["activation_state"])
+        self.assertEqual("ack", record["activation_source"])
+
+    def test_dispatch_activation_current_task_bound_after_handoff_marks_record_activated(self):
+        r = FakeRedis()
+        with mock.patch.object(daemon.time, "time", return_value=1000):
+            payload = create_explicit_handoff(
+                r,
+                prefix="taey",
+                dispatcher_session_id="conductor",
+                target_session_id="worker-codex",
+                body="dispatch body",
+                msg_type="command",
+                priority="normal",
+                dispatcher_task_id="task-59",
+            )
+        r.set(state_key("worker-codex", "current_task"), json.dumps({
+            "task_id": "task-59",
+            "started_at": "1001",
+        }))
+        fake_redis_module = SimpleNamespace(Redis=lambda **kwargs: r)
+        with mock.patch.dict(sys.modules, {"redis": fake_redis_module}):
+            with mock.patch.object(daemon, "get_local_tmux_sessions", return_value=[]):
+                with mock.patch.object(daemon.time, "time", return_value=1006):
+                    with mock.patch.object(daemon.time, "sleep", side_effect=KeyboardInterrupt):
+                        daemon.run_daemon("127.0.0.1", 6379, 1)
+
+        record = json.loads(r.get(explicit_handoff_key("taey", "conductor", payload["msg_id"])))
+        self.assertEqual("activated", record["activation_state"])
+        self.assertEqual("current_task", record["activation_source"])
 
     def test_missing_tmux_marks_local_handoff_not_deliverable(self):
         r = FakeRedis()
