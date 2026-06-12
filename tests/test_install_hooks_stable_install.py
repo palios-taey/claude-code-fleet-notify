@@ -44,8 +44,10 @@ def _make_checkout(td: Path) -> Path:
                  checkout / "scripts" / "install-hooks.sh")
     for src in (REAL_REPO / "hooks").glob("*.py"):
         shutil.copy2(src, checkout / "hooks" / src.name)
-    for src in (REAL_REPO / "notifications").glob("*.py"):
-        shutil.copy2(src, checkout / "notifications" / src.name)
+    for src in (REAL_REPO / "notifications").rglob("*.py"):
+        dest = checkout / "notifications" / src.relative_to(REAL_REPO / "notifications")
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dest)
     shutil.copy2(REAL_REPO / "identity.py", checkout / "identity.py")
     # Probe script: lets tests execute a runtime copy without needing the
     # real hooks' runtime dependencies (redis, orchestrator package).
@@ -270,9 +272,54 @@ class StableInstallShape(unittest.TestCase):
             (td / "settings.json").write_text(original)
             with self.assertRaises(subprocess.CalledProcessError) as ctx:
                 _run_installer(checkout, td)
-            self.assertIn("boot gate failed", ctx.exception.stderr)
+            self.assertIn("AST import closure gate failed", ctx.exception.stderr)
+            self.assertIn("notifications.inbox", ctx.exception.stderr)
             self.assertEqual((td / "settings.json").read_text(), original,
                              "settings were modified despite boot-gate refusal")
+
+    def test_lazy_out_of_closure_import_fails_settings_untouched(self):
+        # exec_module only sees top-level imports. A lazy in-function import
+        # of our own runtime closure must be caught before settings point at
+        # a hook that can crash on its first real call.
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            checkout = _make_checkout(td)
+            hook = checkout / "hooks" / "stop_idle.py"
+            hook.write_text(
+                hook.read_text()
+                + "\n\ndef _lazy_missing_runtime_import():\n"
+                  "    from notifications import missing_lazy\n"
+                  "    return missing_lazy\n"
+            )
+            original = '{"keep": "me"}'
+            (td / "settings.json").write_text(original)
+            with self.assertRaises(subprocess.CalledProcessError) as ctx:
+                _run_installer(checkout, td)
+            self.assertIn("AST import closure gate failed", ctx.exception.stderr)
+            self.assertIn("notifications.missing_lazy", ctx.exception.stderr)
+            self.assertEqual((td / "settings.json").read_text(), original,
+                             "settings were modified despite AST-gate refusal")
+
+    def test_runtime_package_subpackages_are_copied(self):
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            checkout = _make_checkout(td)
+            subpkg = checkout / "notifications" / "subpkg"
+            subpkg.mkdir()
+            (subpkg / "__init__.py").write_text("")
+            (subpkg / "tool.py").write_text("VALUE = 'copied'\n")
+            hook = checkout / "hooks" / "stop_idle.py"
+            hook.write_text(
+                hook.read_text()
+                + "\n\ndef _lazy_subpackage_import():\n"
+                  "    from notifications.subpkg import tool\n"
+                  "    return tool.VALUE\n"
+            )
+            _run_installer(checkout, td)
+            self.assertEqual(
+                (td / "runtime" / "notifications" / "subpkg" / "tool.py").read_text(),
+                "VALUE = 'copied'\n",
+            )
 
     def test_missing_package_entirely_refused_by_static_gate(self):
         with tempfile.TemporaryDirectory() as td:
