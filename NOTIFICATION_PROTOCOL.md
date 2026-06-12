@@ -71,6 +71,8 @@ Any outcome other than `done` leaves `current_task` in place as the "previous di
 
 The notify daemon also runs a backstop for cases where a CLI stalls before firing Stop/AfterAgent. If a local peer still has `current_task` but its `last_tool_activity` is stale (`CF_PEER_INACTIVE_STALE_SECS`, default 300s), the daemon enqueues a high-priority `peer_idle` to the dispatcher with `backstop=stale_last_tool_activity`.
 
+Explicit dispatch handoffs also carry an activation window (`CF_HANDOFF_ACTIVATION_SECS`, default 60s). The daemon marks a handoff activated when the target's heartbeat advances after dispatch, the target binds the dispatched `current_task`, or a handoff ack appears. If none happens before the deadline, the daemon enqueues `dispatch_activation_failed` to the dispatcher. This catches dispatches that reached Redis but never became active in the peer.
+
 ## How messages are delivered
 
 Two paths:

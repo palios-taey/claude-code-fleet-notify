@@ -105,6 +105,29 @@ def default_pickup_poll_budget() -> int:
         return 5
 
 
+def default_activation_deadline_secs() -> int:
+    raw = os.environ.get("CF_HANDOFF_ACTIVATION_SECS", "60").strip()
+    try:
+        return max(1, int(raw))
+    except Exception:
+        return 60
+
+
+def _decode_json_dict(raw: Any) -> dict[str, Any]:
+    try:
+        value = json.loads(raw) if raw else {}
+    except Exception:
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _float_or_none(value: Any) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def is_explicit_handoff_message(message: dict[str, Any]) -> bool:
     return (
         message.get("handoff_kind") == "explicit_handoff"
@@ -131,6 +154,8 @@ def create_explicit_handoff(
     msg_hash = message_hash(body)
     now = time.time()
     pickup_poll_budget = default_pickup_poll_budget()
+    activation_deadline_secs = default_activation_deadline_secs()
+    current_task = _decode_json_dict(redis_client.get(f"{prefix}:{target_session_id}:current_task"))
     record = {
         "kind": "explicit_handoff",
         "dispatcher_session_id": dispatcher_session_id,
@@ -142,6 +167,13 @@ def create_explicit_handoff(
         "created_at": now,
         "ack_deadline_at": now + ack_deadline_secs,
         "ack_backstop_at": now + ack_deadline_secs,
+        "activation_deadline_at": now + activation_deadline_secs,
+        "activation_state": "pending",
+        "activation_failure_notified": False,
+        "activation_baseline_last_activity": redis_client.get(f"{prefix}:{target_session_id}:last_activity"),
+        "activation_baseline_last_tool_activity": redis_client.get(f"{prefix}:{target_session_id}:last_tool_activity"),
+        "activation_baseline_current_task_id": current_task.get("task_id"),
+        "activation_baseline_current_task_started_at": current_task.get("started_at"),
         "pickup_poll_budget": pickup_poll_budget,
         "delivery_poll_count": 0,
         "delivery_state": "queued",
@@ -181,6 +213,115 @@ def create_explicit_handoff(
         redis_client.lpush(inbox_key, encoded_message)
         redis_client.set(record_key, encoded_record)
     return payload
+
+
+def _current_task_activated(record: dict[str, Any], current_task: dict[str, Any]) -> bool:
+    task_id = str(record.get("dispatcher_task_id") or "")
+    if not task_id or str(current_task.get("task_id") or "") != task_id:
+        return False
+    baseline_id = str(record.get("activation_baseline_current_task_id") or "")
+    if baseline_id != task_id:
+        return True
+    created_at = _float_or_none(record.get("created_at"))
+    started_at = _float_or_none(current_task.get("started_at"))
+    return bool(created_at is not None and started_at is not None and started_at >= created_at)
+
+
+def _activity_activated(redis_client, prefix: str, record: dict[str, Any]) -> bool:
+    target = str(record.get("target_session_id") or "")
+    created_at = _float_or_none(record.get("created_at")) or 0.0
+    for suffix in ("last_tool_activity", "last_activity"):
+        now_value = _float_or_none(redis_client.get(f"{prefix}:{target}:{suffix}"))
+        baseline = _float_or_none(record.get(f"activation_baseline_{suffix}"))
+        if now_value is None:
+            continue
+        if baseline is not None and now_value > baseline:
+            return True
+        if baseline is None and now_value >= created_at:
+            return True
+    return False
+
+
+def _ack_activated(redis_client, prefix: str, record: dict[str, Any]) -> bool:
+    dispatcher = str(record.get("dispatcher_session_id") or "")
+    target = str(record.get("target_session_id") or "")
+    msg_id = str(record.get("msg_id") or "")
+    return bool(dispatcher and target and msg_id and redis_client.exists(explicit_ack_key(prefix, dispatcher, target, msg_id)))
+
+
+def _handoff_activated(redis_client, prefix: str, record: dict[str, Any]) -> str | None:
+    if _ack_activated(redis_client, prefix, record):
+        return "ack"
+    if _activity_activated(redis_client, prefix, record):
+        return "heartbeat"
+    target = str(record.get("target_session_id") or "")
+    current_task = _decode_json_dict(redis_client.get(f"{prefix}:{target}:current_task"))
+    if _current_task_activated(record, current_task):
+        return "current_task"
+    return None
+
+
+def _notify_activation_failed(redis_client, prefix: str, record: dict[str, Any], *, now: float) -> None:
+    dispatcher = str(record.get("dispatcher_session_id") or "")
+    target = str(record.get("target_session_id") or "")
+    if not dispatcher or not target:
+        return
+    task_id = record.get("dispatcher_task_id")
+    body = (
+        f"{target} did not activate dispatched task {task_id or '?'} "
+        f"within activation window"
+    )
+    msg = {
+        "from": target,
+        "type": "dispatch_activation_failed",
+        "body": body,
+        "priority": "high",
+        "timestamp": now,
+        "msg_id": f"dispatch-activation-failed-{target}-{record.get('msg_id')}",
+        "dispatcher_session_id": dispatcher,
+        "target_session_id": target,
+        "dispatcher_task_id": task_id,
+        "handoff_msg_id": record.get("msg_id"),
+        "activation_deadline_at": record.get("activation_deadline_at"),
+    }
+    redis_client.lpush(f"{prefix}:{dispatcher}:inbox", json.dumps(msg, separators=(",", ":")))
+
+
+def validate_handoff_activation(redis_client, *, prefix: str, now: float | None = None) -> int:
+    now = time.time() if now is None else now
+    updated = 0
+    for record_key in redis_client.scan_iter(match=f"{prefix}:handoff:*"):
+        try:
+            record = json.loads(redis_client.get(record_key) or "")
+        except Exception:
+            continue
+        if not isinstance(record, dict) or record.get("kind") != "explicit_handoff":
+            continue
+        if not record.get("dispatcher_task_id"):
+            continue
+        if record.get("activation_state") in {"activated", "failed", "superseded", "dead"}:
+            continue
+
+        source = _handoff_activated(redis_client, prefix, record)
+        if source:
+            record["activation_state"] = "activated"
+            record["activation_source"] = source
+            record["activated_at"] = now
+            redis_client.set(record_key, json.dumps(record, separators=(",", ":")))
+            updated += 1
+            continue
+
+        deadline = _float_or_none(record.get("activation_deadline_at"))
+        if deadline is None or now < deadline:
+            continue
+        if not record.get("activation_failure_notified"):
+            _notify_activation_failed(redis_client, prefix, record, now=now)
+            record["activation_failure_notified"] = True
+        record["activation_state"] = "failed"
+        record["activation_failed_at"] = now
+        redis_client.set(record_key, json.dumps(record, separators=(",", ":")))
+        updated += 1
+    return updated
 
 
 def queue_pending_receipts(redis_client, *, prefix: str, target_session_id: str,
