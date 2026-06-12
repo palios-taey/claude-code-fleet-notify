@@ -31,6 +31,7 @@ from notifications.inbox import (
     is_node_idle,
     key_prefix,
     notifications_key,
+    state_key,
 )
 from notifications.handoff import mark_session_machine, record_delivery_signal, session_machine_key
 
@@ -42,6 +43,8 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_POLL_INTERVAL = 3
 MAX_MESSAGE_LENGTH = 4000
+DEFAULT_PEER_INACTIVE_STALE_SECS = 300
+PEER_INACTIVE_DEDUP_SECS = 300
 
 
 def get_local_tmux_sessions() -> list[str]:
@@ -89,6 +92,91 @@ def inject_via_tmux(session_name: str, message: str) -> bool:
     except Exception as exc:
         logger.error("tmux injection exception for %s: %s", session_name, exc)
         return False
+
+
+def _resolve_supervisor(r, node_id: str) -> str | None:
+    explicit = r.get(state_key(node_id, "parent"))
+    if explicit:
+        return explicit
+    for suffix in ("-codex", "-gemini", "-grok"):
+        if node_id.endswith(suffix):
+            return node_id[: -len(suffix)]
+    return None
+
+
+def _decode_current_task(raw: str | None) -> dict | None:
+    if not raw:
+        return None
+    try:
+        task = json.loads(raw)
+    except Exception:
+        return None
+    return task if isinstance(task, dict) else None
+
+
+def _float_or_none(value) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def notify_dispatcher_if_peer_inactive(r, node_id: str, *, now: float | None = None,
+                                       stale_secs: int = DEFAULT_PEER_INACTIVE_STALE_SECS) -> bool:
+    """Backstop for stalls where the CLI never fires Stop/AfterAgent.
+
+    If a local peer still holds dispatch context but has stale tool activity,
+    enqueue one peer_idle-style lifecycle message to its dispatcher. This is
+    intentionally independent of the explicit idle flag, because the missing
+    hook is the failure mode this backstop covers.
+    """
+    if r.exists(state_key(node_id, "tool_running")):
+        return False
+    task = _decode_current_task(r.get(state_key(node_id, "current_task")))
+    if not task:
+        return False
+    task_id = task.get("task_id")
+    supervisor = _resolve_supervisor(r, node_id) or task.get("supervisor")
+    if not supervisor:
+        return False
+    timestamp = _float_or_none(r.get(state_key(node_id, "last_tool_activity")))
+    if timestamp is None:
+        timestamp = _float_or_none(task.get("started_at"))
+    if timestamp is None:
+        return False
+    now = time.time() if now is None else now
+    stale_for = max(0, int(now - timestamp))
+    if stale_for < stale_secs:
+        return False
+
+    dedup_suffix = task_id or "no-task"
+    dedup = f"{key_prefix()}:peer-inactive-notified:{node_id}:{dedup_suffix}"
+    if r.exists(dedup):
+        return False
+
+    body = (
+        f"{node_id} inactive for {stale_for}s while holding dispatched task "
+        f"{task_id or '?'}"
+    )
+    msg = json.dumps({
+        "from": node_id,
+        "type": "peer_idle",
+        "body": body,
+        "outcome": "unknown",
+        "priority": "high",
+        "msg_id": f"peer-inactive-{node_id}-{dedup_suffix}-{int(now)}",
+        "timestamp": now,
+        "task_id": task_id,
+        "task_description": task.get("description"),
+        "task_supervisor": task.get("supervisor"),
+        "task_started_at": task.get("started_at"),
+        "inactive_for_sec": stale_for,
+        "backstop": "stale_last_tool_activity",
+    })
+    r.lpush(inbox_key(str(supervisor)), msg)
+    r.set(dedup, "1", ex=PEER_INACTIVE_DEDUP_SECS)
+    logger.warning("Backstop peer_idle: %s -> %s (%s)", node_id, supervisor, body)
+    return True
 
 
 def build_pointer_summary(r, node_id: str) -> str | None:
@@ -261,6 +349,9 @@ def run_daemon(
             local_sessions = get_local_tmux_sessions()
             local_session_set = set(local_sessions)
             machine = socket.gethostname()
+            peer_inactive_stale_secs = int(
+                os.environ.get("CF_PEER_INACTIVE_STALE_SECS", str(DEFAULT_PEER_INACTIVE_STALE_SECS))
+            )
 
             for session_name in local_sessions:
                 node_id = session_name
@@ -273,6 +364,12 @@ def run_daemon(
                     )
                 except Exception:
                     pass
+
+                notify_dispatcher_if_peer_inactive(
+                    r,
+                    node_id,
+                    stale_secs=peer_inactive_stale_secs,
+                )
 
                 if not is_node_idle(r, node_id):
                     continue
