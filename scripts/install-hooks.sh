@@ -104,6 +104,7 @@ python3 - "$REPO_DIR" "$APPLY" "$CLAUDE_SETTINGS" "$CODEX_HOOKS" "$GEMINI_SETTIN
         "$INSTALL_CLAUDE" "$INSTALL_CODEX" "$INSTALL_GEMINI" "$INSTALL_ROOT" <<'PY'
 from __future__ import annotations
 
+import ast
 import difflib
 import json
 import os
@@ -175,13 +176,14 @@ def sync_runtime() -> list[str]:
     actions: list[str] = []
 
     def copy_tree(src_dir: Path, dest_dir: Path, label: str) -> None:
-        for src in sorted(src_dir.glob("*.py")):
-            dest = dest_dir / src.name
+        for src in sorted(src_dir.rglob("*.py")):
+            rel = src.relative_to(src_dir)
+            dest = dest_dir / rel
             if dest.exists() and dest.read_bytes() == src.read_bytes():
                 continue
-            actions.append(f"copy {label}{src.name} -> {dest}")
+            actions.append(f"copy {label}{rel.as_posix()} -> {dest}")
             if apply:
-                dest_dir.mkdir(parents=True, exist_ok=True)
+                dest.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(src, dest)
 
     copy_tree(hooks_src, hooks_dir, "")
@@ -326,6 +328,119 @@ def apply_one(cli_name: str, spec: dict, original_text: str, new_text: str) -> N
     print(f"[{cli_name}] Applied. Backup: {backup_path}")
 
 
+def source_package_parts(source: Path) -> list[str]:
+    try:
+        rel = source.resolve().relative_to(repo_dir)
+    except ValueError:
+        return []
+    if len(rel.parts) < 2 or rel.suffix != ".py":
+        return []
+    if rel.parts[0] == "hooks":
+        return ["hooks"] if rel.name == "__init__.py" else ["hooks", *rel.with_suffix("").parts[1:-1]]
+    if rel.parts[0] in RUNTIME_PACKAGES:
+        return [rel.parts[0], *rel.with_suffix("").parts[1:-1]]
+    return []
+
+
+def resolve_relative_import(source: Path, level: int, module: str | None,
+                            alias: str | None) -> str | None:
+    package = source_package_parts(source)
+    if not package or level > len(package):
+        return None
+    base = package[:len(package) - level + 1]
+    if module:
+        base.extend(module.split("."))
+    if alias:
+        base.append(alias)
+    return ".".join(part for part in base if part)
+
+
+def is_our_module(module: str) -> bool:
+    root = module.split(".", 1)[0]
+    return root in ({"hooks", "notifications", "identity", "_shared"} | set(RUNTIME_PACKAGES))
+
+
+def runtime_module_candidates(module: str) -> list[Path]:
+    parts = module.split(".")
+    if parts[0] == "identity":
+        return [install_root / "identity.py"]
+    if parts[0] == "_shared":
+        return [hooks_dir / "_shared.py"]
+    if parts[0] == "hooks":
+        base = install_root.joinpath(*parts)
+        return [base.with_suffix(".py"), base / "__init__.py"]
+    if parts[0] in RUNTIME_PACKAGES:
+        base = install_root.joinpath(*parts)
+        return [base.with_suffix(".py"), base / "__init__.py"]
+    return []
+
+
+def runtime_module_exists(module: str) -> bool:
+    return any(candidate.is_file() for candidate in runtime_module_candidates(module))
+
+
+def runtime_module_is_package(module: str) -> bool:
+    parts = module.split(".")
+    if parts[0] not in ({"hooks"} | set(RUNTIME_PACKAGES)):
+        return False
+    return (install_root.joinpath(*parts) / "__init__.py").is_file()
+
+
+def import_from_targets(module: str, aliases: list[ast.alias]) -> list[str]:
+    if module in (set(RUNTIME_PACKAGES) | {"hooks"}) or runtime_module_is_package(module):
+        return [f"{module}.{alias.name}" for alias in aliases
+                if alias.name != "*"]
+    return [module] if module else []
+
+
+def import_targets(source: Path, node: ast.AST) -> list[str]:
+    if isinstance(node, ast.Import):
+        return [alias.name for alias in node.names]
+    if not isinstance(node, ast.ImportFrom):
+        return []
+    if node.level:
+        module = resolve_relative_import(source, node.level, node.module, None)
+        if module:
+            return import_from_targets(module, node.names)
+        return [
+            target for target in (
+                resolve_relative_import(source, node.level, None, alias.name)
+                for alias in node.names if alias.name != "*")
+            if target]
+    module = node.module or ""
+    return import_from_targets(module, node.names)
+
+
+def ast_import_closure_failures(sources: list[Path]) -> list[str]:
+    failures: list[str] = []
+    seen: set[tuple[Path, str]] = set()
+    for source in sources:
+        try:
+            tree = ast.parse(source.read_text(), filename=str(source))
+        except SyntaxError as exc:
+            failures.append(f"{source.relative_to(repo_dir)}: invalid Python: {exc}")
+            continue
+        for node in ast.walk(tree):
+            for target in import_targets(source, node):
+                key = (source, target)
+                if key in seen:
+                    continue
+                seen.add(key)
+                if is_our_module(target) and not runtime_module_exists(target):
+                    rel = source.relative_to(repo_dir)
+                    failures.append(f"{rel}: imports {target}, but it is not in {install_root}")
+    return failures
+
+
+def runtime_closure_sources() -> list[Path]:
+    sources = {hooks_src / name for name in required if name.endswith(".py")}
+    for package in RUNTIME_PACKAGES:
+        sources.update((repo_dir / package).rglob("*.py"))
+    for name in RUNTIME_ROOT_FILES:
+        sources.add(repo_dir / name)
+    return sorted(sources)
+
+
 # Completeness gate: every script any enabled CLI's settings will reference
 # must exist in the source checkout BEFORE anything is copied or written.
 # An incomplete checkout must fail loud here — never emit a command for a
@@ -368,6 +483,16 @@ else:
 # __main__-guarded, so importing the module exercises the full import
 # closure without running hook logic.
 if apply:
+    ast_failures = ast_import_closure_failures(runtime_closure_sources())
+    if ast_failures:
+        raise SystemExit(
+            "ERROR: runtime AST import closure gate failed — these in-closure "
+            "sources reference our modules that were not copied to the runtime "
+            "root; NO settings were written:\n\n"
+            + "\n".join(ast_failures)
+        )
+    print(f"[boot-gate] AST import closure verified for {len(runtime_closure_sources())} sources.")
+
     boot_failures = []
     probed = 0
     for script_name in required:
