@@ -39,6 +39,7 @@ from notifications.handoff import (
     session_machine_key,
     validate_handoff_activation,
 )
+from notifications.task_liveness import peer_idle_allowed
 
 logging.basicConfig(
     level=logging.INFO,
@@ -142,7 +143,14 @@ def notify_dispatcher_if_peer_inactive(r, node_id: str, *, now: float | None = N
         return False
     task_id = task.get("task_id")
     supervisor = _resolve_supervisor(r, node_id) or task.get("supervisor")
-    if not supervisor:
+    allowed, reason, _ = peer_idle_allowed(task_id, node_id, supervisor)
+    if not allowed:
+        logger.info(
+            "Skipping backstop peer_idle for %s task=%s: %s",
+            node_id,
+            task_id or "?",
+            reason,
+        )
         return False
     timestamp = _float_or_none(r.get(state_key(node_id, "last_tool_activity")))
     if timestamp is None:
