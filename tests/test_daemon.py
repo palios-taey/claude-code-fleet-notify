@@ -112,15 +112,85 @@ class DaemonTests(unittest.TestCase):
         fake_redis_module = SimpleNamespace(Redis=lambda **kwargs: r)
         with mock.patch.dict(sys.modules, {"redis": fake_redis_module}):
             with mock.patch.object(daemon, "get_local_tmux_sessions", return_value=["worker-codex"]):
-                with mock.patch.object(daemon.time, "time", return_value=1400):
-                    with mock.patch.object(daemon.time, "sleep", side_effect=KeyboardInterrupt):
-                        daemon.run_daemon("127.0.0.1", 6379, 1)
+                with mock.patch.object(daemon, "peer_idle_allowed", return_value=(True, "in_progress", {"status": "in_progress"})):
+                    with mock.patch.object(daemon.time, "time", return_value=1400):
+                        with mock.patch.object(daemon.time, "sleep", side_effect=KeyboardInterrupt):
+                            daemon.run_daemon("127.0.0.1", 6379, 1)
 
         msg = r.decoded_list(inbox_key("conductor"))[0]
         self.assertEqual("peer_idle", msg["type"])
         self.assertEqual("task-59", msg["task_id"])
         self.assertEqual("stale_last_tool_activity", msg["backstop"])
         self.assertEqual(400, msg["inactive_for_sec"])
+
+    def test_stale_peer_failed_task_does_not_notify_dispatcher(self):
+        r = FakeRedis()
+        r.set(state_key("worker-codex", "parent"), "conductor")
+        r.set(state_key("worker-codex", "last_tool_activity"), "1000")
+        r.set(state_key("worker-codex", "current_task"), json.dumps({
+            "task_id": "task-failed",
+            "description": "already failed",
+            "supervisor": "conductor",
+            "started_at": "900",
+        }))
+
+        with mock.patch.object(daemon, "peer_idle_allowed", return_value=(False, "task_status_failed", {"status": "failed"})):
+            fired = daemon.notify_dispatcher_if_peer_inactive(r, "worker-codex", now=1400)
+
+        self.assertFalse(fired)
+        self.assertEqual(0, r.llen(inbox_key("conductor")))
+
+    def test_stale_peer_orphan_task_does_not_notify_dispatcher(self):
+        r = FakeRedis()
+        r.set(state_key("worker-codex", "parent"), "conductor")
+        r.set(state_key("worker-codex", "last_tool_activity"), "1000")
+        r.set(state_key("worker-codex", "current_task"), json.dumps({
+            "task_id": "task-orphan",
+            "description": "missing task",
+            "supervisor": "conductor",
+            "started_at": "900",
+        }))
+
+        with mock.patch.object(daemon, "peer_idle_allowed", return_value=(False, "task_unresolved", None)):
+            fired = daemon.notify_dispatcher_if_peer_inactive(r, "worker-codex", now=1400)
+
+        self.assertFalse(fired)
+        self.assertEqual(0, r.llen(inbox_key("conductor")))
+
+    def test_stale_peer_self_supervisor_does_not_notify_dispatcher(self):
+        r = FakeRedis()
+        r.set(state_key("worker-codex", "parent"), "worker-codex")
+        r.set(state_key("worker-codex", "last_tool_activity"), "1000")
+        r.set(state_key("worker-codex", "current_task"), json.dumps({
+            "task_id": "task-self",
+            "description": "self notify",
+            "supervisor": "worker-codex",
+            "started_at": "900",
+        }))
+
+        fired = daemon.notify_dispatcher_if_peer_inactive(r, "worker-codex", now=1400)
+
+        self.assertFalse(fired)
+        self.assertEqual(0, r.llen(inbox_key("worker-codex")))
+
+    def test_stale_peer_live_in_progress_task_still_notifies_dispatcher(self):
+        r = FakeRedis()
+        r.set(state_key("worker-codex", "parent"), "conductor")
+        r.set(state_key("worker-codex", "last_tool_activity"), "1000")
+        r.set(state_key("worker-codex", "current_task"), json.dumps({
+            "task_id": "task-live",
+            "description": "live task",
+            "supervisor": "conductor",
+            "started_at": "900",
+        }))
+
+        with mock.patch.object(daemon, "peer_idle_allowed", return_value=(True, "in_progress", {"status": "in_progress"})):
+            fired = daemon.notify_dispatcher_if_peer_inactive(r, "worker-codex", now=1400)
+
+        msg = r.decoded_list(inbox_key("conductor"))[0]
+        self.assertTrue(fired)
+        self.assertEqual("peer_idle", msg["type"])
+        self.assertEqual("task-live", msg["task_id"])
 
     def test_dispatch_activation_failure_notifies_dispatcher(self):
         r = FakeRedis()

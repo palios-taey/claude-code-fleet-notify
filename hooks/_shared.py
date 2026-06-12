@@ -60,6 +60,7 @@ from notifications.handoff import (
     flush_pending_receipts,
     queue_pending_receipts,
 )
+from notifications.task_liveness import peer_idle_allowed
 
 _ORCH_API_BASE = os.environ.get("ORCH_API_BASE", "http://127.0.0.1:5002")
 _DEFAULT_HEARTBEAT_SECS = 300
@@ -339,6 +340,16 @@ def _resolve_blocked_on(task_id: Optional[str]) -> Optional[str]:
     return str(blocked_on)
 
 
+def _peer_idle_allowed_for_task(node_id: str, supervisor: str, task_id: Optional[str]) -> bool:
+    try:
+        allowed, reason, _ = peer_idle_allowed(task_id, node_id, supervisor)
+    except Exception as exc:
+        allowed, reason = False, f"task_liveness_error:{exc}"
+    if not allowed:
+        log_debug(node_id, f"suppressed PEER_IDLE for {node_id}: {reason}")
+    return allowed
+
+
 def _current_task_summary(r, node_id: str):
     """Build a short summary of the worker's just-completed task, if any.
 
@@ -530,6 +541,8 @@ def _notify_supervisor_of_stop(r, node_id: str, supervisor: str) -> None:
             decision = fetch_stop_decision(node_id)
 
         if decision is None:
+            if not _peer_idle_allowed_for_task(node_id, supervisor, observed_task_id):
+                return
             blocked_on = _resolve_blocked_on(observed_task_id)
             if blocked_on:
                 log_debug(node_id, f"suppressed PEER_IDLE for {node_id}: blocked_on={blocked_on}")
@@ -580,6 +593,8 @@ def _notify_supervisor_of_stop(r, node_id: str, supervisor: str) -> None:
         if decision.get("wake_type") == WAKE_ALLOW_STOP:
             if not observed_task and not observed_outcome_struct:
                 log_debug(node_id, f"suppressed PEER_IDLE for {node_id}: {decision.get('blocked_on') or 'allow_stop'}")
+                return
+            if not _peer_idle_allowed_for_task(node_id, supervisor, observed_task_id):
                 return
             body = f"{node_id} stopped — {summary}" if summary else f"{node_id} stopped — no current task recorded"
             priority = "high" if outcome in ("error", "interrupted") else "normal"
