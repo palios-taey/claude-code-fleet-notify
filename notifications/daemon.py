@@ -109,12 +109,16 @@ def inject_via_tmux(session_name: str, message: str) -> bool:
 
 
 def _resolve_supervisor(r, node_id: str) -> str | None:
+    for suffix in ("-codex", "-gemini", "-grok"):
+        if node_id.endswith(suffix):
+            suffix_supervisor = node_id[: -len(suffix)]
+            explicit = r.get(state_key(node_id, "parent"))
+            if explicit and explicit != node_id:
+                return explicit
+            return suffix_supervisor
     explicit = r.get(state_key(node_id, "parent"))
     if explicit:
         return explicit
-    for suffix in ("-codex", "-gemini", "-grok"):
-        if node_id.endswith(suffix):
-            return node_id[: -len(suffix)]
     return None
 
 

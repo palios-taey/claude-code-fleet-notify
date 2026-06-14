@@ -159,19 +159,41 @@ class DaemonTests(unittest.TestCase):
 
     def test_stale_peer_self_supervisor_does_not_notify_dispatcher(self):
         r = FakeRedis()
-        r.set(state_key("worker-codex", "parent"), "worker-codex")
-        r.set(state_key("worker-codex", "last_tool_activity"), "1000")
-        r.set(state_key("worker-codex", "current_task"), json.dumps({
+        r.set(state_key("worker", "parent"), "worker")
+        r.set(state_key("worker", "last_tool_activity"), "1000")
+        r.set(state_key("worker", "current_task"), json.dumps({
             "task_id": "task-self",
             "description": "self notify",
-            "supervisor": "worker-codex",
+            "supervisor": "worker",
             "started_at": "900",
         }))
 
-        fired = daemon.notify_dispatcher_if_peer_inactive(r, "worker-codex", now=1400)
+        fired = daemon.notify_dispatcher_if_peer_inactive(r, "worker", now=1400)
 
         self.assertFalse(fired)
-        self.assertEqual(0, r.llen(inbox_key("worker-codex")))
+        self.assertEqual(0, r.llen(inbox_key("worker")))
+
+    def test_stale_suffix_peer_self_parent_notifies_suffix_supervisor(self):
+        r = FakeRedis()
+        r.set(state_key("weaver-grok", "parent"), "weaver-grok")
+        r.set(state_key("weaver-grok", "last_tool_activity"), "1000")
+        r.set(state_key("weaver-grok", "current_task"), json.dumps({
+            "task_id": "task-97",
+            "description": "peer liveness",
+            "supervisor": "weaver",
+            "started_at": "900",
+        }))
+
+        with mock.patch.object(daemon, "peer_idle_allowed", return_value=(True, "in_progress", {"status": "in_progress"})):
+            fired = daemon.notify_dispatcher_if_peer_inactive(r, "weaver-grok", now=1400)
+
+        msg = r.decoded_list(inbox_key("weaver"))[0]
+        self.assertTrue(fired)
+        self.assertEqual("peer_idle", msg["type"])
+        self.assertEqual("weaver-grok", msg["from"])
+        self.assertEqual("task-97", msg["task_id"])
+        self.assertEqual("stale_last_tool_activity", msg["backstop"])
+        self.assertEqual(0, r.llen(inbox_key("weaver-grok")))
 
     def test_stale_peer_live_in_progress_task_still_notifies_dispatcher(self):
         r = FakeRedis()
