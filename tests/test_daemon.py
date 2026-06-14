@@ -123,6 +123,61 @@ class DaemonTests(unittest.TestCase):
         self.assertEqual("stale_last_tool_activity", msg["backstop"])
         self.assertEqual(400, msg["inactive_for_sec"])
 
+    def test_fresh_peer_with_current_task_does_not_notify_dispatcher(self):
+        r = FakeRedis()
+        r.set(state_key("worker-codex", "parent"), "conductor")
+        r.set(state_key("worker-codex", "last_tool_activity"), "1395")
+        r.set(state_key("worker-codex", "current_task"), json.dumps({
+            "task_id": "task-fresh",
+            "description": "active work",
+            "supervisor": "conductor",
+            "started_at": "1000",
+        }))
+
+        with mock.patch.object(daemon, "peer_idle_allowed", return_value=(True, "in_progress", {"status": "in_progress"})):
+            fired = daemon.notify_dispatcher_if_peer_inactive(r, "worker-codex", now=1400)
+
+        self.assertFalse(fired)
+        self.assertEqual(0, r.llen(inbox_key("conductor")))
+
+    def test_stale_pre_dispatch_activity_does_not_create_false_inactive_duration(self):
+        r = FakeRedis()
+        r.set(state_key("worker-codex", "parent"), "conductor")
+        r.set(state_key("worker-codex", "last_tool_activity"), "1000")
+        r.set(state_key("worker-codex", "current_task"), json.dumps({
+            "task_id": "task-restarted",
+            "description": "fresh dispatch",
+            "supervisor": "conductor",
+            "started_at": "1395",
+        }))
+
+        with mock.patch.object(daemon, "peer_idle_allowed", return_value=(True, "in_progress", {"status": "in_progress"})):
+            fired = daemon.notify_dispatcher_if_peer_inactive(r, "worker-codex", now=1400)
+
+        self.assertFalse(fired)
+        self.assertEqual(0, r.llen(inbox_key("conductor")))
+
+    def test_stale_peer_inactive_duration_uses_latest_activity_marker(self):
+        r = FakeRedis()
+        r.set(state_key("worker-codex", "parent"), "conductor")
+        r.set(state_key("worker-codex", "last_tool_activity"), "1000")
+        r.set(state_key("worker-codex", "last_activity"), "1200")
+        r.set(state_key("worker-codex", "current_task"), json.dumps({
+            "task_id": "task-stale",
+            "description": "real stall",
+            "supervisor": "conductor",
+            "started_at": "900",
+        }))
+
+        with mock.patch.object(daemon, "peer_idle_allowed", return_value=(True, "in_progress", {"status": "in_progress"})):
+            fired = daemon.notify_dispatcher_if_peer_inactive(r, "worker-codex", now=1600)
+
+        msg = r.decoded_list(inbox_key("conductor"))[0]
+        self.assertTrue(fired)
+        self.assertEqual("peer_idle", msg["type"])
+        self.assertEqual("task-stale", msg["task_id"])
+        self.assertEqual(400, msg["inactive_for_sec"])
+
     def test_stale_peer_failed_task_does_not_notify_dispatcher(self):
         r = FakeRedis()
         r.set(state_key("worker-codex", "parent"), "conductor")

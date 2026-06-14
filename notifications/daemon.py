@@ -164,12 +164,16 @@ def notify_dispatcher_if_peer_inactive(r, node_id: str, *, now: float | None = N
             reason,
         )
         return False
-    timestamp = _float_or_none(r.get(state_key(node_id, "last_tool_activity")))
-    if timestamp is None:
-        timestamp = _float_or_none(task.get("started_at"))
-    if timestamp is None:
+    timestamps = [
+        _float_or_none(r.get(state_key(node_id, "last_tool_activity"))),
+        _float_or_none(r.get(state_key(node_id, "last_activity"))),
+        _float_or_none(task.get("started_at")),
+    ]
+    timestamps = [ts for ts in timestamps if ts is not None]
+    if not timestamps:
         return False
     now = time.time() if now is None else now
+    timestamp = max(timestamps)
     stale_for = max(0, int(now - timestamp))
     if stale_for < stale_secs:
         return False
