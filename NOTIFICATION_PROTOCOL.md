@@ -69,7 +69,7 @@ Any outcome other than `done` leaves `current_task` in place as the "previous di
 
 `ALLOW_STOP` from the orchestrator stop-decision API means "do not block this worker from idling." It does **not** suppress lifecycle notification: if the worker still has `current_task` or `last_outcome` dispatch context, the Stop/AfterAgent hook still enqueues `peer_idle`.
 
-The notify daemon also runs a backstop for cases where a CLI stalls before firing Stop/AfterAgent. If a local peer still has `current_task` but its `last_tool_activity` is stale (`CF_PEER_INACTIVE_STALE_SECS`, default 300s), the daemon enqueues a high-priority `peer_idle` to the dispatcher with `backstop=stale_last_tool_activity`.
+The notify daemon also runs a backstop for cases where a CLI stalls before firing Stop/AfterAgent. If a local peer still has `current_task` but its `last_tool_activity` is stale (`CF_PEER_INACTIVE_STALE_SECS`, default 300s), the daemon enqueues a high-priority `peer_idle` to the dispatcher with `backstop=stale_last_tool_activity`. This depends on tracked-dispatch discipline: the dispatcher must bind `current_task` when handing work to a peer, so the daemon has enough state to wake the dispatcher even when the peer never reaches its Stop hook.
 
 Explicit dispatch handoffs also carry an activation window (`CF_HANDOFF_ACTIVATION_SECS`, default 60s). The daemon marks a handoff activated when the target's heartbeat advances after dispatch, the target binds the dispatched `current_task`, or a handoff ack appears. If none happens before the deadline, the daemon enqueues `dispatch_activation_failed` to the dispatcher. This catches dispatches that reached Redis but never became active in the peer.
 

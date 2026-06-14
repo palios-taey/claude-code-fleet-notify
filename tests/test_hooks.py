@@ -200,6 +200,38 @@ class StopHookTests(HookTestCase):
 
         self.assertEqual(0, r.llen(inbox_key("worker-codex")))
 
+    def test_suffix_peer_self_parent_resolves_to_suffix_supervisor_and_notifies(self):
+        r = FakeRedis()
+        r.set(state_key("weaver-grok", "parent"), "weaver-grok")
+        r.set(state_key("weaver-grok", "current_task"), json.dumps({
+            "task_id": "task-97",
+            "description": "peer liveness",
+            "supervisor": "weaver",
+            "started_at": "1000",
+        }))
+
+        with mock.patch.object(shared, "fetch_stop_decision", return_value={
+            "wake_type": shared.WAKE_ALLOW_STOP,
+            "block": False,
+            "reason": None,
+        }):
+            with mock.patch.object(shared, "peer_idle_allowed", return_value=(True, "in_progress", {"status": "in_progress"})):
+                shared.action_stop(r, "weaver-grok")
+
+        msg = r.decoded_list(inbox_key("weaver"))[0]
+        self.assertEqual("peer_idle", msg["type"])
+        self.assertEqual("weaver-grok", msg["from"])
+        self.assertEqual("task-97", msg["task_id"])
+        self.assertEqual(0, r.llen(inbox_key("weaver-grok")))
+
+    def test_top_level_self_parent_still_resolves_to_self_and_suppresses(self):
+        r = FakeRedis()
+        r.set(state_key("weaver", "parent"), "weaver")
+
+        shared.action_stop(r, "weaver")
+
+        self.assertEqual(0, r.llen(inbox_key("weaver")))
+
 
 class UserPromptSubmitHookTests(HookTestCase):
     def test_user_prompt_clears_idle_drains_and_returns_context(self):

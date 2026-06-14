@@ -307,6 +307,19 @@ def _resolve_supervisor(r, node_id: str) -> Optional[str]:
     second-level worker (e.g., ``treasurer-codex-research``) from a
     first-level one.
     """
+    for suffix in ("-codex", "-gemini", "-grok"):
+        if node_id.endswith(suffix):
+            suffix_supervisor = node_id[: -len(suffix)]
+            try:
+                from notifications.inbox import state_key
+
+                explicit = r.get(state_key(node_id, "parent"))
+                if explicit and explicit != node_id:
+                    return explicit
+            except Exception:
+                pass
+            return suffix_supervisor
+
     try:
         from notifications.inbox import state_key
 
@@ -315,10 +328,6 @@ def _resolve_supervisor(r, node_id: str) -> Optional[str]:
             return explicit
     except Exception:
         pass
-
-    for suffix in ("-codex", "-gemini", "-grok"):
-        if node_id.endswith(suffix):
-            return node_id[: -len(suffix)]
     return None
 
 
