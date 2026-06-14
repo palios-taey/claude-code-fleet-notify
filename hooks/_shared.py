@@ -350,6 +350,14 @@ def _peer_idle_allowed_for_task(node_id: str, supervisor: str, task_id: Optional
     return allowed
 
 
+def _stop_event_dedup_key(r, node_id: str, task_id: Optional[str]) -> str:
+    from notifications.inbox import key_prefix, state_key
+
+    stop_stamp = r.get(state_key(node_id, "last_activity")) or "unknown-stop"
+    task_bucket = task_id or "no-task"
+    return f"{key_prefix()}:peer-idle-notified:{node_id}:{task_bucket}:{stop_stamp}"
+
+
 def _current_task_summary(r, node_id: str):
     """Build a short summary of the worker's just-completed task, if any.
 
@@ -475,9 +483,8 @@ def _notify_supervisor_of_stop(r, node_id: str, supervisor: str) -> None:
     so the supervisor sees the result inline without context-switching to
     the worker pane.
 
-    Dedup is keyed per ``(node_id, task_id)`` — back-to-back Stops on the
-    SAME task dedup; a Stop after a re-dispatch on the SAME worker but a
-    DIFFERENT task fires fresh (Logos contract #3 / Gaia dispatch #2).
+    Dedup is keyed per stop event. The task/no-task bucket alone is not a
+    dedup key: distinct no-task stops must still wake the supervisor.
 
     Persistence rule (Gaia, Phase A consultation 2026-05-26): clear
     current_task ONLY when the outcome is explicitly ``done``. Any other
@@ -493,6 +500,10 @@ def _notify_supervisor_of_stop(r, node_id: str, supervisor: str) -> None:
     """
     try:
         from notifications.inbox import inbox_key, state_key
+
+        if supervisor == node_id:
+            log_debug(node_id, f"suppressed PEER_IDLE for {node_id}: supervisor is self")
+            return
 
         summary, outcome = _current_task_summary(r, node_id)
 
@@ -511,15 +522,9 @@ def _notify_supervisor_of_stop(r, node_id: str, supervisor: str) -> None:
             observed_task = None
             observed_task_id = None
 
-        # Audit fix (Gaia system-integration sign-off 2026-05-26, TIER-1):
-        # peer_idle MUST be self-describing — adopters without conductor-
-        # grade dispatch-state binding (treasurer, x-claude, external
-        # users) need task_id as a structured field, not buried in body
-        # text where it has to be regex-extracted. Also surface
-        # task_description / supervisor / started_at + last_outcome
-        # details so the supervisor can update their plan-graph status
-        # directly from the wire without re-querying current_task (which
-        # is about to be cleared).
+        # peer_idle MUST be self-describing. Surface task_id/task_description
+        # when the observed task is still active; otherwise report the stop
+        # honestly as no-task rather than claiming a stale task.
         observed_outcome_struct = None
         try:
             lo = r.get(state_key(node_id, "last_outcome"))
@@ -531,8 +536,15 @@ def _notify_supervisor_of_stop(r, node_id: str, supervisor: str) -> None:
         except Exception:
             observed_outcome_struct = None
 
-        dedup_suffix = observed_task_id or "no-task"
-        dedup = f"taey:peer-idle-notified:{node_id}:{dedup_suffix}"
+        active_task = bool(observed_task_id and _peer_idle_allowed_for_task(node_id, supervisor, observed_task_id))
+        reported_task = observed_task if active_task else None
+        reported_task_id = observed_task_id if active_task else None
+        stale_task_reason = None
+        if observed_task_id and not active_task:
+            stale_task_reason = f"observed current_task {observed_task_id} is not active; reporting stop without task claim"
+
+        dedup_suffix = reported_task_id or "no-task"
+        dedup = _stop_event_dedup_key(r, node_id, dedup_suffix)
         if r.exists(dedup):
             return
 
@@ -541,39 +553,28 @@ def _notify_supervisor_of_stop(r, node_id: str, supervisor: str) -> None:
             decision = fetch_stop_decision(node_id)
 
         if decision is None:
-            if not _peer_idle_allowed_for_task(node_id, supervisor, observed_task_id):
-                return
             blocked_on = _resolve_blocked_on(observed_task_id)
             if blocked_on:
-                log_debug(node_id, f"suppressed PEER_IDLE for {node_id}: blocked_on={blocked_on}")
-                if outcome == "done" and observed_task_id:
-                    try:
-                        r.eval(
-                            _CAS_CLEAR_DONE_LUA, 3,
-                            state_key(node_id, "current_task"),
-                            state_key(node_id, "last_outcome"),
-                            state_key(node_id, "last_clear_was_done"),
-                            observed_task_id,
-                        )
-                    except Exception as cas_exc:
-                        log_debug(node_id, f"STOP CAS clear failed: {cas_exc}")
-                return
+                log_debug(node_id, f"STOP: reporting blocked_on stop for {node_id}: blocked_on={blocked_on}")
 
-            body = f"{node_id} stopped — {summary}" if summary else f"{node_id} stopped — no current task recorded"
-            priority = "high" if summary and outcome in ("error", "interrupted") else ("normal" if summary else "low")
+            body = f"{node_id} stopped — {summary}" if reported_task and summary else f"{node_id} stopped — no current task recorded"
+            if stale_task_reason:
+                body = f"{body}; {stale_task_reason}"
+            priority = "high" if outcome in ("error", "interrupted") else ("normal" if reported_task and summary else "low")
             msg = json.dumps({
                 "from": node_id,
                 "type": "peer_idle",
                 "body": body,
-                "outcome": outcome,
+                "outcome": outcome or "unknown",
                 "priority": priority,
                 "msg_id": f"peer-idle-{node_id}-{dedup_suffix}-{int(time.time())}",
                 "timestamp": time.time(),
-                "task_id": observed_task_id,
-                "task_description": (observed_task.get("description") if observed_task else None),
-                "task_supervisor": (observed_task.get("supervisor") if observed_task else None),
-                "task_started_at": (observed_task.get("started_at") if observed_task else None),
+                "task_id": reported_task_id,
+                "task_description": (reported_task.get("description") if reported_task else None),
+                "task_supervisor": (reported_task.get("supervisor") if reported_task else None),
+                "task_started_at": (reported_task.get("started_at") if reported_task else None),
                 "outcome_details": (observed_outcome_struct.get("details") if observed_outcome_struct else None),
+                "stale_task_id": (observed_task_id if stale_task_reason else None),
             })
             r.lpush(inbox_key(supervisor), msg)
             r.set(dedup, "1", ex=60)
@@ -591,12 +592,9 @@ def _notify_supervisor_of_stop(r, node_id: str, supervisor: str) -> None:
             return
 
         if decision.get("wake_type") == WAKE_ALLOW_STOP:
-            if not observed_task and not observed_outcome_struct:
-                log_debug(node_id, f"suppressed PEER_IDLE for {node_id}: {decision.get('blocked_on') or 'allow_stop'}")
-                return
-            if not _peer_idle_allowed_for_task(node_id, supervisor, observed_task_id):
-                return
-            body = f"{node_id} stopped — {summary}" if summary else f"{node_id} stopped — no current task recorded"
+            body = f"{node_id} stopped — {summary}" if reported_task and summary else f"{node_id} stopped — no current task recorded"
+            if stale_task_reason:
+                body = f"{body}; {stale_task_reason}"
             priority = "high" if outcome in ("error", "interrupted") else "normal"
             msg = json.dumps({
                 "from": node_id,
@@ -606,11 +604,12 @@ def _notify_supervisor_of_stop(r, node_id: str, supervisor: str) -> None:
                 "priority": priority,
                 "msg_id": f"peer-idle-{node_id}-{dedup_suffix}-{int(time.time())}",
                 "timestamp": time.time(),
-                "task_id": observed_task_id,
-                "task_description": (observed_task.get("description") if observed_task else None),
-                "task_supervisor": (observed_task.get("supervisor") if observed_task else None),
-                "task_started_at": (observed_task.get("started_at") if observed_task else None),
+                "task_id": reported_task_id,
+                "task_description": (reported_task.get("description") if reported_task else None),
+                "task_supervisor": (reported_task.get("supervisor") if reported_task else None),
+                "task_started_at": (reported_task.get("started_at") if reported_task else None),
                 "outcome_details": (observed_outcome_struct.get("details") if observed_outcome_struct else None),
+                "stale_task_id": (observed_task_id if stale_task_reason else None),
             })
             r.lpush(inbox_key(supervisor), msg)
             r.set(dedup, "1", ex=60)
