@@ -29,9 +29,9 @@ if ! git -C "$CURRENT_REPO" diff --quiet || ! git -C "$CURRENT_REPO" diff --cach
     exit 1
 fi
 
-# Idempotent worktree check: a git worktree's .git is a FILE (gitdir pointer), not a directory.
-# Use `git rev-parse --git-dir` to validate worktree existence regardless of .git file/dir shape.
-# If the worktree already exists and HEAD already matches $TARGET_SHA, skip recreation (true idempotence).
+# Idempotent version check. Version directories are self-contained clones, not
+# git worktrees, so moving the source/live path cannot break their .git state.
+# If the clone already exists and HEAD already matches $TARGET_SHA, skip recreation.
 # Refuse to overwrite if $LIVE_PATH currently symlinks to this target.
 CURRENT_TARGET_SHA=""
 if git -C "$TARGET_DIR" rev-parse --git-dir >/dev/null 2>&1; then
@@ -42,8 +42,9 @@ if [ "$CURRENT_TARGET_SHA" != "$TARGET_SHA" ]; then
         echo "Refusing: $TARGET_DIR is currently live but HEAD ($CURRENT_TARGET_SHA) != target ($TARGET_SHA)" >&2
         exit 1
     fi
-    git -C "$SOURCE_REPO" worktree remove --force "$TARGET_DIR" >/dev/null 2>&1 || rm -rf "$TARGET_DIR"
-    git -C "$SOURCE_REPO" worktree add --detach "$TARGET_DIR" "$TARGET_SHA" >/dev/null
+    rm -rf "$TARGET_DIR"
+    git clone --no-local --no-checkout "$SOURCE_REPO" "$TARGET_DIR" >/dev/null
+    git -C "$TARGET_DIR" checkout --detach "$TARGET_SHA" >/dev/null
 fi
 
 PREVIOUS_TARGET="$CURRENT_REPO"
