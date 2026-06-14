@@ -19,6 +19,7 @@ from pathlib import Path
 # Ensure the repo root is importable when this file is executed as a script.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import hashlib
 import json
 import socket
 
@@ -48,6 +49,13 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 DEFAULT_POLL_INTERVAL = 3
+# Per-session pointer-inject backoff: a session whose idle flag stays set and
+# whose inbox does NOT change (wedged / non-submitting / broken Stop hook) is
+# re-injected at most once per this interval, instead of every poll_interval.
+# A NEW message (inbox signature changes) injects promptly; a session that
+# submits the pointer clears idle and is never re-injected. Prevents the
+# every-3s keystroke hammer that disrupts wedged sessions fleet-wide.
+POINTER_INJECT_BACKOFF_SECS = 90
 MAX_MESSAGE_LENGTH = 4000
 DEFAULT_PEER_INACTIVE_STALE_SECS = 300
 PEER_INACTIVE_DEDUP_SECS = 300
@@ -394,6 +402,29 @@ def run_daemon(
                 if not has_pending_messages(r, node_id):
                     continue
 
+                # Per-session inject backoff. The inbox signature changes when a
+                # new message arrives (inject promptly) but stays identical for a
+                # wedged/non-submitting session (idle never clears) — in which
+                # case re-inject at most once per POINTER_INJECT_BACKOFF_SECS
+                # instead of every poll. Prevents the keystroke hammer.
+                now = time.time()
+                try:
+                    inbox_sig = hashlib.sha1(
+                        b"\n".join(s.encode() for s in r.lrange(inbox_key(node_id), 0, -1))
+                    ).hexdigest()
+                except Exception:
+                    inbox_sig = None
+                if inbox_sig is not None:
+                    bo_raw = r.get(state_key(node_id, "pointer_inject_backoff"))
+                    if bo_raw:
+                        try:
+                            bo = json.loads(bo_raw)
+                            if (bo.get("sig") == inbox_sig
+                                    and (now - float(bo.get("ts", 0))) < POINTER_INJECT_BACKOFF_SECS):
+                                continue  # same undrained inbox, injected recently -> back off
+                        except Exception:
+                            pass
+
                 # Grok-cli does NOT honor additionalContext from prompt hooks
                 # the way Claude Code / codex / gemini do. For *-grok targets
                 # we inject FULL message bodies via tmux instead of the
@@ -428,6 +459,19 @@ def run_daemon(
                 # daemon pre-emptively clearing a flag it cannot validate.
                 logger.info("Notifying %s: %s", session_name, summary)
                 ok = inject_via_tmux(session_name, summary)
+                # Stamp the backoff on every attempt (ok or not): whether the
+                # inject lands or fails, do not re-inject this same inbox for
+                # POINTER_INJECT_BACKOFF_SECS. A new message changes inbox_sig and
+                # injects promptly; a successful submit clears idle (no re-inject).
+                if inbox_sig is not None:
+                    try:
+                        r.set(
+                            state_key(node_id, "pointer_inject_backoff"),
+                            json.dumps({"sig": inbox_sig, "ts": now}),
+                            ex=POINTER_INJECT_BACKOFF_SECS * 4,
+                        )
+                    except Exception:
+                        pass
                 try:
                     from notifications.trace import trace
                     trace(r, "inject", node=session_name, ok=ok)

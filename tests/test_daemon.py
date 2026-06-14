@@ -340,6 +340,59 @@ class DaemonTests(unittest.TestCase):
         self.assertEqual("not_deliverable", record["delivery_state"])
         self.assertEqual("tmux_missing", record["delivery_failure_reason"])
 
+    def test_pointer_inject_backoff_suppresses_repeat_for_wedged_session(self):
+        # Regression for the 3s keystroke-hammer: a wedged session (idle stuck
+        # on, inbox unchanged across polls) must be injected at most ONCE per
+        # backoff window, not on every poll.
+        r = FakeRedis()
+        r.set(state_key("wedged", "idle"), "1")
+        r.lpush(inbox_key("wedged"), json.dumps({"from": "s", "type": "message", "body": "x"}))
+        fake_redis_module = SimpleNamespace(Redis=lambda **kwargs: r)
+        sleeps = {"n": 0}
+
+        def stop_after_five(_):
+            sleeps["n"] += 1
+            if sleeps["n"] >= 5:
+                raise KeyboardInterrupt
+
+        with mock.patch.dict(sys.modules, {"redis": fake_redis_module}):
+            with mock.patch.object(daemon, "get_local_tmux_sessions", return_value=["wedged"]):
+                with mock.patch.object(daemon, "inject_via_tmux", return_value=True) as inject:
+                    with mock.patch.object(daemon.time, "time", return_value=1000.0):
+                        with mock.patch.object(daemon.time, "sleep", side_effect=stop_after_five):
+                            daemon.run_daemon("127.0.0.1", 6379, 1)
+
+        # 5 polls, same time, unchanged inbox -> exactly one inject (backoff held)
+        inject.assert_called_once()
+
+    def test_pointer_inject_backoff_new_message_injects_promptly(self):
+        # A NEW message changes the inbox signature and must inject promptly even
+        # while a recent backoff stamp exists (no starvation of new messages).
+        import hashlib
+
+        r = FakeRedis()
+        r.set(state_key("wedged", "idle"), "1")
+        r.lpush(inbox_key("wedged"), json.dumps({"from": "s", "type": "message", "body": "first"}))
+        sig_one = hashlib.sha1(
+            b"\n".join(s.encode() for s in r.lrange(inbox_key("wedged"), 0, -1))
+        ).hexdigest()
+        # recent backoff stamp for the CURRENT (one-message) inbox state
+        r.set(state_key("wedged", "pointer_inject_backoff"),
+              json.dumps({"sig": sig_one, "ts": 1000.0}))
+        # a NEW message arrives -> signature changes
+        r.lpush(inbox_key("wedged"), json.dumps({"from": "s", "type": "message", "body": "NEW"}))
+        fake_redis_module = SimpleNamespace(Redis=lambda **kwargs: r)
+
+        with mock.patch.dict(sys.modules, {"redis": fake_redis_module}):
+            with mock.patch.object(daemon, "get_local_tmux_sessions", return_value=["wedged"]):
+                with mock.patch.object(daemon, "inject_via_tmux", return_value=True) as inject:
+                    with mock.patch.object(daemon.time, "time", return_value=1001.0):
+                        with mock.patch.object(daemon.time, "sleep", side_effect=KeyboardInterrupt):
+                            daemon.run_daemon("127.0.0.1", 6379, 1)
+
+        # within the backoff window BUT signature changed -> injects promptly
+        inject.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()
