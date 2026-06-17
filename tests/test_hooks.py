@@ -352,6 +352,38 @@ class PostToolUseHookTests(HookTestCase):
         self.assertEqual("receipt_acked", record["state"])
         self.assertEqual("message_pickup", record["receipt_source"])
 
+    def test_post_tool_does_not_ack_handoff_for_different_target(self):
+        r = FakeRedis()
+        msg = {
+            "from": "conductor-codex",
+            "type": "command",
+            "body": "wrong target body",
+            "msg_id": "123e4567-e89b-12d3-a456-426614174002",
+            "handoff_kind": "explicit_handoff",
+            "dispatcher_session_id": "conductor-codex",
+            "target_session_id": "session-c",
+            "message_hash": "hash-3",
+        }
+        record_key = explicit_handoff_key("taey", "conductor-codex", msg["msg_id"])
+        r.lpush(inbox_key("session-b"), json.dumps(msg))
+        r.set(record_key, json.dumps({
+            "kind": "explicit_handoff",
+            "dispatcher_session_id": "conductor-codex",
+            "target_session_id": "session-c",
+            "dispatcher_task_id": "task-789",
+            "msg_id": msg["msg_id"],
+            "message_hash": "hash-3",
+            "state": "pending_unacked",
+        }))
+
+        result = self.run_hook("hooks.check_notifications", r, '{"tool_name":"Bash"}')
+
+        self.assertIn("wrong target body", result["hookSpecificOutput"]["additionalContext"])
+        ack_key = explicit_ack_key("taey", "conductor-codex", "session-c", msg["msg_id"])
+        self.assertNotIn(ack_key, r.store)
+        record = json.loads(r.store[record_key])
+        self.assertEqual("pending_unacked", record["state"])
+
     def test_post_tool_clears_tool_running_drains_all_queues_and_returns_context(self):
         r = FakeRedis()
         r.set(state_key("session-b", "tool_running"), "1")

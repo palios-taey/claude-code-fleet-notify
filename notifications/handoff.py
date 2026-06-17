@@ -108,24 +108,26 @@ def write_handoff_receipt(
     target = str(target_session_id or "")
     ack_by = str(ack_by_session_id or target)
     msg_id = str(msg_id or "")
-    if not dispatcher or not target or not ack_by or not msg_id:
+    if not dispatcher or not target or not ack_by or not msg_id or ack_by != target:
+        return None
+    msg_hash = str(message_hash or "")
+    record_key = explicit_handoff_key(prefix, dispatcher, msg_id)
+    record = _decode_json_dict(redis_client.get(record_key))
+    if (
+        record.get("kind") != "explicit_handoff"
+        or str(record.get("target_session_id") or "") != target
+        or str(record.get("message_hash") or "") != msg_hash
+    ):
         return None
     ack_payload = {
         "ack_by": ack_by,
-        "message_hash": str(message_hash or ""),
+        "message_hash": msg_hash,
     }
     redis_client.set(
         explicit_ack_key(prefix, dispatcher, target, msg_id),
         json.dumps(ack_payload, separators=(",", ":")),
     )
-    record_key = explicit_handoff_key(prefix, dispatcher, msg_id)
-    record = _decode_json_dict(redis_client.get(record_key))
-    if (
-        record.get("kind") == "explicit_handoff"
-        and str(record.get("target_session_id") or "") == target
-        and ack_by == target
-        and str(record.get("state") or "") not in {"resolved", "superseded", "dead", "receipt_acked"}
-    ):
+    if str(record.get("state") or "") not in {"resolved", "superseded", "dead", "receipt_acked"}:
         now = time.time()
         record["state"] = "receipt_acked"
         record["receipt_source"] = receipt_source
