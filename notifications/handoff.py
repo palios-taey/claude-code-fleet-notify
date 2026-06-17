@@ -77,6 +77,10 @@ def explicit_handoff_key(prefix: str, dispatcher: str, msg_id: str) -> str:
     return f"{prefix}:handoff:{dispatcher}:{msg_id}"
 
 
+def explicit_handoff_index_key(prefix: str, dispatcher: str) -> str:
+    return f"{prefix}:handoff-index:{dispatcher}"
+
+
 def explicit_ack_key(prefix: str, dispatcher: str, target: str, msg_id: str) -> str:
     return f"{prefix}:handoff-ack:{dispatcher}:{target}:{msg_id}"
 
@@ -202,16 +206,19 @@ def create_explicit_handoff(
     }
     inbox_key = f"{prefix}:{target_session_id}:inbox"
     record_key = explicit_handoff_key(prefix, dispatcher_session_id, msg_id)
+    index_key = explicit_handoff_index_key(prefix, dispatcher_session_id)
     encoded_message = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
     encoded_record = json.dumps(record, separators=(",", ":"), ensure_ascii=False)
     if hasattr(redis_client, "pipeline"):
         pipe = redis_client.pipeline(transaction=True)
         pipe.lpush(inbox_key, encoded_message)
         pipe.set(record_key, encoded_record)
+        pipe.sadd(index_key, msg_id)
         pipe.execute()
     else:
         redis_client.lpush(inbox_key, encoded_message)
         redis_client.set(record_key, encoded_record)
+        redis_client.sadd(index_key, msg_id)
     return payload
 
 

@@ -53,6 +53,12 @@ class FakeRedis:
             self.expiry[key] = ex
         return True
 
+    def sadd(self, key, *values):
+        current = self.store.setdefault(key, set())
+        before = len(current)
+        current.update(values)
+        return len(current) - before
+
     def get(self, key):
         return self.store.get(key)
 

@@ -81,6 +81,15 @@ class Redis:
         self._save(data)
         return True
 
+    def sadd(self, key, *values):
+        data = self._load()
+        current = set(data.get(key, []))
+        before = len(current)
+        current.update(values)
+        data[key] = sorted(current)
+        self._save(data)
+        return len(current) - before
+
     def get(self, key):
         return self._load().get(key)
 
@@ -173,6 +182,7 @@ class CliTests(unittest.TestCase):
             self.assertEqual(5, record["pickup_poll_budget"])
             self.assertEqual("queued", record["delivery_state"])
             self.assertIn("ack_backstop_at", record)
+            self.assertEqual([inbox_msg["msg_id"]], data["taey:handoff-index:conductor-codex"])
 
     def test_taey_ack_peek_does_not_clear_and_ack_drains_with_pops(self):
         with tempfile.TemporaryDirectory() as tmp:
