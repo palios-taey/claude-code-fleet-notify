@@ -10,7 +10,7 @@ from unittest import mock
 
 from hooks import _shared as shared
 from notifications.inbox import inbox_key, notifications_key, state_key
-from notifications.handoff import explicit_ack_key, pending_receipts_key
+from notifications.handoff import explicit_ack_key, explicit_handoff_key, pending_receipts_key
 from tests.fakes import FakeRedis
 
 
@@ -247,7 +247,7 @@ class UserPromptSubmitHookTests(HookTestCase):
         context = result["hookSpecificOutput"]["additionalContext"]
         self.assertIn("hello", context)
 
-    def test_user_prompt_writes_passive_receipt_only_on_next_prompt(self):
+    def test_user_prompt_writes_handoff_receipt_on_pickup(self):
         r = FakeRedis()
         msg = {
             "from": "conductor-codex",
@@ -259,6 +259,16 @@ class UserPromptSubmitHookTests(HookTestCase):
             "target_session_id": "session-b",
             "message_hash": "hash-1",
         }
+        record_key = explicit_handoff_key("taey", "conductor-codex", msg["msg_id"])
+        r.set(record_key, json.dumps({
+            "kind": "explicit_handoff",
+            "dispatcher_session_id": "conductor-codex",
+            "target_session_id": "session-b",
+            "dispatcher_task_id": "task-123",
+            "msg_id": msg["msg_id"],
+            "message_hash": "hash-1",
+            "state": "pending_unacked",
+        }))
         with mock.patch.dict(
             "os.environ",
             {
@@ -270,15 +280,19 @@ class UserPromptSubmitHookTests(HookTestCase):
             r.lpush(inbox_key("session-b"), json.dumps(msg))
             first = self.run_hook("hooks.prompt_activity", r, "")
             self.assertIn("handoff body", first["hookSpecificOutput"]["additionalContext"])
-            self.assertNotIn(
-                explicit_ack_key("taey", "conductor-codex", "session-b", msg["msg_id"]),
-                r.store,
+            ack_key = explicit_ack_key("taey", "conductor-codex", "session-b", msg["msg_id"])
+            self.assertIn(ack_key, r.store)
+            self.assertEqual(
+                {"ack_by": "session-b", "message_hash": "hash-1"},
+                json.loads(r.store[ack_key]),
             )
+            record = json.loads(r.store[record_key])
+            self.assertEqual("receipt_acked", record["state"])
+            self.assertEqual("hook_pickup", record["receipt_source"])
             self.assertIn(pending_receipts_key("taey", "session-b"), r.store)
 
             second = self.run_hook("hooks.prompt_activity", r, "")
             self.assertEqual({}, second)
-            ack_key = explicit_ack_key("taey", "conductor-codex", "session-b", msg["msg_id"])
             self.assertIn(ack_key, r.store)
             self.assertEqual(
                 {"ack_by": "session-b", "message_hash": "hash-1"},
@@ -302,6 +316,42 @@ class PreToolUseHookTests(HookTestCase):
 
 
 class PostToolUseHookTests(HookTestCase):
+    def test_post_tool_writes_handoff_receipt_on_pickup(self):
+        r = FakeRedis()
+        msg = {
+            "from": "conductor-codex",
+            "type": "command",
+            "body": "handoff body",
+            "msg_id": "123e4567-e89b-12d3-a456-426614174001",
+            "handoff_kind": "explicit_handoff",
+            "dispatcher_session_id": "conductor-codex",
+            "target_session_id": "session-b",
+            "message_hash": "hash-2",
+        }
+        record_key = explicit_handoff_key("taey", "conductor-codex", msg["msg_id"])
+        r.lpush(inbox_key("session-b"), json.dumps(msg))
+        r.set(record_key, json.dumps({
+            "kind": "explicit_handoff",
+            "dispatcher_session_id": "conductor-codex",
+            "target_session_id": "session-b",
+            "dispatcher_task_id": "task-456",
+            "msg_id": msg["msg_id"],
+            "message_hash": "hash-2",
+            "state": "pending_unacked",
+        }))
+
+        result = self.run_hook("hooks.check_notifications", r, '{"tool_name":"Bash"}')
+
+        self.assertIn("handoff body", result["hookSpecificOutput"]["additionalContext"])
+        ack_key = explicit_ack_key("taey", "conductor-codex", "session-b", msg["msg_id"])
+        self.assertEqual(
+            {"ack_by": "session-b", "message_hash": "hash-2"},
+            json.loads(r.store[ack_key]),
+        )
+        record = json.loads(r.store[record_key])
+        self.assertEqual("receipt_acked", record["state"])
+        self.assertEqual("hook_pickup", record["receipt_source"])
+
     def test_post_tool_clears_tool_running_drains_all_queues_and_returns_context(self):
         r = FakeRedis()
         r.set(state_key("session-b", "tool_running"), "1")
