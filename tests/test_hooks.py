@@ -288,7 +288,7 @@ class UserPromptSubmitHookTests(HookTestCase):
             )
             record = json.loads(r.store[record_key])
             self.assertEqual("receipt_acked", record["state"])
-            self.assertEqual("hook_pickup", record["receipt_source"])
+            self.assertEqual("message_pickup", record["receipt_source"])
             self.assertIn(pending_receipts_key("taey", "session-b"), r.store)
 
             second = self.run_hook("hooks.prompt_activity", r, "")
@@ -350,7 +350,7 @@ class PostToolUseHookTests(HookTestCase):
         )
         record = json.loads(r.store[record_key])
         self.assertEqual("receipt_acked", record["state"])
-        self.assertEqual("hook_pickup", record["receipt_source"])
+        self.assertEqual("message_pickup", record["receipt_source"])
 
     def test_post_tool_clears_tool_running_drains_all_queues_and_returns_context(self):
         r = FakeRedis()

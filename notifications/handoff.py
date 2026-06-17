@@ -408,7 +408,7 @@ def queue_pending_receipts(redis_client, *, prefix: str, target_session_id: str,
             target_session_id=entry["target_session_id"],
             msg_id=entry["msg_id"],
             message_hash=entry["message_hash"],
-            receipt_source="hook_pickup",
+            receipt_source="message_pickup",
             ack_by_session_id=target_session_id,
         )
         token = (

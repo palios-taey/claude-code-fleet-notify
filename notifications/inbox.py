@@ -262,7 +262,14 @@ def clear_all(redis_client, node_id: str, max_count: Optional[int] = None) -> No
     This is intentionally implemented as pops, not ``DELETE``, to avoid dropping messages
     that arrive between a separate peek and clear operation.
     """
-    drain_all(redis_client, node_id, max_count=max_count)
+    drained = drain_all(redis_client, node_id, max_count=max_count)
+    from notifications.handoff import queue_pending_receipts
+    queue_pending_receipts(
+        redis_client,
+        prefix=DEFAULT_KEY_PREFIX,
+        target_session_id=node_id,
+        messages=flatten_sources(drained),
+    )
 
 
 def flatten_sources(messages_by_source: dict) -> list[dict]:
