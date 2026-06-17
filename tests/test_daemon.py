@@ -13,6 +13,16 @@ from tests.fakes import FakeRedis
 
 
 class DaemonTests(unittest.TestCase):
+    def run_daemon_once(self, redis_client, sessions, *, inject_result=True, now=1000.0):
+        fake_redis_module = SimpleNamespace(Redis=lambda **kwargs: redis_client)
+        with mock.patch.dict(sys.modules, {"redis": fake_redis_module}):
+            with mock.patch.object(daemon, "get_local_tmux_sessions", return_value=sessions):
+                with mock.patch.object(daemon, "inject_via_tmux", return_value=inject_result) as inject:
+                    with mock.patch.object(daemon.time, "time", return_value=now):
+                        with mock.patch.object(daemon.time, "sleep", side_effect=KeyboardInterrupt):
+                            daemon.run_daemon("127.0.0.1", 6379, 1)
+        return inject
+
     def test_build_pointer_summary_does_not_pop_messages(self):
         r = FakeRedis()
         r.lpush(inbox_key("session-b"), json.dumps({"from": "session-a", "type": "message", "body": "hello"}))
@@ -41,6 +51,43 @@ class DaemonTests(unittest.TestCase):
         self.assertEqual(1, r.llen(inbox_key("idle-session")))
         self.assertTrue(r.exists(state_key("idle-session", "idle")))
 
+    def test_run_daemon_injects_idle_absent_stale_sessions_with_messages(self):
+        r = FakeRedis()
+        sessions = [
+            "fail-open-stop",
+            "redis-none-stop",
+            "decision-block-stop",
+            "action-stop-exception",
+            "hook-never-fired",
+        ]
+        for node_id in sessions:
+            r.set(state_key(node_id, "last_activity"), "1000")
+            r.lpush(inbox_key(node_id), json.dumps({"from": "sender", "type": "message", "body": node_id}))
+
+        inject = self.run_daemon_once(r, sessions, now=1100.0)
+
+        self.assertEqual(sessions, [call.args[0] for call in inject.call_args_list])
+        for node_id in sessions:
+            self.assertFalse(r.exists(state_key(node_id, "idle")))
+            self.assertEqual(1, r.llen(inbox_key(node_id)))
+
+    def test_run_daemon_does_not_inject_idle_absent_tool_running_or_recent_activity(self):
+        r = FakeRedis()
+        r.set(state_key("tool-running", "tool_running"), "1")
+        r.set(state_key("tool-running", "last_activity"), "900")
+        r.lpush(inbox_key("tool-running"), json.dumps({"from": "sender", "type": "message", "body": "tool"}))
+        r.set(state_key("recent-activity", "last_activity"), "1040")
+        r.lpush(inbox_key("recent-activity"), json.dumps({"from": "sender", "type": "message", "body": "recent"}))
+        r.lpush(inbox_key("unknown-activity"), json.dumps({"from": "sender", "type": "message", "body": "unknown"}))
+
+        inject = self.run_daemon_once(
+            r,
+            ["tool-running", "recent-activity", "unknown-activity"],
+            now=1100.0,
+        )
+
+        inject.assert_not_called()
+
     def test_failed_injection_leaves_message_and_idle_for_retry(self):
         r = FakeRedis()
         r.set(state_key("session-b", "idle"), "1")
@@ -55,6 +102,23 @@ class DaemonTests(unittest.TestCase):
 
         self.assertEqual(1, r.llen(inbox_key("session-b")))
         self.assertTrue(r.exists(state_key("session-b", "idle")))
+
+    def test_repeated_pointer_inject_failures_notify_supervisor_once(self):
+        r = FakeRedis()
+        r.set(state_key("worker-codex", "parent"), "conductor")
+        r.set(state_key("worker-codex", "idle"), "1")
+        r.lpush(inbox_key("worker-codex"), json.dumps({"from": "sender", "type": "message", "body": "body"}))
+
+        for now in (1000.0, 1002.0, 1004.0, 1006.0):
+            with mock.patch.object(daemon, "POINTER_INJECT_BACKOFF_SECS", 1):
+                self.run_daemon_once(r, ["worker-codex"], inject_result=False, now=now)
+
+        notices = r.decoded_list(inbox_key("conductor"))
+        self.assertEqual(1, len(notices))
+        self.assertEqual("inject_failure", notices[0]["type"])
+        self.assertEqual("worker-codex", notices[0]["from"])
+        self.assertEqual(3, notices[0]["failure_count"])
+        self.assertEqual("4", r.get(state_key("worker-codex", "pointer_inject_fail_count")))
 
     def test_handoff_injection_success_records_poll_signal(self):
         r = FakeRedis()
