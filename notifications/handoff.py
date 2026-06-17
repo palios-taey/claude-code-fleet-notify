@@ -93,6 +93,49 @@ def session_machine_key(prefix: str, session_id: str) -> str:
     return f"{prefix}:{session_id}:machine"
 
 
+def write_handoff_receipt(
+    redis_client,
+    *,
+    prefix: str,
+    dispatcher_session_id: str,
+    target_session_id: str,
+    msg_id: str,
+    message_hash: str,
+    receipt_source: str,
+    ack_by_session_id: str | None = None,
+) -> dict[str, Any] | None:
+    dispatcher = str(dispatcher_session_id or "")
+    target = str(target_session_id or "")
+    ack_by = str(ack_by_session_id or target)
+    msg_id = str(msg_id or "")
+    if not dispatcher or not target or not ack_by or not msg_id or ack_by != target:
+        return None
+    msg_hash = str(message_hash or "")
+    record_key = explicit_handoff_key(prefix, dispatcher, msg_id)
+    record = _decode_json_dict(redis_client.get(record_key))
+    if (
+        record.get("kind") != "explicit_handoff"
+        or str(record.get("target_session_id") or "") != target
+        or str(record.get("message_hash") or "") != msg_hash
+    ):
+        return None
+    ack_payload = {
+        "ack_by": ack_by,
+        "message_hash": msg_hash,
+    }
+    redis_client.set(
+        explicit_ack_key(prefix, dispatcher, target, msg_id),
+        json.dumps(ack_payload, separators=(",", ":")),
+    )
+    if str(record.get("state") or "") not in {"resolved", "superseded", "dead", "receipt_acked"}:
+        now = time.time()
+        record["state"] = "receipt_acked"
+        record["receipt_source"] = receipt_source
+        record["receipt_acked_at"] = now
+        redis_client.set(record_key, json.dumps(record, separators=(",", ":")))
+    return ack_payload | {"dispatcher_session_id": dispatcher, "msg_id": msg_id}
+
+
 def message_hash(body: str) -> str:
     return hashlib.sha256(body.encode("utf-8")).hexdigest()
 
@@ -360,6 +403,16 @@ def queue_pending_receipts(redis_client, *, prefix: str, target_session_id: str,
             "msg_id": str(message.get("msg_id")),
             "message_hash": str(message.get("message_hash") or ""),
         }
+        write_handoff_receipt(
+            redis_client,
+            prefix=prefix,
+            dispatcher_session_id=entry["dispatcher_session_id"],
+            target_session_id=entry["target_session_id"],
+            msg_id=entry["msg_id"],
+            message_hash=entry["message_hash"],
+            receipt_source="message_pickup",
+            ack_by_session_id=target_session_id,
+        )
         token = (
             entry["dispatcher_session_id"],
             entry["target_session_id"],
@@ -480,14 +533,17 @@ def flush_pending_receipts(redis_client, *, prefix: str, target_session_id: str,
         msg_id = str(item.get("msg_id") or "")
         if not dispatcher or not target or not msg_id:
             continue
-        ack_payload = {
-            "ack_by": target_session_id,
-            "message_hash": str(item.get("message_hash") or ""),
-        }
-        redis_client.set(
-            explicit_ack_key(prefix, dispatcher, target, msg_id),
-            json.dumps(ack_payload, separators=(",", ":")),
+        written_receipt = write_handoff_receipt(
+            redis_client,
+            prefix=prefix,
+            dispatcher_session_id=dispatcher,
+            target_session_id=target,
+            msg_id=msg_id,
+            message_hash=str(item.get("message_hash") or ""),
+            receipt_source="passive_flush",
+            ack_by_session_id=target_session_id,
         )
-        written.append(ack_payload | {"dispatcher_session_id": dispatcher, "msg_id": msg_id})
+        if written_receipt:
+            written.append(written_receipt)
     redis_client.delete(pending_key)
     return written

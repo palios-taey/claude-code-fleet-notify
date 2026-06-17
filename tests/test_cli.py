@@ -189,11 +189,33 @@ class CliTests(unittest.TestCase):
             fake_dir = Path(tmp)
             (fake_dir / "redis.py").write_text(FAKE_REDIS)
             state = fake_dir / "state.json"
+            handoff_msg = {
+                "from": "conductor-codex",
+                "type": "command",
+                "body": "handoff body",
+                "msg_id": "123e4567-e89b-12d3-a456-426614174999",
+                "handoff_kind": "explicit_handoff",
+                "dispatcher_session_id": "conductor-codex",
+                "target_session_id": "session-b",
+                "message_hash": "hash-manual",
+            }
+            record_key = f"taey:handoff:conductor-codex:{handoff_msg['msg_id']}"
+            ack_key = f"taey:handoff-ack:conductor-codex:session-b:{handoff_msg['msg_id']}"
             initial = {
                 "taey:session-b:inbox": [
                     json.dumps({"from": "session-a", "type": "message", "body": "new"}),
+                    json.dumps(handoff_msg),
                     json.dumps({"from": "session-a", "type": "message", "body": "old"}),
-                ]
+                ],
+                record_key: json.dumps({
+                    "kind": "explicit_handoff",
+                    "dispatcher_session_id": "conductor-codex",
+                    "target_session_id": "session-b",
+                    "dispatcher_task_id": "task-manual",
+                    "msg_id": handoff_msg["msg_id"],
+                    "message_hash": "hash-manual",
+                    "state": "pending_unacked",
+                }),
             }
             state.write_text(json.dumps(initial))
             env = os.environ.copy()
@@ -205,11 +227,21 @@ class CliTests(unittest.TestCase):
 
             peek = self.run_cli(["scripts/taey-ack", "--peek"], env)
             self.assertIn("PEEK MODE", peek.stdout)
-            self.assertEqual(2, len(json.loads(state.read_text())["taey:session-b:inbox"]))
+            after_peek = json.loads(state.read_text())
+            self.assertEqual(3, len(after_peek["taey:session-b:inbox"]))
+            self.assertNotIn(ack_key, after_peek)
 
             ack = self.run_cli(["scripts/taey-ack"], env)
             self.assertIn("Drained all queues", ack.stdout)
-            self.assertEqual([], json.loads(state.read_text())["taey:session-b:inbox"])
+            after_ack = json.loads(state.read_text())
+            self.assertEqual([], after_ack["taey:session-b:inbox"])
+            self.assertEqual(
+                {"ack_by": "session-b", "message_hash": "hash-manual"},
+                json.loads(after_ack[ack_key]),
+            )
+            record = json.loads(after_ack[record_key])
+            self.assertEqual("receipt_acked", record["state"])
+            self.assertEqual("message_pickup", record["receipt_source"])
 
 
 if __name__ == "__main__":

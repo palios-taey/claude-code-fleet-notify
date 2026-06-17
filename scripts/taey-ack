@@ -10,9 +10,10 @@ import sys
 import time
 from datetime import datetime
 
-# Search standard installed locations for the fleet-notify package.
-for _p in ('/usr/local/lib/claude-code-fleet-notify',
-          os.path.join(os.path.dirname(os.path.realpath(__file__)), '..')):
+# Search the checkout first when this script is run from a repo, then the
+# standard installed location used by symlinked installs.
+for _p in (os.path.join(os.path.dirname(os.path.realpath(__file__)), '..'),
+          '/usr/local/lib/claude-code-fleet-notify'):
     if os.path.isdir(_p) and os.path.isfile(os.path.join(_p, 'identity.py')):
         sys.path.insert(0, _p)
         break
