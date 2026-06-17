@@ -10,8 +10,9 @@ Delivery paths
 --------------
 1. Active sessions: PostToolUse hook drains queues inline and renders the payload via
    ``hookSpecificOutput.additionalContext``.
-2. Idle sessions: notification daemon drains queues and injects the formatted block via
-   ``scripts/tmux-send``.
+2. Stopped sessions: notification daemon injects a Redis pointer via ``scripts/tmux-send``
+   when the explicit idle flag is set, or when recent activity is stale and no tool is
+   running. Queues are drained only by recipient hooks after a real prompt/tool event.
 
 The helpers in this module intentionally avoid ``DELETE``-ing whole queues during normal
 operation because that can drop messages that arrive between a destructive peek and the
@@ -26,6 +27,7 @@ import uuid
 from typing import Any, Dict, Iterable, Optional
 
 DEFAULT_TOOL_TTL = 60
+DEFAULT_INJECT_IDLE_GRACE_SEC = 90.0
 DEFAULT_KEY_PREFIX = os.environ.get("NOTIFY_KEY_PREFIX", "taey")
 WAKE_ALLOW_STOP = "ALLOW_STOP"
 WAKE_WITH_QUEUE = "WAKE_WITH_QUEUE"
@@ -373,9 +375,49 @@ def clear_idle(redis_client, node_id: str) -> None:
     mark_activity(redis_client, node_id)
 
 
+def _float_or_none(value: Any) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def inject_idle_grace_sec() -> float:
+    raw = os.environ.get("INJECT_IDLE_GRACE_SEC", str(DEFAULT_INJECT_IDLE_GRACE_SEC))
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        return DEFAULT_INJECT_IDLE_GRACE_SEC
+
+
 def is_node_idle(redis_client, node_id: str, idle_threshold: int = 30) -> bool:  # noqa: ARG001
     """Check whether a node is safe for tmux injection.
 
     ONLY returns True if the explicit idle flag is set by the Stop hook.
     """
     return bool(redis_client.exists(state_key(node_id, "idle")))
+
+
+def can_inject_pointer(
+    redis_client,
+    node_id: str,
+    *,
+    now: float | None = None,
+    idle_grace_sec: float | None = None,
+) -> bool:
+    """Return True when daemon pointer injection is safe for this session.
+
+    The explicit idle flag remains the fast path. If that best-effort flag is
+    absent, the daemon may still inject only after the session has no active
+    tool-running marker and its last activity is older than the grace window.
+    """
+    if redis_client.exists(state_key(node_id, "tool_running")):
+        return False
+    if is_node_idle(redis_client, node_id):
+        return True
+    last_activity = _float_or_none(redis_client.get(state_key(node_id, "last_activity")))
+    if last_activity is None:
+        return False
+    now = time.time() if now is None else now
+    grace = inject_idle_grace_sec() if idle_grace_sec is None else max(0.0, float(idle_grace_sec))
+    return (now - last_activity) > grace

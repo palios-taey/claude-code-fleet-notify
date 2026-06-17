@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Notification delivery daemon — one per machine, handles all local tmux sessions.
 
-The daemon is the idle delivery path. It periodically discovers tmux sessions, checks
-whether a session is safe to inject into, drains any queued notifications, and submits
-those notifications via ``scripts/tmux-send``. If injection fails, the drained payload is
-re-queued in FIFO order so no messages are lost.
+The daemon is the stopped-session delivery path. It periodically discovers tmux
+sessions, checks whether a session is safe to inject into, and submits a Redis
+pointer via ``scripts/tmux-send``. Messages remain queued until the recipient hook
+drains them after a real prompt/tool event.
 """
 from __future__ import annotations
 
@@ -25,11 +25,11 @@ import socket
 
 from notifications.inbox import (
     WAKE_TYPES,
+    can_inject_pointer,
     flatten_sources,
     format_notification_block,
     has_pending_messages,
     inbox_key,
-    is_node_idle,
     key_prefix,
     notifications_key,
     state_key,
@@ -49,13 +49,15 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 DEFAULT_POLL_INTERVAL = 3
-# Per-session pointer-inject backoff: a session whose idle flag stays set and
-# whose inbox does NOT change (wedged / non-submitting / broken Stop hook) is
-# re-injected at most once per this interval, instead of every poll_interval.
+# Per-session pointer-inject backoff: a session whose safe-to-inject predicate
+# stays true and whose inbox does NOT change (wedged / non-submitting / broken
+# Stop hook) is re-injected at most once per this interval, instead of every poll_interval.
 # A NEW message (inbox signature changes) injects promptly; a session that
 # submits the pointer clears idle and is never re-injected. Prevents the
 # every-3s keystroke hammer that disrupts wedged sessions fleet-wide.
 POINTER_INJECT_BACKOFF_SECS = 90
+DEFAULT_INJECT_FAILURE_ESCALATE_AFTER = 3
+DEFAULT_INJECT_FAILURE_ESCALATION_TTL_SECS = 900
 MAX_MESSAGE_LENGTH = 4000
 DEFAULT_PEER_INACTIVE_STALE_SECS = 300
 PEER_INACTIVE_DEDUP_SECS = 300
@@ -137,6 +139,66 @@ def _float_or_none(value) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _int_env(name: str, default: int, minimum: int = 1) -> int:
+    raw = os.environ.get(name, str(default)).strip()
+    try:
+        return max(minimum, int(raw))
+    except (TypeError, ValueError):
+        return default
+
+
+def _int_or_zero(value) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _record_pointer_inject_result(r, node_id: str, *, ok: bool,
+                                  machine: str, now: float) -> None:
+    count_key = state_key(node_id, "pointer_inject_fail_count")
+    notice_key = state_key(node_id, "pointer_inject_failure_notified")
+    if ok:
+        r.delete(count_key, notice_key)
+        return
+
+    ttl_secs = _int_env(
+        "INJECT_FAILURE_ESCALATION_TTL_SECS",
+        DEFAULT_INJECT_FAILURE_ESCALATION_TTL_SECS,
+    )
+    count = _int_or_zero(r.get(count_key)) + 1
+    r.set(count_key, str(count), ex=ttl_secs)
+
+    threshold = _int_env(
+        "INJECT_FAILURE_ESCALATE_AFTER",
+        DEFAULT_INJECT_FAILURE_ESCALATE_AFTER,
+    )
+    if count < threshold or r.exists(notice_key):
+        return
+
+    supervisor = _resolve_supervisor(r, node_id)
+    body = (
+        f"{node_id} pointer injection failed {count} consecutive times on {machine}; "
+        "messages remain queued in Redis."
+    )
+    if supervisor and supervisor != node_id:
+        msg = json.dumps({
+            "from": node_id,
+            "type": "inject_failure",
+            "body": body,
+            "priority": "high",
+            "msg_id": f"inject-failure-{node_id}-{int(now)}",
+            "timestamp": now,
+            "failure_count": count,
+            "machine": machine,
+        })
+        r.lpush(inbox_key(str(supervisor)), msg)
+        logger.error("Pointer injection failure escalation: %s -> %s", node_id, supervisor)
+    else:
+        logger.error("Pointer injection failure escalation: %s", body)
+    r.set(notice_key, "1", ex=ttl_secs)
 
 
 def notify_dispatcher_if_peer_inactive(r, node_id: str, *, now: float | None = None,
@@ -405,9 +467,10 @@ def run_daemon(
                     stale_secs=peer_inactive_stale_secs,
                 )
 
-                if not is_node_idle(r, node_id):
-                    continue
                 if not has_pending_messages(r, node_id):
+                    continue
+                now = time.time()
+                if not can_inject_pointer(r, node_id, now=now):
                     continue
 
                 # Per-session inject backoff. The inbox signature changes when a
@@ -415,7 +478,6 @@ def run_daemon(
                 # wedged/non-submitting session (idle never clears) — in which
                 # case re-inject at most once per POINTER_INJECT_BACKOFF_SECS
                 # instead of every poll. Prevents the keystroke hammer.
-                now = time.time()
                 try:
                     inbox_sig = hashlib.sha1(
                         b"\n".join(s.encode() for s in r.lrange(inbox_key(node_id), 0, -1))
@@ -496,9 +558,19 @@ def run_daemon(
                     )
                 except Exception:
                     pass
+                try:
+                    _record_pointer_inject_result(
+                        r,
+                        node_id,
+                        ok=ok,
+                        machine=machine,
+                        now=now,
+                    )
+                except Exception:
+                    pass
                 if not ok:
                     logger.error(
-                        "Injection failed for %s; idle left set, will retry next poll",
+                        "Injection failed for %s; message left queued, will retry",
                         session_name,
                     )
 
