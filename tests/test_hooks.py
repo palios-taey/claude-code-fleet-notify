@@ -9,7 +9,7 @@ from contextlib import redirect_stdout
 from unittest import mock
 
 from hooks import _shared as shared
-from notifications.inbox import inbox_key, notifications_key, state_key
+from notifications.inbox import DEFAULT_TOOL_TTL, inbox_key, notifications_key, state_key
 from notifications.handoff import explicit_ack_key, explicit_handoff_key, pending_receipts_key
 from tests.fakes import FakeRedis
 
@@ -309,7 +309,7 @@ class PreToolUseHookTests(HookTestCase):
 
         self.assertEqual("PreToolUse", result["hookSpecificOutput"]["hookEventName"])
         self.assertEqual("1", r.store[state_key("session-b", "tool_running")])
-        self.assertEqual(60, r.expiry[state_key("session-b", "tool_running")])
+        self.assertEqual(DEFAULT_TOOL_TTL, r.expiry[state_key("session-b", "tool_running")])
         self.assertIn(state_key("session-b", "last_activity"), r.store)
         self.assertIn(state_key("session-b", "last_tool_activity"), r.store)
         self.assertNotIn(state_key("session-b", "idle"), r.deleted)
