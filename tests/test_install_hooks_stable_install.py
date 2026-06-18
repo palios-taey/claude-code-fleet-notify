@@ -24,9 +24,10 @@ import unittest
 from pathlib import Path
 
 REAL_REPO = Path(__file__).resolve().parent.parent
-EVENTS = ("PreToolUse", "PostToolUse", "Stop", "UserPromptSubmit")
+EVENTS = ("SessionStart", "PreToolUse", "PostToolUse", "Stop", "UserPromptSubmit")
 # Event -> script basename, mirroring CLI_SPECS["claude"] in the installer.
 SCRIPTS = {
+    "SessionStart": "session_start.py",
     "PreToolUse": "pre_tool_activity.py",
     "PostToolUse": "check_notifications.py",
     "Stop": "stop_idle.py",

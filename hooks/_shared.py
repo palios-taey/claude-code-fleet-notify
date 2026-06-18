@@ -6,8 +6,8 @@ factors out the common parts so per-CLI entry-point scripts stay thin (~30
 lines each).
 
 Hooks coverage:
-    Claude:   PreToolUse / PostToolUse / Stop / UserPromptSubmit
-    Codex:    PreToolUse / PostToolUse / Stop / UserPromptSubmit (same names)
+    Claude:   SessionStart / PreToolUse / PostToolUse / Stop / UserPromptSubmit
+    Codex:    SessionStart / PreToolUse / PostToolUse / Stop / UserPromptSubmit
     Gemini:   BeforeTool / AfterTool / AfterAgent / BeforeAgent
 
 Output envelope differs slightly:
@@ -261,20 +261,26 @@ def action_post_tool(r, node_id: str, tool_name: str = "") -> str:
         context = "\n".join(f"[{m.get('type','msg')} from {m.get('from','?')}]: {m.get('body','')[:200]}"
                             for m in messages)
 
-    # A wake is the moment a session most needs state. If the orchestrator's
-    # wake-packet endpoint is live (ORCH_WAKE_PACKET_ENABLED on the API side),
-    # append the assembled wake-state packet (current work, refs, memory, rules
-    # — provenance-hashed) so the session wakes WITH context instead of
-    # rebuilding it by file-scanning. Strictly fail-open: any error, timeout,
-    # or disabled endpoint leaves the normal notification block untouched.
-    # Only runs on real wake deliveries (messages non-empty), never per tool call.
+    return _append_wake_packet_context(node_id, context)
+
+
+def _wake_packet_context(node_id: str) -> str:
     packet = _fetch_wake_packet(node_id)
-    if packet:
-        context = (
-            f"{context}\n\n=== WAKE STATE PACKET (orchestrator) ===\n"
-            f"{WAKE_PACKET_DATA_ONLY_BOUNDARY}\n{packet}"
-        )
-    return context
+    if not packet:
+        return ""
+    return (
+        "=== WAKE STATE PACKET (orchestrator) ===\n"
+        f"{WAKE_PACKET_DATA_ONLY_BOUNDARY}\n{packet}"
+    )
+
+
+def _append_wake_packet_context(node_id: str, context: str) -> str:
+    packet_context = _wake_packet_context(node_id)
+    if not packet_context:
+        return context
+    if context:
+        return f"{context}\n\n{packet_context}"
+    return packet_context
 
 
 def _fetch_wake_packet(node_id: str) -> str:
@@ -761,9 +767,9 @@ def action_stop(r, node_id: str) -> None:
         log_debug(node_id, f"action_stop error: {e}")
 
 
-def action_session_start(r, node_id: str) -> None:
+def action_session_start(r, node_id: str) -> str:
     """SessionStart: mark a fresh session idle so daemon delivery works
-    before the first user or bootstrap prompt."""
+    before the first user or bootstrap prompt, and surface scoped state."""
     try:
         from notifications.inbox import state_key
 
@@ -777,6 +783,7 @@ def action_session_start(r, node_id: str) -> None:
             pass
     except Exception as e:
         log_debug(node_id, f"action_session_start error: {e}")
+    return _wake_packet_context(node_id)
 
 
 def action_user_prompt(r, node_id: str) -> str:
@@ -824,18 +831,16 @@ def action_user_prompt(r, node_id: str) -> str:
     except Exception as e:
         log_debug(node_id, f"USER-PROMPT drain error: {e}")
 
-    if not messages:
-        return ""
-
     try:
         from notifications.inbox import format_notification_block
-        return format_notification_block(messages, task_summary="")
+        context = format_notification_block(messages, task_summary="") if messages else ""
     except Exception as e:
         log_debug(node_id, f"USER-PROMPT format error: {e}")
-        return "\n".join(
+        context = "\n".join(
             f"[{m.get('type','msg')} from {m.get('from','?')}]: {m.get('body','')[:200]}"
             for m in messages
-        )
+        ) if messages else ""
+    return _append_wake_packet_context(node_id, context)
 
 
 # ---- output envelope helpers ----

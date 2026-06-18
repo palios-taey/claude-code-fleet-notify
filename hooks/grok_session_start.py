@@ -71,8 +71,8 @@ def main() -> None:
         emit_claude_or_codex("SessionStart", None)
         sys.exit(0)
 
-    action_session_start(r, node_id)
-    emit_claude_or_codex("SessionStart", None)
+    context = action_session_start(r, node_id)
+    emit_claude_or_codex("SessionStart", context if context else None)
     sys.exit(0)
 
 

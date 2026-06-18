@@ -220,6 +220,7 @@ CLI_SPECS = {
     "claude": {
         "path": claude_path,
         "hooks": {
+            "SessionStart":     ("session_start.py",       5000),
             "PreToolUse":       ("pre_tool_activity.py",   3000),
             "PostToolUse":      ("check_notifications.py", 5000),
             "Stop":             ("stop_idle.py",           5000),
@@ -230,6 +231,7 @@ CLI_SPECS = {
     "codex": {
         "path": codex_path,
         "hooks": {
+            "SessionStart":     ("codex_session_start.py", 10000),
             "PreToolUse":       ("codex_pre_tool.py",      10000),
             "PostToolUse":      ("codex_post_tool.py",     10000),
             "Stop":             ("codex_stop.py",          10000),

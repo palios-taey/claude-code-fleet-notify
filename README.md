@@ -40,7 +40,7 @@ Out of scope (will fail silently or partially — adopters: don't):
 
 | CLI | Config file | Event names | Install command |
 |---|---|---|---|
-| Claude Code | `~/.claude/settings.json` | `PreToolUse` / `PostToolUse` / `Stop` / `UserPromptSubmit` | `install-hooks.sh --apply` |
+| Claude Code | `~/.claude/settings.json` | `SessionStart` / `PreToolUse` / `PostToolUse` / `Stop` / `UserPromptSubmit` | `install-hooks.sh --apply` |
 | OpenAI codex | `~/.codex/hooks.json` | same as Claude Code | `install-hooks.sh --codex --apply` |
 | Google gemini | `~/.gemini/settings.json` | `BeforeTool` / `AfterTool` / `BeforeAgent` / `AfterAgent` | `install-hooks.sh --gemini --apply` |
 | xAI grok | `~/.grok/hooks/cf-notify.json` | `SessionStart` / `UserPromptSubmit` / `Stop` | copy `templates/grok/cf-notify.json`; see `docs/grok-hooks.md` |
@@ -144,6 +144,8 @@ The installer copies `hooks/*.py`, `notifications/*.py`, and `identity.py` to a 
 In `--apply` mode the installer also runs a boot gate before writing settings: every runtime hook that would be referenced by a settings file must import cleanly from the runtime root with no checkout `PYTHONPATH` help. If the boot gate fails, no settings file is written.
 
 > **Grok** (xAI `grok-cli`) should use the dedicated global hook file `~/.grok/hooks/cf-notify.json` so `SessionStart` can mark idle at boot. See `docs/grok-hooks.md`.
+
+Wake packets are injected through lifecycle hooks when the orchestrator endpoint is enabled: `SessionStart` supplies scoped state at session boot, `UserPromptSubmit` refreshes it at the start of each submitted prompt, and `PostToolUse` appends it to drained notification deliveries. All wake-packet fetches are fail-open; if the orchestrator API is unavailable, normal hook behavior continues without context injection.
 
 ## Run The Daemon
 
