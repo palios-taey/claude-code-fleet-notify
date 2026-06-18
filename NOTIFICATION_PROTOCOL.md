@@ -34,7 +34,7 @@ For every tmux-session participant (Claude Code / codex / gemini / grok), notifi
 **Path B — Idle (session has stopped, `idle=1` set by Stop hook)**:
 - The notification daemon (`notifications/daemon.py`) polls Redis, detects pending notifications for an idle session, and uses `scripts/tmux-send` to inject a pointer prompt into the session's tmux pane.
 - The session sees the pointer (e.g., "[NOTIFY] You have N messages...") and acts on it.
-- This is the **tmux-when-idle** path. Used only while `idle == 1`. The daemon does NOT clear idle (only the UserPromptSubmit hook does, after the human or pointer prompt is submitted).
+- This is the **tmux-when-idle** path. Used only while `idle == 1`. The daemon does NOT clear idle; prompt/tool hooks clear it when the CLI becomes active again.
 - The daemon's injection authorization rule is exactly one flag: inject if and only if `${NOTIFY_KEY_PREFIX:-taey}:SESSION:idle` exists.
 
 **This pair is the official + canonical pattern** for dispatching work to any tmux-session CLI peer in the fleet. An earlier subprocess-invocation approach was dropped in favor of full peer integration with hooks. No fallback paths exist; the central notification system uses hook context while active and tmux only when idle.
@@ -50,7 +50,7 @@ All four supported CLIs run the same Redis state machine (`idle` / `last_activit
 | Claude Code | `~/.claude/settings.json` | JSON | `PreToolUse` / `PostToolUse` / `Stop` / `UserPromptSubmit` | `pre_tool_activity.py` / `check_notifications.py` / `stop_idle.py` / `prompt_activity.py` |
 | OpenAI codex | `~/.codex/hooks.json` | JSON | `PreToolUse` / `PostToolUse` / `Stop` / `UserPromptSubmit` | `codex_pre_tool.py` / `codex_post_tool.py` / `codex_stop.py` / `codex_user_prompt.py` |
 | Google gemini | `~/.gemini/settings.json` | JSON | `BeforeTool` / `AfterTool` / `AfterAgent` / `BeforeAgent` | `gemini_before_tool.py` / `gemini_after_tool.py` / `gemini_after_agent.py` / `gemini_before_agent.py` |
-| xAI grok | `~/.grok/hooks/cf-notify.json` | global file, no project trust required | `SessionStart` / `PreToolUse` / `PostToolUse` / `Stop` / `UserPromptSubmit` | `grok_session_start.py`, `grok_stop.py`, `grok_user_prompt.py` plus shared tool hooks |
+| xAI grok | `~/.grok/hooks/cf-notify.json` | global file, no project trust required | `SessionStart` / `Stop` / `UserPromptSubmit` | `grok_session_start.py`, `grok_stop.py`, `grok_user_prompt.py` |
 
 Use `bash scripts/install-hooks.sh --help` for the full installation matrix. `--apply` writes a timestamped backup of each affected config file before changing it; without `--apply` the script is a dry-run that prints unified diffs and exits.
 
@@ -107,7 +107,7 @@ Tmux is used only when the session is stopped and `idle=1`, and it carries only 
 
 | Flag | Who sets it | Who clears it |
 |---|---|---|
-| `${NOTIFY_KEY_PREFIX:-taey}:SESSION:idle` | **Only** the `Stop` hook | `UserPromptSubmit` hook |
+| `${NOTIFY_KEY_PREFIX:-taey}:SESSION:idle` | **Only** the `Stop` hook | `UserPromptSubmit`/`BeforeAgent` and tool-activity hooks |
 | `${NOTIFY_KEY_PREFIX:-taey}:SESSION:last_activity` | hook activity | overwritten by later hook activity |
 | `${NOTIFY_KEY_PREFIX:-taey}:SESSION:last_tool_activity` | tool-hook activity | overwritten by later tool-hook activity |
 
