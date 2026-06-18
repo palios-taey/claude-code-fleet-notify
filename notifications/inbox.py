@@ -11,8 +11,7 @@ Delivery paths
 1. Active sessions: PostToolUse hook drains queues inline and renders the payload via
    ``hookSpecificOutput.additionalContext``.
 2. Stopped sessions: notification daemon injects a Redis pointer via ``scripts/tmux-send``
-   when the explicit idle flag is set, or when recent activity is stale beyond the
-   maximum tool window and no tool is running. Queues are drained only by recipient
+   only when the explicit idle flag is set. Queues are drained only by recipient
    hooks after a real prompt/tool event.
 
 The helpers in this module intentionally avoid ``DELETE``-ing whole queues during normal
@@ -27,9 +26,6 @@ import time
 import uuid
 from typing import Any, Dict, Iterable, Optional
 
-MAX_TOOL_RUNTIME_SEC = 600
-DEFAULT_TOOL_TTL = 900
-DEFAULT_INJECT_IDLE_GRACE_SEC = 900.0
 DEFAULT_KEY_PREFIX = os.environ.get("NOTIFY_KEY_PREFIX", "taey")
 WAKE_ALLOW_STOP = "ALLOW_STOP"
 WAKE_WITH_QUEUE = "WAKE_WITH_QUEUE"
@@ -356,17 +352,6 @@ def mark_activity(redis_client, node_id: str) -> None:
     redis_client.set(state_key(node_id, "last_activity"), str(time.time()))
 
 
-def set_tool_running(redis_client, node_id: str, ttl: int = DEFAULT_TOOL_TTL) -> None:
-    """Mark a node as mid-tool-call. TTL outlives max tool runtime and is only a crash safety net."""
-    redis_client.set(state_key(node_id, "tool_running"), "1", ex=ttl)
-    mark_activity(redis_client, node_id)
-
-
-def clear_tool_running(redis_client, node_id: str) -> None:
-    redis_client.delete(state_key(node_id, "tool_running"))
-    mark_activity(redis_client, node_id)
-
-
 def set_idle(redis_client, node_id: str) -> None:
     redis_client.set(state_key(node_id, "idle"), "1")
     mark_activity(redis_client, node_id)
@@ -375,21 +360,6 @@ def set_idle(redis_client, node_id: str) -> None:
 def clear_idle(redis_client, node_id: str) -> None:
     redis_client.delete(state_key(node_id, "idle"))
     mark_activity(redis_client, node_id)
-
-
-def _float_or_none(value: Any) -> float | None:
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def inject_idle_grace_sec() -> float:
-    raw = os.environ.get("INJECT_IDLE_GRACE_SEC", str(DEFAULT_INJECT_IDLE_GRACE_SEC))
-    try:
-        return max(0.0, float(raw))
-    except (TypeError, ValueError):
-        return DEFAULT_INJECT_IDLE_GRACE_SEC
 
 
 def is_node_idle(redis_client, node_id: str, idle_threshold: int = 30) -> bool:  # noqa: ARG001
@@ -403,42 +373,9 @@ def is_node_idle(redis_client, node_id: str, idle_threshold: int = 30) -> bool: 
 def can_inject_pointer(
     redis_client,
     node_id: str,
-    *,
-    now: float | None = None,
-    idle_grace_sec: float | None = None,
 ) -> bool:
     """Return True when daemon pointer injection is safe for this session.
 
-    The explicit idle flag remains the fast path. If that best-effort flag is
-    absent, the daemon may still inject only after the session has no active
-    tool-running marker and its last activity is older than a grace window that
-    exceeds the maximum tool runtime.
+    The explicit idle flag is the complete authorization rule.
     """
-    return pointer_injection_path(
-        redis_client,
-        node_id,
-        now=now,
-        idle_grace_sec=idle_grace_sec,
-    ) is not None
-
-
-def pointer_injection_path(
-    redis_client,
-    node_id: str,
-    *,
-    now: float | None = None,
-    idle_grace_sec: float | None = None,
-) -> str | None:
-    """Return the signal that authorizes pointer injection, or None."""
-    if redis_client.exists(state_key(node_id, "tool_running")):
-        return None
-    if is_node_idle(redis_client, node_id):
-        return "idle"
-    last_activity = _float_or_none(redis_client.get(state_key(node_id, "last_activity")))
-    if last_activity is None:
-        return None
-    now = time.time() if now is None else now
-    grace = inject_idle_grace_sec() if idle_grace_sec is None else max(0.0, float(idle_grace_sec))
-    if (now - last_activity) > grace:
-        return "stale"
-    return None
+    return is_node_idle(redis_client, node_id)

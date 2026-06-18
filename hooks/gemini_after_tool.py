@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Gemini CLI AfterTool hook — clear tool_running, drain inbox, return
+"""Gemini CLI AfterTool hook — stamp activity, drain inbox, return
 inbox messages + pending OrchTasks via additionalContext.
 
 Wired in ~/.gemini/settings.json under "hooks.AfterTool".

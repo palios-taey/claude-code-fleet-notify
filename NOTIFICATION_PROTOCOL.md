@@ -20,7 +20,7 @@ Targets are arbitrary strings. There is no allowlist. A practical fleet might us
 ## Participant types
 
 - **tmux-session participants** are REPL-CLI sessions with the four hooks installed. Supported CLIs: Claude Code, OpenAI codex, Google gemini, and xAI grok (see "Per-CLI hook integration" below for config-file paths and event-name mappings). The daemon injects a pointer prompt through tmux only when the session is stopped and marked idle.
-- **headless participants** read Redis directly. They do not use hooks, tmux injection, `idle`, or `tool_running` state. They poll `${NOTIFY_KEY_PREFIX:-taey}:<name>:inbox` and reply with `taey-notify <target> --from <name>`.
+- **headless participants** read Redis directly. They do not use hooks, tmux injection, or `idle` state. They poll `${NOTIFY_KEY_PREFIX:-taey}:<name>:inbox` and reply with `taey-notify <target> --from <name>`.
 
 ## Dual delivery path — the canonical dispatch pattern for tmux participants
 
@@ -35,14 +35,15 @@ For every tmux-session participant (Claude Code / codex / gemini / grok), notifi
 - The notification daemon (`notifications/daemon.py`) polls Redis, detects pending notifications for an idle session, and uses `scripts/tmux-send` to inject a pointer prompt into the session's tmux pane.
 - The session sees the pointer (e.g., "[NOTIFY] You have N messages...") and acts on it.
 - This is the **tmux-when-idle** path. Used only while `idle == 1`. The daemon does NOT clear idle (only the UserPromptSubmit hook does, after the human or pointer prompt is submitted).
+- The daemon's injection authorization rule is exactly one flag: inject if and only if `${NOTIFY_KEY_PREFIX:-taey}:SESSION:idle` exists.
 
-**This pair is the official + canonical pattern** for dispatching work to any tmux-session CLI peer in the fleet. An earlier subprocess-invocation approach was dropped in favor of full peer integration with hooks. No fallback paths exist; the central notification system is designed to use injections during tool use when active and tmux only when idle.
+**This pair is the official + canonical pattern** for dispatching work to any tmux-session CLI peer in the fleet. An earlier subprocess-invocation approach was dropped in favor of full peer integration with hooks. No fallback paths exist; the central notification system uses hook context while active and tmux only when idle.
 
 If a tmux peer cannot be reached via this dual path (e.g., the tmux session itself is dead), the right response is to respawn the session via `peer-respawn.sh`, NOT to fall back to a subprocess invocation.
 
 ## Per-CLI hook integration
 
-All four supported CLIs run the same Redis state machine (`idle` / `tool_running` / `last_activity` / `inbox` / `notifications`). The per-CLI hook variants in `hooks/` are thin wrappers that adapt to each CLI's distinct (a) config file location + format, (b) event-name vocabulary, (c) stdin/stdout envelope shape. All four call into the shared `hooks/_shared.py` helper which is the single source of truth for `action_pre_tool` / `action_post_tool` / `action_stop` / `action_user_prompt`.
+All four supported CLIs run the same Redis state machine (`idle` / `last_activity` / `last_tool_activity` / `inbox` / `notifications`). The per-CLI hook variants in `hooks/` are thin wrappers that adapt to each CLI's distinct (a) config file location + format, (b) event-name vocabulary, (c) stdin/stdout envelope shape. All four call into the shared `hooks/_shared.py` helper which is the single source of truth for `action_pre_tool` / `action_post_tool` / `action_stop` / `action_user_prompt`.
 
 | CLI | Config file | Format | Event names | Hook scripts |
 |---|---|---|---|---|
@@ -69,7 +70,7 @@ Any outcome other than `done` leaves `current_task` in place as the "previous di
 
 `ALLOW_STOP` from the orchestrator stop-decision API means "do not block this worker from idling." It does **not** suppress lifecycle notification: if the worker still has `current_task` or `last_outcome` dispatch context, the Stop/AfterAgent hook still enqueues `peer_idle`.
 
-The notify daemon also runs a backstop for cases where a CLI stalls before firing Stop/AfterAgent. If a local peer still has `current_task` but its `last_tool_activity` is stale (`CF_PEER_INACTIVE_STALE_SECS`, default 300s), the daemon enqueues a high-priority `peer_idle` to the dispatcher with `backstop=stale_last_tool_activity`. This depends on tracked-dispatch discipline: the dispatcher must bind `current_task` when handing work to a peer, so the daemon has enough state to wake the dispatcher even when the peer never reaches its Stop hook.
+The notify daemon does not run timer-based peer-inactive escalation. Task-level stalls are owned by the orchestrator worker-liveness path.
 
 Explicit dispatch handoffs also carry an activation window (`CF_HANDOFF_ACTIVATION_SECS`, default 60s). The daemon marks a handoff activated when the target's heartbeat advances after dispatch, the target binds the dispatched `current_task`, or a handoff ack appears. If none happens before the deadline, the daemon enqueues `dispatch_activation_failed` to the dispatcher. This catches dispatches that reached Redis but never became active in the peer.
 
@@ -87,7 +88,7 @@ Two paths:
 
 The daemon does not pop messages. Full bodies stay in Redis. The recipient reads them on its next tool call via `PostToolUse`, on the next submitted prompt via `UserPromptSubmit`, or directly with `taey-ack`.
 
-Tmux is used only when the session is stopped and `idle=1`, and it carries only a pointer. Active sessions never receive notification bodies through tmux.
+Tmux is used only when the session is stopped and `idle=1`, and it carries only a pointer. Active sessions never receive notification bodies or pointers through tmux.
 
 ## Redis keys
 
@@ -99,16 +100,16 @@ Tmux is used only when the session is stopped and `idle=1`, and it carries only 
 | `${NOTIFY_KEY_PREFIX:-taey}:SESSION:notifications` | monitor / worker queue, writers `RPUSH`, readers `LPOP` |
 | `${NOTIFY_KEY_PREFIX:-taey}:notify:SESSION:orch` | auxiliary queue, writers `RPUSH`, readers `LPOP` |
 | `${NOTIFY_KEY_PREFIX:-taey}:SESSION:idle` | durable idle flag set only by `Stop` |
-| `${NOTIFY_KEY_PREFIX:-taey}:SESSION:tool_running` | transient tool-running flag with 900s TTL, longer than the 600s max tool runtime |
-| `${NOTIFY_KEY_PREFIX:-taey}:SESSION:last_activity` | last hook activity timestamp |
+| `${NOTIFY_KEY_PREFIX:-taey}:SESSION:last_activity` | last hook activity timestamp, used for handoff activation observation |
+| `${NOTIFY_KEY_PREFIX:-taey}:SESSION:last_tool_activity` | last tool-hook activity timestamp, used for handoff activation observation |
 
 ## State rules
 
 | Flag | Who sets it | Who clears it |
 |---|---|---|
 | `${NOTIFY_KEY_PREFIX:-taey}:SESSION:idle` | **Only** the `Stop` hook | `UserPromptSubmit` hook |
-| `${NOTIFY_KEY_PREFIX:-taey}:SESSION:tool_running` | `PreToolUse` hook | `PostToolUse` hook, `Stop` hook, or 900s crash-safety TTL |
 | `${NOTIFY_KEY_PREFIX:-taey}:SESSION:last_activity` | hook activity | overwritten by later hook activity |
+| `${NOTIFY_KEY_PREFIX:-taey}:SESSION:last_tool_activity` | tool-hook activity | overwritten by later tool-hook activity |
 
 Nothing else sets `idle=1`. The daemon never clears idle because tmux injection is not proof that the prompt was submitted.
 
