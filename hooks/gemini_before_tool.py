@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Gemini CLI BeforeTool hook — set tool_running flag.
+"""Gemini CLI BeforeTool hook — stamp tool activity.
 
 Wired in ~/.gemini/settings.json under "hooks.BeforeTool".
 Gemini stdin includes: session_id, transcript_path, cwd, hook_event_name,

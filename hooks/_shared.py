@@ -194,13 +194,11 @@ def get_redis_and_node():
 # ---- the four state-machine actions ----
 
 def action_pre_tool(r, node_id: str, tool_name: str = "") -> None:
-    """PreToolUse / BeforeTool: set tool_running flag with max-tool TTL safety net,
-    stamp activity keys. Same semantics as Claude's pre_tool_activity.py."""
+    """PreToolUse / BeforeTool: stamp activity keys."""
     try:
-        from notifications.inbox import DEFAULT_TOOL_TTL, state_key
+        from notifications.inbox import state_key
 
         now = str(time.time())
-        r.set(state_key(node_id, "tool_running"), "1", ex=DEFAULT_TOOL_TTL)
         r.set(state_key(node_id, "last_activity"), now)
         r.set(state_key(node_id, "last_tool_activity"), now)
         log_debug(node_id, f"PRE-TOOL: tool={tool_name}")
@@ -209,18 +207,17 @@ def action_pre_tool(r, node_id: str, tool_name: str = "") -> None:
 
 
 def action_post_tool(r, node_id: str, tool_name: str = "") -> str:
-    """PostToolUse / AfterTool: clear tool_running, drain inbox + notifications +
-    orch streams, return formatted context string for additionalContext.
+    """PostToolUse / AfterTool: drain inbox + notifications + orch streams,
+    return formatted context string for additionalContext.
     Empty string means nothing to surface."""
     try:
         from notifications.inbox import state_key
 
         now = str(time.time())
-        r.delete(state_key(node_id, "tool_running"))
         r.set(state_key(node_id, "last_activity"), now)
         r.set(state_key(node_id, "last_tool_activity"), now)
     except Exception as e:
-        log_debug(node_id, f"post_tool clear error: {e}")
+        log_debug(node_id, f"post_tool activity error: {e}")
 
     # Drain message queues
     messages = []
@@ -719,8 +716,8 @@ def _notify_supervisor_of_stop(r, node_id: str, supervisor: str) -> None:
 
 def action_stop(r, node_id: str) -> None:
     """Stop / AfterAgent: set idle=1 with no TTL (stopped means stopped until
-    UserPromptSubmit clears it). Clear tool_running. Stamp last_activity.
-    Notify supervisor (if any) with completed-task summary.
+    UserPromptSubmit clears it). Stamp last_activity. Notify supervisor (if
+    any) with completed-task summary.
 
     NOTE: this is the ONLY place idle gets set. Per NOTIFICATION_PROTOCOL.md.
 
@@ -736,7 +733,6 @@ def action_stop(r, node_id: str) -> None:
         from notifications.inbox import state_key
 
         r.set(state_key(node_id, "idle"), "1")
-        r.delete(state_key(node_id, "tool_running"))
         r.set(state_key(node_id, "last_activity"), str(time.time()))
         log_debug(node_id, "STOP: idle=1")
         try:
@@ -759,7 +755,6 @@ def action_session_start(r, node_id: str) -> None:
         from notifications.inbox import state_key
 
         r.set(state_key(node_id, "idle"), "1")
-        r.delete(state_key(node_id, "tool_running"))
         r.set(state_key(node_id, "last_activity"), str(time.time()))
         log_debug(node_id, "SESSION-START: idle=1")
         try:

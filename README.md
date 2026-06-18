@@ -190,8 +190,8 @@ ${NOTIFY_KEY_PREFIX:-taey}:SESSION:inbox
 ${NOTIFY_KEY_PREFIX:-taey}:SESSION:notifications
 ${NOTIFY_KEY_PREFIX:-taey}:notify:SESSION:orch
 ${NOTIFY_KEY_PREFIX:-taey}:SESSION:idle
-${NOTIFY_KEY_PREFIX:-taey}:SESSION:tool_running
 ${NOTIFY_KEY_PREFIX:-taey}:SESSION:last_activity
+${NOTIFY_KEY_PREFIX:-taey}:SESSION:last_tool_activity
 ```
 
 ## Testing

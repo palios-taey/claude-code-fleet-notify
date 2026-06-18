@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Codex CLI PreToolUse hook — set tool_running flag.
+"""Codex CLI PreToolUse hook — stamp tool activity.
 
 Wired in ~/.codex/config.toml under [[hooks.PreToolUse]].
 Codex stdin includes: session_id, transcript_path, cwd, hook_event_name,

@@ -29,9 +29,9 @@ from notifications.inbox import (
     format_notification_block,
     has_pending_messages,
     inbox_key,
+    is_node_idle,
     key_prefix,
     notifications_key,
-    pointer_injection_path,
     state_key,
 )
 from notifications.handoff import (
@@ -40,7 +40,6 @@ from notifications.handoff import (
     session_machine_key,
     validate_handoff_activation,
 )
-from notifications.task_liveness import peer_idle_allowed
 
 logging.basicConfig(
     level=logging.INFO,
@@ -59,17 +58,6 @@ POINTER_INJECT_BACKOFF_SECS = 90
 DEFAULT_INJECT_FAILURE_ESCALATE_AFTER = 3
 DEFAULT_INJECT_FAILURE_ESCALATION_TTL_SECS = 900
 MAX_MESSAGE_LENGTH = 4000
-DEFAULT_PEER_INACTIVE_STALE_SECS = 300
-PEER_INACTIVE_DEDUP_SECS = 300
-ACTIVE_PANE_MARKERS = (
-    "esc to interrupt",
-    "ctrl-c to interrupt",
-    "ctrl+c to interrupt",
-    "press ctrl-c",
-    "press ctrl+c",
-)
-
-ACTIVE_PANE_FOOTER_LINES = 2
 
 
 def get_local_tmux_sessions() -> list[str]:
@@ -92,24 +80,6 @@ def _clip_message(message: str) -> str:
     if len(message) <= MAX_MESSAGE_LENGTH:
         return message
     return message[: MAX_MESSAGE_LENGTH - 28].rstrip() + "\n...[notification block truncated]"
-
-
-def session_pane_looks_active(session_name: str, *, lines: int = 12) -> bool:
-    """Return True when the live tmux pane shows a tool/agent activity marker."""
-    try:
-        result = subprocess.run(
-            ["tmux", "capture-pane", "-p", "-J", "-S", f"-{max(1, int(lines))}", "-t", session_name],
-            capture_output=True,
-            text=True,
-            timeout=2,
-        )
-    except Exception:
-        return False
-    if result.returncode != 0:
-        return False
-    nonblank = [line.strip().lower() for line in result.stdout.splitlines() if line.strip()]
-    footer = "\n".join(nonblank[-ACTIVE_PANE_FOOTER_LINES:])
-    return any(marker in footer for marker in ACTIVE_PANE_MARKERS)
 
 
 def inject_via_tmux(session_name: str, message: str) -> bool:
@@ -149,23 +119,6 @@ def _resolve_supervisor(r, node_id: str) -> str | None:
     if explicit:
         return explicit
     return None
-
-
-def _decode_current_task(raw: str | None) -> dict | None:
-    if not raw:
-        return None
-    try:
-        task = json.loads(raw)
-    except Exception:
-        return None
-    return task if isinstance(task, dict) else None
-
-
-def _float_or_none(value) -> float | None:
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
 
 
 def _int_env(name: str, default: int, minimum: int = 1) -> int:
@@ -226,75 +179,6 @@ def _record_pointer_inject_result(r, node_id: str, *, ok: bool,
     else:
         logger.error("Pointer injection failure escalation: %s", body)
     r.set(notice_key, "1", ex=ttl_secs)
-
-
-def notify_dispatcher_if_peer_inactive(r, node_id: str, *, now: float | None = None,
-                                       stale_secs: int = DEFAULT_PEER_INACTIVE_STALE_SECS) -> bool:
-    """Backstop for stalls where the CLI never fires Stop/AfterAgent.
-
-    If a local peer still holds dispatch context but has stale tool activity,
-    enqueue one peer_idle-style lifecycle message to its dispatcher. This is
-    intentionally independent of the explicit idle flag, because the missing
-    hook is the failure mode this backstop covers.
-    """
-    if r.exists(state_key(node_id, "tool_running")):
-        return False
-    task = _decode_current_task(r.get(state_key(node_id, "current_task")))
-    if not task:
-        return False
-    task_id = task.get("task_id")
-    supervisor = _resolve_supervisor(r, node_id) or task.get("supervisor")
-    allowed, reason, _ = peer_idle_allowed(task_id, node_id, supervisor)
-    if not allowed:
-        logger.info(
-            "Skipping backstop peer_idle for %s task=%s: %s",
-            node_id,
-            task_id or "?",
-            reason,
-        )
-        return False
-    timestamps = [
-        _float_or_none(r.get(state_key(node_id, "last_tool_activity"))),
-        _float_or_none(r.get(state_key(node_id, "last_activity"))),
-        _float_or_none(task.get("started_at")),
-    ]
-    timestamps = [ts for ts in timestamps if ts is not None]
-    if not timestamps:
-        return False
-    now = time.time() if now is None else now
-    timestamp = max(timestamps)
-    stale_for = max(0, int(now - timestamp))
-    if stale_for < stale_secs:
-        return False
-
-    dedup_suffix = task_id or "no-task"
-    dedup = f"{key_prefix()}:peer-inactive-notified:{node_id}:{dedup_suffix}"
-    if r.exists(dedup):
-        return False
-
-    body = (
-        f"{node_id} inactive for {stale_for}s while holding dispatched task "
-        f"{task_id or '?'}"
-    )
-    msg = json.dumps({
-        "from": node_id,
-        "type": "peer_idle",
-        "body": body,
-        "outcome": "unknown",
-        "priority": "high",
-        "msg_id": f"peer-inactive-{node_id}-{dedup_suffix}-{int(now)}",
-        "timestamp": now,
-        "task_id": task_id,
-        "task_description": task.get("description"),
-        "task_supervisor": task.get("supervisor"),
-        "task_started_at": task.get("started_at"),
-        "inactive_for_sec": stale_for,
-        "backstop": "stale_last_tool_activity",
-    })
-    r.lpush(inbox_key(str(supervisor)), msg)
-    r.set(dedup, "1", ex=PEER_INACTIVE_DEDUP_SECS)
-    logger.warning("Backstop peer_idle: %s -> %s (%s)", node_id, supervisor, body)
-    return True
 
 
 def build_pointer_summary(r, node_id: str) -> str | None:
@@ -467,9 +351,6 @@ def run_daemon(
             local_sessions = get_local_tmux_sessions()
             local_session_set = set(local_sessions)
             machine = socket.gethostname()
-            peer_inactive_stale_secs = int(
-                os.environ.get("CF_PEER_INACTIVE_STALE_SECS", str(DEFAULT_PEER_INACTIVE_STALE_SECS))
-            )
 
             try:
                 validate_handoff_activation(r, prefix=key_prefix())
@@ -488,20 +369,10 @@ def run_daemon(
                 except Exception:
                     pass
 
-                notify_dispatcher_if_peer_inactive(
-                    r,
-                    node_id,
-                    stale_secs=peer_inactive_stale_secs,
-                )
-
                 if not has_pending_messages(r, node_id):
                     continue
                 now = time.time()
-                inject_path = pointer_injection_path(r, node_id, now=now)
-                if inject_path is None:
-                    continue
-                if inject_path == "stale" and session_pane_looks_active(session_name):
-                    logger.info("Skipping pointer inject for active pane: %s", session_name)
+                if not is_node_idle(r, node_id):
                     continue
 
                 # Per-session inject backoff. The inbox signature changes when a

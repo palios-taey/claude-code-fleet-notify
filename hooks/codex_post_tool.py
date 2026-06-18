@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Codex CLI PostToolUse hook — clear tool_running, drain inbox, return
+"""Codex CLI PostToolUse hook — stamp activity, drain inbox, return
 inbox messages + pending OrchTasks via additionalContext.
 
 Wired in ~/.codex/config.toml under [[hooks.PostToolUse]].
