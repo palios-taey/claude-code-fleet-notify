@@ -47,8 +47,8 @@ All four supported CLIs run the same Redis state machine (`idle` / `last_activit
 
 | CLI | Config file | Format | Event names | Hook scripts |
 |---|---|---|---|---|
-| Claude Code | `~/.claude/settings.json` | JSON | `PreToolUse` / `PostToolUse` / `Stop` / `UserPromptSubmit` | `pre_tool_activity.py` / `check_notifications.py` / `stop_idle.py` / `prompt_activity.py` |
-| OpenAI codex | `~/.codex/hooks.json` | JSON | `PreToolUse` / `PostToolUse` / `Stop` / `UserPromptSubmit` | `codex_pre_tool.py` / `codex_post_tool.py` / `codex_stop.py` / `codex_user_prompt.py` |
+| Claude Code | `~/.claude/settings.json` | JSON | `SessionStart` / `PreToolUse` / `PostToolUse` / `Stop` / `UserPromptSubmit` | `session_start.py` / `pre_tool_activity.py` / `check_notifications.py` / `stop_idle.py` / `prompt_activity.py` |
+| OpenAI codex | `~/.codex/hooks.json` | JSON | `SessionStart` / `PreToolUse` / `PostToolUse` / `Stop` / `UserPromptSubmit` | `codex_session_start.py` / `codex_pre_tool.py` / `codex_post_tool.py` / `codex_stop.py` / `codex_user_prompt.py` |
 | Google gemini | `~/.gemini/settings.json` | JSON | `BeforeTool` / `AfterTool` / `AfterAgent` / `BeforeAgent` | `gemini_before_tool.py` / `gemini_after_tool.py` / `gemini_after_agent.py` / `gemini_before_agent.py` |
 | xAI grok | `~/.grok/hooks/cf-notify.json` | global file, no project trust required | `SessionStart` / `Stop` / `UserPromptSubmit` | `grok_session_start.py`, `grok_stop.py`, `grok_user_prompt.py` |
 
@@ -86,7 +86,7 @@ Two paths:
    [NOTIFY] You have 3 messages (from <session-A>, docs-agent; first=ESCALATION). Read with: redis-cli -h 127.0.0.1 LRANGE ${NOTIFY_KEY_PREFIX:-taey}:SESSION:inbox 0 -1
    ```
 
-The daemon does not pop messages. Full bodies stay in Redis. The recipient reads them on its next tool call via `PostToolUse`, on the next submitted prompt via `UserPromptSubmit`, or directly with `taey-ack`.
+The daemon does not pop messages. Full bodies stay in Redis. The recipient reads them on its next tool call via `PostToolUse`, on the next submitted prompt via `UserPromptSubmit`, or directly with `taey-ack`. Wake packets are fetched from the orchestrator on `SessionStart`, `UserPromptSubmit`, and notification-draining `PostToolUse` so scoped state arrives before the model acts.
 
 Tmux is used only when the session is stopped and `idle=1`, and it carries only a pointer. Active sessions never receive notification bodies or pointers through tmux.
 
