@@ -42,6 +42,30 @@ class DaemonTests(unittest.TestCase):
         with mock.patch.object(daemon.subprocess, "run", return_value=result):
             self.assertTrue(daemon.session_pane_looks_active("active-session"))
 
+    def test_session_pane_looks_active_ignores_body_marker_above_footer(self):
+        result = SimpleNamespace(
+            returncode=0,
+            stdout=(
+                "review notes\n"
+                "the esc to interrupt guard was discussed in prose\n"
+                "\n"
+                "assistant is idle\n"
+                "❯\n"
+            ),
+        )
+
+        with mock.patch.object(daemon.subprocess, "run", return_value=result):
+            self.assertFalse(daemon.session_pane_looks_active("idle-session"))
+
+    def test_session_pane_looks_active_detects_footer_marker(self):
+        result = SimpleNamespace(
+            returncode=0,
+            stdout="analysis output\n⏵⏵ running command · esc to interrupt\n",
+        )
+
+        with mock.patch.object(daemon.subprocess, "run", return_value=result):
+            self.assertTrue(daemon.session_pane_looks_active("active-session"))
+
     def test_session_pane_looks_active_false_without_marker(self):
         result = SimpleNamespace(returncode=0, stdout="stopped prompt\n")
 
@@ -66,6 +90,17 @@ class DaemonTests(unittest.TestCase):
         self.assertEqual("idle-session", inject.call_args.args[0])
         self.assertEqual(1, r.llen(inbox_key("idle-session")))
         self.assertTrue(r.exists(state_key("idle-session", "idle")))
+
+    def test_idle_flagged_session_injects_even_when_pane_marker_is_seen(self):
+        r = FakeRedis()
+        r.set(state_key("idle-prose", "idle"), "1")
+        r.lpush(inbox_key("idle-prose"), json.dumps({"from": "sender", "type": "message", "body": "body"}))
+
+        inject = self.run_daemon_once(r, ["idle-prose"], now=2000.0, pane_active=True)
+
+        inject.assert_called_once()
+        self.assertEqual("idle-prose", inject.call_args.args[0])
+        self.assertEqual(1, r.llen(inbox_key("idle-prose")))
 
     def test_run_daemon_injects_idle_absent_stale_sessions_with_messages(self):
         r = FakeRedis()
@@ -118,6 +153,17 @@ class DaemonTests(unittest.TestCase):
 
         self.assertIn("queued", context)
         self.assertEqual(0, r.llen(inbox_key("long-tool")))
+
+    def test_mid_tool_footer_marker_does_not_inject(self):
+        r = FakeRedis()
+        r.set(state_key("mid-tool", "idle"), "1")
+        r.set(state_key("mid-tool", "tool_running"), "1")
+        r.lpush(inbox_key("mid-tool"), json.dumps({"from": "sender", "type": "message", "body": "queued"}))
+
+        inject = self.run_daemon_once(r, ["mid-tool"], now=2000.0, pane_active=True)
+
+        inject.assert_not_called()
+        self.assertEqual(1, r.llen(inbox_key("mid-tool")))
 
     def test_failed_injection_leaves_message_and_idle_for_retry(self):
         r = FakeRedis()

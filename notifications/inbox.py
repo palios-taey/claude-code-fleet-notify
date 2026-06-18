@@ -414,13 +414,31 @@ def can_inject_pointer(
     tool-running marker and its last activity is older than a grace window that
     exceeds the maximum tool runtime.
     """
+    return pointer_injection_path(
+        redis_client,
+        node_id,
+        now=now,
+        idle_grace_sec=idle_grace_sec,
+    ) is not None
+
+
+def pointer_injection_path(
+    redis_client,
+    node_id: str,
+    *,
+    now: float | None = None,
+    idle_grace_sec: float | None = None,
+) -> str | None:
+    """Return the signal that authorizes pointer injection, or None."""
     if redis_client.exists(state_key(node_id, "tool_running")):
-        return False
+        return None
     if is_node_idle(redis_client, node_id):
-        return True
+        return "idle"
     last_activity = _float_or_none(redis_client.get(state_key(node_id, "last_activity")))
     if last_activity is None:
-        return False
+        return None
     now = time.time() if now is None else now
     grace = inject_idle_grace_sec() if idle_grace_sec is None else max(0.0, float(idle_grace_sec))
-    return (now - last_activity) > grace
+    if (now - last_activity) > grace:
+        return "stale"
+    return None

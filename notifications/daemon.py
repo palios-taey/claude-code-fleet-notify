@@ -25,13 +25,13 @@ import socket
 
 from notifications.inbox import (
     WAKE_TYPES,
-    can_inject_pointer,
     flatten_sources,
     format_notification_block,
     has_pending_messages,
     inbox_key,
     key_prefix,
     notifications_key,
+    pointer_injection_path,
     state_key,
 )
 from notifications.handoff import (
@@ -69,6 +69,8 @@ ACTIVE_PANE_MARKERS = (
     "press ctrl+c",
 )
 
+ACTIVE_PANE_FOOTER_LINES = 2
+
 
 def get_local_tmux_sessions() -> list[str]:
     """List all tmux sessions on this machine."""
@@ -105,8 +107,9 @@ def session_pane_looks_active(session_name: str, *, lines: int = 12) -> bool:
         return False
     if result.returncode != 0:
         return False
-    recent = "\n".join(line.strip().lower() for line in result.stdout.splitlines() if line.strip())
-    return any(marker in recent for marker in ACTIVE_PANE_MARKERS)
+    nonblank = [line.strip().lower() for line in result.stdout.splitlines() if line.strip()]
+    footer = "\n".join(nonblank[-ACTIVE_PANE_FOOTER_LINES:])
+    return any(marker in footer for marker in ACTIVE_PANE_MARKERS)
 
 
 def inject_via_tmux(session_name: str, message: str) -> bool:
@@ -494,9 +497,10 @@ def run_daemon(
                 if not has_pending_messages(r, node_id):
                     continue
                 now = time.time()
-                if not can_inject_pointer(r, node_id, now=now):
+                inject_path = pointer_injection_path(r, node_id, now=now)
+                if inject_path is None:
                     continue
-                if session_pane_looks_active(session_name):
+                if inject_path == "stale" and session_pane_looks_active(session_name):
                     logger.info("Skipping pointer inject for active pane: %s", session_name)
                     continue
 
