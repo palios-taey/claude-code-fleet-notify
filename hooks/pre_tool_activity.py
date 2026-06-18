@@ -2,8 +2,8 @@
 """
 PreToolUse hook — mark node activity.
 
-Daemon injection is gated only by idle=1; this hook only stamps activity
-markers used by handoff activation.
+Daemon injection is gated only by idle=1; this hook clears idle before
+stamping activity markers used by handoff activation.
 
 Must be fast — adds ~50ms to every tool call.
 """
@@ -27,9 +27,14 @@ def main():
         r = redis_connect()
         node_id = detect_node_id()
         now = str(time.time())
+        r.delete(state_key(node_id, "idle"))
         r.set(state_key(node_id, "last_activity"), now)
         r.set(state_key(node_id, "last_tool_activity"), now)
-        # NOTE: Do NOT delete idle here — only UserPromptSubmit clears idle
+        try:
+            from notifications.trace import trace
+            trace(r, "idle_clear", node=node_id, src="pre_tool")
+        except Exception:
+            pass
     except Exception:
         pass
 

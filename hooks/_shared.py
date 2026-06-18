@@ -193,15 +193,27 @@ def get_redis_and_node():
 
 # ---- the four state-machine actions ----
 
+def _clear_idle_flag(r, node_id: str, src: str) -> None:
+    from notifications.inbox import state_key
+
+    r.delete(state_key(node_id, "idle"))
+    try:
+        from notifications.trace import trace
+        trace(r, "idle_clear", node=node_id, src=src)
+    except Exception:
+        pass
+
+
 def action_pre_tool(r, node_id: str, tool_name: str = "") -> None:
-    """PreToolUse / BeforeTool: stamp activity keys."""
+    """PreToolUse / BeforeTool: clear idle and stamp activity keys."""
     try:
         from notifications.inbox import state_key
 
         now = str(time.time())
+        _clear_idle_flag(r, node_id, "pre_tool")
         r.set(state_key(node_id, "last_activity"), now)
         r.set(state_key(node_id, "last_tool_activity"), now)
-        log_debug(node_id, f"PRE-TOOL: tool={tool_name}")
+        log_debug(node_id, f"PRE-TOOL: idle cleared, tool={tool_name}")
     except Exception as e:
         log_debug(node_id, f"action_pre_tool error: {e}")
 
@@ -214,6 +226,7 @@ def action_post_tool(r, node_id: str, tool_name: str = "") -> str:
         from notifications.inbox import state_key
 
         now = str(time.time())
+        _clear_idle_flag(r, node_id, "post_tool")
         r.set(state_key(node_id, "last_activity"), now)
         r.set(state_key(node_id, "last_tool_activity"), now)
     except Exception as e:
@@ -767,8 +780,8 @@ def action_session_start(r, node_id: str) -> None:
 
 
 def action_user_prompt(r, node_id: str) -> str:
-    """UserPromptSubmit / BeforeAgent: clear idle flag (the user is back),
-    stamp last_activity, drain inbox so daemon-injected pointers don't
+    """UserPromptSubmit / BeforeAgent: clear idle flag, stamp last_activity,
+    drain inbox so daemon-injected pointers don't
     redeliver if the recipient responds with text only.
 
     Returns a formatted notification block as additionalContext (same
@@ -777,17 +790,13 @@ def action_user_prompt(r, node_id: str) -> str:
     Per task-4b841b72: text-only responses without this drain caused
     the daemon-redelivery spam loop.
 
-    NOTE: this is the ONLY place idle gets cleared by hooks."""
+    Tool hooks also clear idle so autonomous CLI tool loops are not treated
+    as stopped between model responses."""
     try:
         from notifications.inbox import state_key
 
-        r.delete(state_key(node_id, "idle"))
+        _clear_idle_flag(r, node_id, "user_prompt")
         r.set(state_key(node_id, "last_activity"), str(time.time()))
-        try:
-            from notifications.trace import trace
-            trace(r, "idle_clear", node=node_id)
-        except Exception:
-            pass
     except Exception as e:
         log_debug(node_id, f"action_user_prompt error: {e}")
 

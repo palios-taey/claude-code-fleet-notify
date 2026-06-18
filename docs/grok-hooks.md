@@ -39,3 +39,9 @@ need `/hooks-trust`.
 The critical boot fix is `SessionStart`: it sets `taey:<node>:idle=1`
 immediately on launch so the notify daemon can inject work before the first
 manual or bootstrap prompt.
+
+Current Grok wiring does not include a tool-activity hook in
+`templates/grok/cf-notify.json`; only prompt submission can clear idle after a
+Grok stop. If Grok exposes stable `PreToolUse` / `PostToolUse` global hook
+events, add wrappers that call the shared tool actions so active Grok tool loops
+clear idle the same way Codex and Gemini do.
