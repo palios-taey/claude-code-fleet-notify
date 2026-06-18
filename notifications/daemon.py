@@ -61,6 +61,13 @@ DEFAULT_INJECT_FAILURE_ESCALATION_TTL_SECS = 900
 MAX_MESSAGE_LENGTH = 4000
 DEFAULT_PEER_INACTIVE_STALE_SECS = 300
 PEER_INACTIVE_DEDUP_SECS = 300
+ACTIVE_PANE_MARKERS = (
+    "esc to interrupt",
+    "ctrl-c to interrupt",
+    "ctrl+c to interrupt",
+    "press ctrl-c",
+    "press ctrl+c",
+)
 
 
 def get_local_tmux_sessions() -> list[str]:
@@ -83,6 +90,23 @@ def _clip_message(message: str) -> str:
     if len(message) <= MAX_MESSAGE_LENGTH:
         return message
     return message[: MAX_MESSAGE_LENGTH - 28].rstrip() + "\n...[notification block truncated]"
+
+
+def session_pane_looks_active(session_name: str, *, lines: int = 12) -> bool:
+    """Return True when the live tmux pane shows a tool/agent activity marker."""
+    try:
+        result = subprocess.run(
+            ["tmux", "capture-pane", "-p", "-J", "-S", f"-{max(1, int(lines))}", "-t", session_name],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+    except Exception:
+        return False
+    if result.returncode != 0:
+        return False
+    recent = "\n".join(line.strip().lower() for line in result.stdout.splitlines() if line.strip())
+    return any(marker in recent for marker in ACTIVE_PANE_MARKERS)
 
 
 def inject_via_tmux(session_name: str, message: str) -> bool:
@@ -471,6 +495,9 @@ def run_daemon(
                     continue
                 now = time.time()
                 if not can_inject_pointer(r, node_id, now=now):
+                    continue
+                if session_pane_looks_active(session_name):
+                    logger.info("Skipping pointer inject for active pane: %s", session_name)
                     continue
 
                 # Per-session inject backoff. The inbox signature changes when a

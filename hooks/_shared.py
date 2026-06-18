@@ -194,13 +194,13 @@ def get_redis_and_node():
 # ---- the four state-machine actions ----
 
 def action_pre_tool(r, node_id: str, tool_name: str = "") -> None:
-    """PreToolUse / BeforeTool: set tool_running flag with 60s TTL safety net,
+    """PreToolUse / BeforeTool: set tool_running flag with max-tool TTL safety net,
     stamp activity keys. Same semantics as Claude's pre_tool_activity.py."""
     try:
-        from notifications.inbox import state_key
+        from notifications.inbox import DEFAULT_TOOL_TTL, state_key
 
         now = str(time.time())
-        r.set(state_key(node_id, "tool_running"), "1", ex=60)
+        r.set(state_key(node_id, "tool_running"), "1", ex=DEFAULT_TOOL_TTL)
         r.set(state_key(node_id, "last_activity"), now)
         r.set(state_key(node_id, "last_tool_activity"), now)
         log_debug(node_id, f"PRE-TOOL: tool={tool_name}")

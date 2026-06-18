@@ -11,8 +11,9 @@ Delivery paths
 1. Active sessions: PostToolUse hook drains queues inline and renders the payload via
    ``hookSpecificOutput.additionalContext``.
 2. Stopped sessions: notification daemon injects a Redis pointer via ``scripts/tmux-send``
-   when the explicit idle flag is set, or when recent activity is stale and no tool is
-   running. Queues are drained only by recipient hooks after a real prompt/tool event.
+   when the explicit idle flag is set, or when recent activity is stale beyond the
+   maximum tool window and no tool is running. Queues are drained only by recipient
+   hooks after a real prompt/tool event.
 
 The helpers in this module intentionally avoid ``DELETE``-ing whole queues during normal
 operation because that can drop messages that arrive between a destructive peek and the
@@ -26,8 +27,9 @@ import time
 import uuid
 from typing import Any, Dict, Iterable, Optional
 
-DEFAULT_TOOL_TTL = 60
-DEFAULT_INJECT_IDLE_GRACE_SEC = 90.0
+MAX_TOOL_RUNTIME_SEC = 600
+DEFAULT_TOOL_TTL = 900
+DEFAULT_INJECT_IDLE_GRACE_SEC = 900.0
 DEFAULT_KEY_PREFIX = os.environ.get("NOTIFY_KEY_PREFIX", "taey")
 WAKE_ALLOW_STOP = "ALLOW_STOP"
 WAKE_WITH_QUEUE = "WAKE_WITH_QUEUE"
@@ -355,7 +357,7 @@ def mark_activity(redis_client, node_id: str) -> None:
 
 
 def set_tool_running(redis_client, node_id: str, ttl: int = DEFAULT_TOOL_TTL) -> None:
-    """Mark a node as mid-tool-call. TTL is a crash safety net."""
+    """Mark a node as mid-tool-call. TTL outlives max tool runtime and is only a crash safety net."""
     redis_client.set(state_key(node_id, "tool_running"), "1", ex=ttl)
     mark_activity(redis_client, node_id)
 
@@ -409,7 +411,8 @@ def can_inject_pointer(
 
     The explicit idle flag remains the fast path. If that best-effort flag is
     absent, the daemon may still inject only after the session has no active
-    tool-running marker and its last activity is older than the grace window.
+    tool-running marker and its last activity is older than a grace window that
+    exceeds the maximum tool runtime.
     """
     if redis_client.exists(state_key(node_id, "tool_running")):
         return False

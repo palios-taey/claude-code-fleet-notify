@@ -99,7 +99,7 @@ Tmux is used only when the session is stopped and `idle=1`, and it carries only 
 | `${NOTIFY_KEY_PREFIX:-taey}:SESSION:notifications` | monitor / worker queue, writers `RPUSH`, readers `LPOP` |
 | `${NOTIFY_KEY_PREFIX:-taey}:notify:SESSION:orch` | auxiliary queue, writers `RPUSH`, readers `LPOP` |
 | `${NOTIFY_KEY_PREFIX:-taey}:SESSION:idle` | durable idle flag set only by `Stop` |
-| `${NOTIFY_KEY_PREFIX:-taey}:SESSION:tool_running` | transient tool-running flag with 60s TTL |
+| `${NOTIFY_KEY_PREFIX:-taey}:SESSION:tool_running` | transient tool-running flag with 900s TTL, longer than the 600s max tool runtime |
 | `${NOTIFY_KEY_PREFIX:-taey}:SESSION:last_activity` | last hook activity timestamp |
 
 ## State rules
@@ -107,7 +107,7 @@ Tmux is used only when the session is stopped and `idle=1`, and it carries only 
 | Flag | Who sets it | Who clears it |
 |---|---|---|
 | `${NOTIFY_KEY_PREFIX:-taey}:SESSION:idle` | **Only** the `Stop` hook | `UserPromptSubmit` hook |
-| `${NOTIFY_KEY_PREFIX:-taey}:SESSION:tool_running` | `PreToolUse` hook | `PostToolUse` hook, `Stop` hook, or TTL |
+| `${NOTIFY_KEY_PREFIX:-taey}:SESSION:tool_running` | `PreToolUse` hook | `PostToolUse` hook, `Stop` hook, or 900s crash-safety TTL |
 | `${NOTIFY_KEY_PREFIX:-taey}:SESSION:last_activity` | hook activity | overwritten by later hook activity |
 
 Nothing else sets `idle=1`. The daemon never clears idle because tmux injection is not proof that the prompt was submitted.

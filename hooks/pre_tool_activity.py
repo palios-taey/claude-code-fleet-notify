@@ -14,7 +14,7 @@ import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from identity import detect_node_id, redis_connect
-from notifications.inbox import state_key
+from notifications.inbox import DEFAULT_TOOL_TTL, state_key
 
 
 def main():
@@ -26,7 +26,7 @@ def main():
     try:
         r = redis_connect()
         node_id = detect_node_id()
-        r.set(state_key(node_id, "tool_running"), "1", ex=60)  # 60s TTL, not 300
+        r.set(state_key(node_id, "tool_running"), "1", ex=DEFAULT_TOOL_TTL)
         now = str(time.time())
         r.set(state_key(node_id, "last_activity"), now)
         r.set(state_key(node_id, "last_tool_activity"), now)

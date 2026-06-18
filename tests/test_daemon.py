@@ -6,6 +6,7 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
+from hooks import _shared as shared
 from notifications import daemon
 from notifications.inbox import inbox_key, state_key
 from notifications.handoff import create_explicit_handoff, explicit_ack_key, explicit_handoff_key
@@ -13,14 +14,16 @@ from tests.fakes import FakeRedis
 
 
 class DaemonTests(unittest.TestCase):
-    def run_daemon_once(self, redis_client, sessions, *, inject_result=True, now=1000.0):
+    def run_daemon_once(self, redis_client, sessions, *, inject_result=True, now=1000.0,
+                        pane_active=False):
         fake_redis_module = SimpleNamespace(Redis=lambda **kwargs: redis_client)
         with mock.patch.dict(sys.modules, {"redis": fake_redis_module}):
             with mock.patch.object(daemon, "get_local_tmux_sessions", return_value=sessions):
-                with mock.patch.object(daemon, "inject_via_tmux", return_value=inject_result) as inject:
-                    with mock.patch.object(daemon.time, "time", return_value=now):
-                        with mock.patch.object(daemon.time, "sleep", side_effect=KeyboardInterrupt):
-                            daemon.run_daemon("127.0.0.1", 6379, 1)
+                with mock.patch.object(daemon, "session_pane_looks_active", return_value=pane_active):
+                    with mock.patch.object(daemon, "inject_via_tmux", return_value=inject_result) as inject:
+                        with mock.patch.object(daemon.time, "time", return_value=now):
+                            with mock.patch.object(daemon.time, "sleep", side_effect=KeyboardInterrupt):
+                                daemon.run_daemon("127.0.0.1", 6379, 1)
         return inject
 
     def test_build_pointer_summary_does_not_pop_messages(self):
@@ -33,6 +36,18 @@ class DaemonTests(unittest.TestCase):
         self.assertIn(inbox_key("session-b"), summary)
         self.assertEqual(1, r.llen(inbox_key("session-b")))
 
+    def test_session_pane_looks_active_detects_interrupt_marker(self):
+        result = SimpleNamespace(returncode=0, stdout="working\nEsc to interrupt\n")
+
+        with mock.patch.object(daemon.subprocess, "run", return_value=result):
+            self.assertTrue(daemon.session_pane_looks_active("active-session"))
+
+    def test_session_pane_looks_active_false_without_marker(self):
+        result = SimpleNamespace(returncode=0, stdout="stopped prompt\n")
+
+        with mock.patch.object(daemon.subprocess, "run", return_value=result):
+            self.assertFalse(daemon.session_pane_looks_active("stopped-session"))
+
     def test_run_daemon_injects_only_idle_sessions_with_messages(self):
         r = FakeRedis()
         r.set(state_key("idle-session", "idle"), "1")
@@ -42,9 +57,10 @@ class DaemonTests(unittest.TestCase):
         fake_redis_module = SimpleNamespace(Redis=lambda **kwargs: r)
         with mock.patch.dict(sys.modules, {"redis": fake_redis_module}):
             with mock.patch.object(daemon, "get_local_tmux_sessions", return_value=["idle-session", "busy-session"]):
-                with mock.patch.object(daemon, "inject_via_tmux", return_value=True) as inject:
-                    with mock.patch.object(daemon.time, "sleep", side_effect=KeyboardInterrupt):
-                        daemon.run_daemon("127.0.0.1", 6379, 1)
+                with mock.patch.object(daemon, "session_pane_looks_active", return_value=False):
+                    with mock.patch.object(daemon, "inject_via_tmux", return_value=True) as inject:
+                        with mock.patch.object(daemon.time, "sleep", side_effect=KeyboardInterrupt):
+                            daemon.run_daemon("127.0.0.1", 6379, 1)
 
         inject.assert_called_once()
         self.assertEqual("idle-session", inject.call_args.args[0])
@@ -64,7 +80,7 @@ class DaemonTests(unittest.TestCase):
             r.set(state_key(node_id, "last_activity"), "1000")
             r.lpush(inbox_key(node_id), json.dumps({"from": "sender", "type": "message", "body": node_id}))
 
-        inject = self.run_daemon_once(r, sessions, now=1100.0)
+        inject = self.run_daemon_once(r, sessions, now=2000.0)
 
         self.assertEqual(sessions, [call.args[0] for call in inject.call_args_list])
         for node_id in sessions:
@@ -76,17 +92,32 @@ class DaemonTests(unittest.TestCase):
         r.set(state_key("tool-running", "tool_running"), "1")
         r.set(state_key("tool-running", "last_activity"), "900")
         r.lpush(inbox_key("tool-running"), json.dumps({"from": "sender", "type": "message", "body": "tool"}))
-        r.set(state_key("recent-activity", "last_activity"), "1040")
+        r.set(state_key("recent-activity", "last_activity"), "1980")
         r.lpush(inbox_key("recent-activity"), json.dumps({"from": "sender", "type": "message", "body": "recent"}))
         r.lpush(inbox_key("unknown-activity"), json.dumps({"from": "sender", "type": "message", "body": "unknown"}))
 
         inject = self.run_daemon_once(
             r,
             ["tool-running", "recent-activity", "unknown-activity"],
-            now=1100.0,
+            now=2000.0,
         )
 
         inject.assert_not_called()
+
+    def test_expired_tool_marker_with_active_pane_does_not_inject_and_post_tool_drains(self):
+        r = FakeRedis()
+        r.set(state_key("long-tool", "last_activity"), "1000")
+        r.lpush(inbox_key("long-tool"), json.dumps({"from": "sender", "type": "message", "body": "queued"}))
+
+        inject = self.run_daemon_once(r, ["long-tool"], now=2000.0, pane_active=True)
+
+        inject.assert_not_called()
+        self.assertEqual(1, r.llen(inbox_key("long-tool")))
+
+        context = shared.action_post_tool(r, "long-tool", tool_name="Bash")
+
+        self.assertIn("queued", context)
+        self.assertEqual(0, r.llen(inbox_key("long-tool")))
 
     def test_failed_injection_leaves_message_and_idle_for_retry(self):
         r = FakeRedis()
@@ -96,9 +127,10 @@ class DaemonTests(unittest.TestCase):
         fake_redis_module = SimpleNamespace(Redis=lambda **kwargs: r)
         with mock.patch.dict(sys.modules, {"redis": fake_redis_module}):
             with mock.patch.object(daemon, "get_local_tmux_sessions", return_value=["session-b"]):
-                with mock.patch.object(daemon, "inject_via_tmux", return_value=False):
-                    with mock.patch.object(daemon.time, "sleep", side_effect=KeyboardInterrupt):
-                        daemon.run_daemon("127.0.0.1", 6379, 1)
+                with mock.patch.object(daemon, "session_pane_looks_active", return_value=False):
+                    with mock.patch.object(daemon, "inject_via_tmux", return_value=False):
+                        with mock.patch.object(daemon.time, "sleep", side_effect=KeyboardInterrupt):
+                            daemon.run_daemon("127.0.0.1", 6379, 1)
 
         self.assertEqual(1, r.llen(inbox_key("session-b")))
         self.assertTrue(r.exists(state_key("session-b", "idle")))
@@ -153,9 +185,10 @@ class DaemonTests(unittest.TestCase):
         fake_redis_module = SimpleNamespace(Redis=lambda **kwargs: r)
         with mock.patch.dict(sys.modules, {"redis": fake_redis_module}):
             with mock.patch.object(daemon, "get_local_tmux_sessions", return_value=["worker-codex"]):
-                with mock.patch.object(daemon, "inject_via_tmux", return_value=True):
-                    with mock.patch.object(daemon.time, "sleep", side_effect=KeyboardInterrupt):
-                        daemon.run_daemon("127.0.0.1", 6379, 1)
+                with mock.patch.object(daemon, "session_pane_looks_active", return_value=False):
+                    with mock.patch.object(daemon, "inject_via_tmux", return_value=True):
+                        with mock.patch.object(daemon.time, "sleep", side_effect=KeyboardInterrupt):
+                            daemon.run_daemon("127.0.0.1", 6379, 1)
 
         record = json.loads(r.get(record_key))
         self.assertEqual("injected_waiting_ack", record["delivery_state"])
@@ -498,10 +531,11 @@ class DaemonTests(unittest.TestCase):
 
         with mock.patch.dict(sys.modules, {"redis": fake_redis_module}):
             with mock.patch.object(daemon, "get_local_tmux_sessions", return_value=["wedged"]):
-                with mock.patch.object(daemon, "inject_via_tmux", return_value=True) as inject:
-                    with mock.patch.object(daemon.time, "time", return_value=1000.0):
-                        with mock.patch.object(daemon.time, "sleep", side_effect=stop_after_five):
-                            daemon.run_daemon("127.0.0.1", 6379, 1)
+                with mock.patch.object(daemon, "session_pane_looks_active", return_value=False):
+                    with mock.patch.object(daemon, "inject_via_tmux", return_value=True) as inject:
+                        with mock.patch.object(daemon.time, "time", return_value=1000.0):
+                            with mock.patch.object(daemon.time, "sleep", side_effect=stop_after_five):
+                                daemon.run_daemon("127.0.0.1", 6379, 1)
 
         # 5 polls, same time, unchanged inbox -> exactly one inject (backoff held)
         inject.assert_called_once()
@@ -526,10 +560,11 @@ class DaemonTests(unittest.TestCase):
 
         with mock.patch.dict(sys.modules, {"redis": fake_redis_module}):
             with mock.patch.object(daemon, "get_local_tmux_sessions", return_value=["wedged"]):
-                with mock.patch.object(daemon, "inject_via_tmux", return_value=True) as inject:
-                    with mock.patch.object(daemon.time, "time", return_value=1001.0):
-                        with mock.patch.object(daemon.time, "sleep", side_effect=KeyboardInterrupt):
-                            daemon.run_daemon("127.0.0.1", 6379, 1)
+                with mock.patch.object(daemon, "session_pane_looks_active", return_value=False):
+                    with mock.patch.object(daemon, "inject_via_tmux", return_value=True) as inject:
+                        with mock.patch.object(daemon.time, "time", return_value=1001.0):
+                            with mock.patch.object(daemon.time, "sleep", side_effect=KeyboardInterrupt):
+                                daemon.run_daemon("127.0.0.1", 6379, 1)
 
         # within the backoff window BUT signature changed -> injects promptly
         inject.assert_called_once()
