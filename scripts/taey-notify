@@ -9,6 +9,7 @@ Delivery is handled automatically by:
 
 Usage:
     taey-notify <target-node> "message"
+    taey-notify "DEFECT: scoped issue" --type defect
     taey-notify <target-node> "ESCALATION: something broke" --type escalation
     taey-notify <target-node> "cycle done" --type heartbeat --priority low
 """
@@ -29,6 +30,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 REDIS_HOST = os.environ.get('REDIS_HOST', '127.0.0.1')
 REDIS_PORT = int(os.environ.get('REDIS_PORT', '6379'))
 NOTIFY_KEY_PREFIX = os.environ.get('NOTIFY_KEY_PREFIX', 'taey')
+DEFAULT_TARGET_TYPES = {'defect', 'response_ready', 'result', 'status', 'escalation'}
 
 
 def detect_from_node():
@@ -49,12 +51,43 @@ def detect_from_node():
     return socket.gethostname()
 
 
+def resolve_target_and_message(args, from_node, redis_client):
+    if args.message is not None:
+        return args.target_or_message, args.message
+    if args.type not in DEFAULT_TARGET_TYPES:
+        print(
+            "ERROR: target is required for this message type. "
+            "For peer defect/status/result reports, use --type defect/status/result "
+            "or set NOTIFY_TARGET explicitly.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+    from notifications.targets import default_notify_target
+
+    target = default_notify_target(
+        redis_client,
+        from_node,
+        explicit_target=os.environ.get("NOTIFY_TARGET"),
+        prefix=args.key_prefix,
+    )
+    if not target:
+        print(
+            "ERROR: target omitted and no NOTIFY_TARGET or parent session resolved. "
+            "Pass an explicit target or set taey:<node>:parent.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    return target, args.target_or_message
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Send notification to a Claude instance's Redis inbox",
     )
-    parser.add_argument('target', help='Target node ID (e.g. session-a, build-worker)')
-    parser.add_argument('message', help='Message body')
+    parser.add_argument('target_or_message',
+                        help='Target node ID, or message body for peer report types')
+    parser.add_argument('message', nargs='?', help='Message body')
     parser.add_argument('--type', '-t', default='message',
                         choices=['message', 'escalation', 'heartbeat', 'notification',
                                  'response_ready', 'command', 'defect', 'task',
@@ -101,6 +134,7 @@ def main():
         print(f"ERROR: Cannot connect to Redis at {args.redis_host}:{args.redis_port}: {e}",
               file=sys.stderr)
         sys.exit(1)
+    target, message = resolve_target_and_message(args, from_node, r)
     if args.handoff:
         from notifications.handoff import create_explicit_handoff
 
@@ -118,8 +152,8 @@ def main():
             r,
             prefix=args.key_prefix,
             dispatcher_session_id=from_node,
-            target_session_id=args.target,
-            body=args.message,
+            target_session_id=target,
+            body=message,
             msg_type=args.type,
             priority=args.priority,
             dispatcher_task_id=args.dispatcher_task_id,
@@ -131,23 +165,23 @@ def main():
         msg = json.dumps({
             "from": from_node,
             "type": args.type,
-            "body": args.message,
+            "body": message,
             "timestamp": time.time(),
             "priority": args.priority,
             "msg_id": uuid.uuid4().hex[:12],
         })
-        r.lpush(f"{args.key_prefix}:{args.target}:inbox", msg)
+        r.lpush(f"{args.key_prefix}:{target}:inbox", msg)
         msg_id = json.loads(msg)["msg_id"]
     try:
         r.xadd(
             f"{args.key_prefix}:notify_trace",
-            {"ev": "enqueue", "node": args.target, "src": "taey-notify",
+            {"ev": "enqueue", "node": target, "src": "taey-notify",
              "type": args.type, "frm": from_node, "wall": f"{time.time():.3f}", "msg_id": msg_id},
             maxlen=50000, approximate=True,
         )
     except Exception:
         pass
-    print(f"OK: sent to {args.target} [{args.type}] from {from_node}")
+    print(f"OK: sent to {target} [{args.type}] from {from_node}")
 
 
 if __name__ == '__main__':
