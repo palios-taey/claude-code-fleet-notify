@@ -174,6 +174,16 @@ taey-notify session-b "production deploy failed" --type escalation
 taey-notify session-b "cycle done" --type heartbeat --priority low
 ```
 
+Peer defect/status/result reports may omit the target. In that report path,
+`NOTIFY_TARGET` remains an explicit override; otherwise the sender's parent is
+resolved with the same rule as the Stop hook (`taey:<node>:parent`, then
+`<parent>-codex` / `<parent>-gemini` / `<parent>-grok` suffix stripping):
+
+```bash
+TAEY_NODE_ID=weaver-codex taey-notify "DEFECT: debug defect" --type defect
+# routes to weaver, not conductor
+```
+
 Read your own inbox:
 
 ```bash

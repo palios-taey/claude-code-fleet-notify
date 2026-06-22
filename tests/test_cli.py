@@ -137,6 +137,77 @@ class CliTests(unittest.TestCase):
             self.assertEqual("hello", msg["body"])
             self.assertEqual([], [key for key in data if ":handoff:" in key])
 
+    def test_peer_defect_without_target_routes_to_parent_not_conductor(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_dir = Path(tmp)
+            (fake_dir / "redis.py").write_text(FAKE_REDIS)
+            state = fake_dir / "state.json"
+            env = os.environ.copy()
+            env.update({
+                "PYTHONPATH": f"{fake_dir}:{ROOT}",
+                "FAKE_REDIS_STATE": str(state),
+                "TAEY_NODE_ID": "weaver-codex",
+            })
+
+            self.run_cli(
+                ["scripts/taey-notify", "DEFECT: debug defect", "--type", "defect"],
+                env,
+            )
+
+            data = json.loads(state.read_text())
+            self.assertIn("taey:weaver:inbox", data)
+            self.assertNotIn("taey:conductor:inbox", data)
+            raw = data["taey:weaver:inbox"][0]
+            msg = json.loads(raw)
+            self.assertEqual("weaver-codex", msg["from"])
+            self.assertEqual("defect", msg["type"])
+            self.assertEqual("DEFECT: debug defect", msg["body"])
+
+    def test_peer_report_without_target_honors_explicit_parent_override(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_dir = Path(tmp)
+            (fake_dir / "redis.py").write_text(FAKE_REDIS)
+            state = fake_dir / "state.json"
+            state.write_text(json.dumps({"taey:weaver-codex:parent": "reviewer"}))
+            env = os.environ.copy()
+            env.update({
+                "PYTHONPATH": f"{fake_dir}:{ROOT}",
+                "FAKE_REDIS_STATE": str(state),
+                "TAEY_NODE_ID": "weaver-codex",
+            })
+
+            self.run_cli(
+                ["scripts/taey-notify", "ready for gate", "--type", "status"],
+                env,
+            )
+
+            data = json.loads(state.read_text())
+            self.assertIn("taey:reviewer:inbox", data)
+            self.assertNotIn("taey:weaver:inbox", data)
+
+    def test_non_report_without_target_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_dir = Path(tmp)
+            (fake_dir / "redis.py").write_text(FAKE_REDIS)
+            state = fake_dir / "state.json"
+            env = os.environ.copy()
+            env.update({
+                "PYTHONPATH": f"{fake_dir}:{ROOT}",
+                "FAKE_REDIS_STATE": str(state),
+                "TAEY_NODE_ID": "weaver-codex",
+            })
+
+            proc = subprocess.run(
+                [sys.executable, "scripts/taey-notify", "plain message"],
+                cwd=ROOT,
+                env=env,
+                text=True,
+                capture_output=True,
+            )
+
+            self.assertNotEqual(0, proc.returncode)
+            self.assertIn("target is required", proc.stderr)
+
     def test_taey_notify_handoff_creates_scoped_record_with_uuid(self):
         with tempfile.TemporaryDirectory() as tmp:
             fake_dir = Path(tmp)

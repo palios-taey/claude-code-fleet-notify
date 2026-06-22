@@ -21,6 +21,10 @@ Targets are arbitrary strings. There is no allowlist. A practical fleet might us
 
 - **tmux-session participants** are REPL-CLI sessions with the four hooks installed. Supported CLIs: Claude Code, OpenAI codex, Google gemini, and xAI grok (see "Per-CLI hook integration" below for config-file paths and event-name mappings). The daemon injects a pointer prompt through tmux only when the session is stopped and marked idle.
 - **headless participants** read Redis directly. They do not use hooks, tmux injection, or `idle` state. They poll `${NOTIFY_KEY_PREFIX:-taey}:<name>:inbox` and reply with `taey-notify <target> --from <name>`.
+- **peer defect/status/result reports** may omit `<target>`. In that path,
+  `NOTIFY_TARGET` wins as an explicit override; otherwise the CLI derives the
+  same parent as the Stop hook. A per-parent peer such as `weaver-codex`
+  therefore reports to `weaver`, not `conductor`.
 
 ## Dual delivery path — the canonical dispatch pattern for tmux participants
 
