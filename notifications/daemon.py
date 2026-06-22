@@ -58,6 +58,8 @@ POINTER_INJECT_BACKOFF_SECS = 90
 DEFAULT_INJECT_FAILURE_ESCALATE_AFTER = 3
 DEFAULT_INJECT_FAILURE_ESCALATION_TTL_SECS = 900
 MAX_MESSAGE_LENGTH = 4000
+DAEMON_HEARTBEAT_NODE = "_notify_daemon"
+DAEMON_HEARTBEAT_SUFFIX = "heartbeat"
 
 
 def get_local_tmux_sessions() -> list[str]:
@@ -126,6 +128,13 @@ def _int_or_zero(value) -> int:
         return int(value)
     except (TypeError, ValueError):
         return 0
+
+
+def write_daemon_heartbeat(r, machine: str, *, now: float | None = None) -> str:
+    ts = time.time() if now is None else float(now)
+    value = f"{ts:.6f}+{machine}"
+    r.set(state_key(DAEMON_HEARTBEAT_NODE, DAEMON_HEARTBEAT_SUFFIX), value)
+    return value
 
 
 def _record_pointer_inject_result(r, node_id: str, *, ok: bool,
@@ -343,6 +352,10 @@ def run_daemon(
             local_sessions = get_local_tmux_sessions()
             local_session_set = set(local_sessions)
             machine = socket.gethostname()
+            try:
+                write_daemon_heartbeat(r, machine, now=time.time())
+            except Exception as exc:
+                logger.error("daemon heartbeat write failed: %s", exc)
 
             try:
                 validate_handoff_activation(r, prefix=key_prefix())

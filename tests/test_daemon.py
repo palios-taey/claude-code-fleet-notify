@@ -52,6 +52,19 @@ class DaemonTests(unittest.TestCase):
         self.assertEqual(1, r.llen(inbox_key("idle-session")))
         self.assertTrue(r.exists(state_key("idle-session", "idle")))
 
+    def test_run_daemon_writes_heartbeat_each_poll(self):
+        r = FakeRedis()
+
+        fake_redis_module = SimpleNamespace(Redis=lambda **kwargs: r)
+        with mock.patch.dict(sys.modules, {"redis": fake_redis_module}):
+            with mock.patch.object(daemon, "get_local_tmux_sessions", return_value=[]):
+                with mock.patch.object(daemon.socket, "gethostname", return_value="notify-host"):
+                    with mock.patch.object(daemon.time, "time", return_value=1234.5):
+                        with mock.patch.object(daemon.time, "sleep", side_effect=KeyboardInterrupt):
+                            daemon.run_daemon("127.0.0.1", 6379, 1)
+
+        self.assertEqual("1234.500000+notify-host", r.get(state_key("_notify_daemon", "heartbeat")))
+
     def test_idle_flagged_session_injects_even_with_tool_running_and_activity_markers(self):
         r = FakeRedis()
         r.set(state_key("idle-session", "idle"), "1")
