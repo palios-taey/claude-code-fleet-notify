@@ -198,6 +198,10 @@ def _clear_idle_flag(r, node_id: str, src: str) -> None:
 
     r.delete(state_key(node_id, "idle"))
     try:
+        _clear_no_task_peer_idle_markers(r, node_id)
+    except Exception as exc:
+        log_debug(node_id, f"peer-idle marker clear failed (non-fatal): {exc}")
+    try:
         from notifications.trace import trace
         trace(r, "idle_clear", node=node_id, src=src)
     except Exception:
@@ -364,6 +368,21 @@ def _stop_event_dedup_key(r, node_id: str, task_id: Optional[str]) -> str:
     return f"{key_prefix()}:peer-idle-notified:{node_id}:{task_bucket}:{stop_stamp}"
 
 
+def _no_task_peer_idle_marker_key(node_id: str, supervisor: str) -> str:
+    from notifications.inbox import key_prefix
+
+    return f"{key_prefix()}:peer_idle_sent:{node_id}:{supervisor}"
+
+
+def _clear_no_task_peer_idle_markers(r, node_id: str) -> None:
+    from notifications.inbox import key_prefix
+
+    pattern = f"{key_prefix()}:peer_idle_sent:{node_id}:*"
+    keys = list(r.scan_iter(match=pattern))
+    if keys:
+        r.delete(*keys)
+
+
 def _current_task_summary(r, node_id: str):
     """Build a short summary of the worker's just-completed task, if any.
 
@@ -489,8 +508,9 @@ def _notify_supervisor_of_stop(r, node_id: str, supervisor: str) -> None:
     so the supervisor sees the result inline without context-switching to
     the worker pane.
 
-    Dedup is keyed per stop event. The task/no-task bucket alone is not a
-    dedup key: distinct no-task stops must still wake the supervisor.
+    Task and outcome handoff dedup is keyed per stop event. Bare no-task
+    ``peer_idle`` is deduped per idle transition: already-idle re-stops
+    suppress until activity clears the marker.
 
     Persistence rule (Gaia, Phase A consultation 2026-05-26): clear
     current_task ONLY when the outcome is explicitly ``done``. Any other
@@ -550,15 +570,25 @@ def _notify_supervisor_of_stop(r, node_id: str, supervisor: str) -> None:
             stale_task_reason = f"observed current_task {observed_task_id} is not active; reporting stop without task claim"
 
         dedup_suffix = reported_task_id or "no-task"
-        dedup = _stop_event_dedup_key(r, node_id, dedup_suffix)
-        if r.exists(dedup):
-            return
+        bare_no_task_peer_idle = (
+            reported_task_id is None
+            and stale_task_reason is None
+            and observed_outcome_struct is None
+        )
+        peer_idle_dedup = (
+            _no_task_peer_idle_marker_key(node_id, supervisor)
+            if bare_no_task_peer_idle
+            else _stop_event_dedup_key(r, node_id, dedup_suffix)
+        )
+        stop_event_dedup = _stop_event_dedup_key(r, node_id, dedup_suffix)
 
         decision = _take_cached_stop_decision(r, node_id)
         if decision is None:
             decision = fetch_stop_decision(node_id)
 
         if decision is None:
+            if r.exists(peer_idle_dedup):
+                return
             blocked_on = _resolve_blocked_on(observed_task_id)
             if blocked_on:
                 log_debug(node_id, f"STOP: reporting blocked_on stop for {node_id}: blocked_on={blocked_on}")
@@ -583,7 +613,10 @@ def _notify_supervisor_of_stop(r, node_id: str, supervisor: str) -> None:
                 "stale_task_id": (observed_task_id if stale_task_reason else None),
             })
             r.lpush(inbox_key(supervisor), msg)
-            r.set(dedup, "1", ex=60)
+            if bare_no_task_peer_idle:
+                r.set(peer_idle_dedup, "1")
+            else:
+                r.set(peer_idle_dedup, "1", ex=60)
             if outcome == "done" and observed_task_id:
                 try:
                     r.eval(
@@ -598,6 +631,8 @@ def _notify_supervisor_of_stop(r, node_id: str, supervisor: str) -> None:
             return
 
         if decision.get("wake_type") == WAKE_ALLOW_STOP:
+            if r.exists(peer_idle_dedup):
+                return
             body = f"{node_id} stopped — {summary}" if reported_task and summary else f"{node_id} stopped — no current task recorded"
             if stale_task_reason:
                 body = f"{body}; {stale_task_reason}"
@@ -618,7 +653,10 @@ def _notify_supervisor_of_stop(r, node_id: str, supervisor: str) -> None:
                 "stale_task_id": (observed_task_id if stale_task_reason else None),
             })
             r.lpush(inbox_key(supervisor), msg)
-            r.set(dedup, "1", ex=60)
+            if bare_no_task_peer_idle:
+                r.set(peer_idle_dedup, "1")
+            else:
+                r.set(peer_idle_dedup, "1", ex=60)
             if outcome == "done" and observed_task_id:
                 try:
                     cleared = r.eval(
@@ -645,6 +683,8 @@ def _notify_supervisor_of_stop(r, node_id: str, supervisor: str) -> None:
             priority = "low"
 
         reason = decision.get("reason")
+        if r.exists(stop_event_dedup):
+            return
         msg_obj = {
             "from": node_id,
             "type": "wake",
@@ -685,7 +725,7 @@ def _notify_supervisor_of_stop(r, node_id: str, supervisor: str) -> None:
 
         msg = json.dumps(msg_obj)
         r.lpush(inbox_key(supervisor), msg)
-        r.set(dedup, "1", ex=60)
+        r.set(stop_event_dedup, "1", ex=60)
 
         # Clear ONLY on confirmed completion, AND only if the observed
         # task_id still matches what's in Redis (CAS). If a fresh dispatch

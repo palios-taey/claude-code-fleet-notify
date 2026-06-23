@@ -163,7 +163,7 @@ class StopHookTests(HookTestCase):
         self.assertEqual("task-orphan", msg["stale_task_id"])
         self.assertIn("not active", msg["body"])
 
-    def test_allow_stop_dedups_same_stop_event_but_not_later_no_task_stop(self):
+    def test_allow_stop_dedups_no_task_peer_idle_until_activity(self):
         r = FakeRedis()
 
         with mock.patch.object(shared, "fetch_stop_decision", return_value={
@@ -175,10 +175,52 @@ class StopHookTests(HookTestCase):
             shared._notify_supervisor_of_stop(r, "worker-codex", "conductor")
             shared._notify_supervisor_of_stop(r, "worker-codex", "conductor")
             self.assertEqual(1, r.llen(inbox_key("conductor")))
+            marker_key = shared._no_task_peer_idle_marker_key("worker-codex", "conductor")
+            self.assertEqual("1", r.get(marker_key))
 
             r.set(state_key("worker-codex", "last_activity"), "1001.0")
             shared._notify_supervisor_of_stop(r, "worker-codex", "conductor")
+            self.assertEqual(1, r.llen(inbox_key("conductor")))
+
+            shared.action_user_prompt(r, "worker-codex")
+            self.assertNotIn(marker_key, r.store)
+
+            r.set(state_key("worker-codex", "last_activity"), "1002.0")
+            shared._notify_supervisor_of_stop(r, "worker-codex", "conductor")
             self.assertEqual(2, r.llen(inbox_key("conductor")))
+
+    def test_no_task_peer_idle_marker_does_not_suppress_task_handoff(self):
+        r = FakeRedis()
+
+        with mock.patch.object(shared, "fetch_stop_decision", return_value={
+            "wake_type": shared.WAKE_ALLOW_STOP,
+            "block": False,
+            "reason": None,
+        }):
+            r.set(state_key("worker-codex", "last_activity"), "1000.0")
+            shared._notify_supervisor_of_stop(r, "worker-codex", "conductor")
+            self.assertEqual(1, r.llen(inbox_key("conductor")))
+
+            r.set(state_key("worker-codex", "last_activity"), "1001.0")
+            r.set(state_key("worker-codex", "current_task"), json.dumps({
+                "task_id": "task-done",
+                "description": "completed task",
+                "supervisor": "conductor",
+                "started_at": "1000",
+            }))
+            r.set(state_key("worker-codex", "last_outcome"), json.dumps({
+                "outcome": "done",
+                "details": "completed cleanly",
+            }))
+            with mock.patch.object(shared, "peer_idle_allowed", return_value=(True, "in_progress", {"status": "in_progress"})):
+                shared._notify_supervisor_of_stop(r, "worker-codex", "conductor")
+
+        self.assertEqual(2, r.llen(inbox_key("conductor")))
+        msg = r.decoded_list(inbox_key("conductor"))[0]
+        self.assertEqual("peer_idle", msg["type"])
+        self.assertEqual("task-done", msg["task_id"])
+        self.assertEqual("done", msg["outcome"])
+        self.assertEqual("completed cleanly", msg["outcome_details"])
 
     def test_allow_stop_self_supervisor_suppresses_peer_idle(self):
         r = FakeRedis()
