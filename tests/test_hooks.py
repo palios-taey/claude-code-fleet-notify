@@ -3,9 +3,13 @@ from __future__ import annotations
 import importlib
 import io
 import json
+import os
+import subprocess
 import sys
+import tempfile
 import unittest
 from contextlib import redirect_stdout
+from pathlib import Path
 from unittest import mock
 
 from hooks import _shared as shared
@@ -397,6 +401,219 @@ class PreToolUseHookTests(HookTestCase):
                 self.assertIn(state_key("session-b", "idle"), r.deleted)
                 self.assertFalse(r.exists(state_key("session-b", "idle")))
                 self.assertIn(state_key("session-b", "last_tool_activity"), r.store)
+
+
+class LivePathGuardTests(HookTestCase):
+    def live_registry(self, td: Path) -> tuple[Path, Path, Path]:
+        live = td / "live" / "the-conductor"
+        worktree = td / ".peer-worktrees" / "conductor-codex-task"
+        registry_path = td / "live_path_registry.json"
+        live.mkdir(parents=True)
+        worktree.mkdir(parents=True)
+        registry_path.write_text(json.dumps({
+            "live_checkout_paths": [str(live)],
+            "worktree_roots": [str(td / ".peer-worktrees")],
+            "live_db_endpoints": [
+                {"kind": "neo4j", "host": "127.0.0.1", "port": 7689},
+                {"kind": "redis", "host": "127.0.0.1", "port": 6379},
+            ],
+        }))
+        return registry_path, live, worktree
+
+    def test_live_checkout_destructive_operations_are_blocked(self):
+        with tempfile.TemporaryDirectory() as raw_td:
+            registry, live, _worktree = self.live_registry(Path(raw_td))
+            with mock.patch.dict(os.environ, {"CF_LIVE_PATH_REGISTRY": str(registry)}, clear=False):
+                cases = [
+                    ("git commit -m fix", "git commit"),
+                    ("rm -rf scratch", "rm"),
+                    ("cypher-shell -a bolt://127.0.0.1:7689 'MATCH (n) DETACH DELETE n'", "Neo4j"),
+                    ("redis-cli DEL task:key", "Redis"),
+                ]
+                for command, expected in cases:
+                    with self.subTest(command=command):
+                        allowed, reason = shared.live_guard_decision(
+                            str(live), "Bash", {"command": command}
+                        )
+                        self.assertFalse(allowed)
+                        self.assertIn("BLOCKED:", reason)
+                        self.assertIn(expected, reason)
+
+    def test_worktree_and_read_only_operations_are_allowed(self):
+        with tempfile.TemporaryDirectory() as raw_td:
+            registry, live, worktree = self.live_registry(Path(raw_td))
+            with mock.patch.dict(os.environ, {"CF_LIVE_PATH_REGISTRY": str(registry)}, clear=False):
+                for command in ("git commit -m fix", "rm -rf scratch"):
+                    with self.subTest(worktree_command=command):
+                        allowed, reason = shared.live_guard_decision(
+                            str(worktree), "Bash", {"command": command}
+                        )
+                        self.assertTrue(allowed, reason)
+
+                for command in ("git status --short", "ls -la"):
+                    with self.subTest(live_read_only=command):
+                        allowed, reason = shared.live_guard_decision(
+                            str(live), "Bash", {"command": command}
+                        )
+                        self.assertTrue(allowed, reason)
+
+    def test_live_checkout_allows_only_ff_only_deploy_sync(self):
+        with tempfile.TemporaryDirectory() as raw_td:
+            registry, live, _worktree = self.live_registry(Path(raw_td))
+            subprocess.run(
+                ["git", "init", "-b", "main", str(live)],
+                check=True,
+                capture_output=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(live), "config", "user.email", "test@example.invalid"],
+                check=True,
+                capture_output=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(live), "config", "user.name", "Test User"],
+                check=True,
+                capture_output=True,
+            )
+            (live / "README.md").write_text("test\n")
+            subprocess.run(
+                ["git", "-C", str(live), "add", "README.md"],
+                check=True,
+                capture_output=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(live), "commit", "-m", "init"],
+                check=True,
+                capture_output=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(live), "config", "branch.main.remote", "origin"],
+                check=True,
+                capture_output=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(live), "config", "branch.main.merge", "refs/heads/main"],
+                check=True,
+                capture_output=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(live), "config", "pull.ff", "only"],
+                check=True,
+                capture_output=True,
+            )
+            with mock.patch.dict(os.environ, {"CF_LIVE_PATH_REGISTRY": str(registry)}, clear=False):
+                allowed_cases = (
+                    "git merge --ff-only origin/main",
+                    "git pull --ff-only",
+                    "git pull",
+                )
+                for command in allowed_cases:
+                    with self.subTest(allowed_command=command):
+                        allowed, reason = shared.live_guard_decision(
+                            str(live), "Bash", {"command": command}
+                        )
+                        self.assertTrue(allowed, reason)
+
+                denied_cases = (
+                    "git merge origin/main",
+                    "git merge --ff-only origin/feature",
+                    "git pull origin feature",
+                    "git reset --hard",
+                )
+                for command in denied_cases:
+                    with self.subTest(denied_command=command):
+                        allowed, reason = shared.live_guard_decision(
+                            str(live), "Bash", {"command": command}
+                        )
+                        self.assertFalse(allowed)
+                        self.assertIn("BLOCKED:", reason)
+
+    def test_absolute_live_target_blocks_from_non_live_cwd(self):
+        with tempfile.TemporaryDirectory() as raw_td:
+            registry, live, _worktree = self.live_registry(Path(raw_td))
+            with mock.patch.dict(os.environ, {"CF_LIVE_PATH_REGISTRY": str(registry)}, clear=False):
+                allowed, reason = shared.live_guard_decision(
+                    raw_td, "Bash", {"command": f"rm -rf {live / 'data'}"}
+                )
+            self.assertFalse(allowed)
+            self.assertIn(str(live), reason)
+
+    def test_explicit_non_live_db_port_is_allowed(self):
+        with tempfile.TemporaryDirectory() as raw_td:
+            registry, _live, _worktree = self.live_registry(Path(raw_td))
+            other = Path(raw_td) / "other"
+            other.mkdir()
+            with mock.patch.dict(os.environ, {"CF_LIVE_PATH_REGISTRY": str(registry)}, clear=False):
+                for command in (
+                    "redis-cli --port=6380 DEL task:key",
+                    "cypher-shell -a bolt://127.0.0.1:17689 'MATCH (n) DETACH DELETE n'",
+                ):
+                    with self.subTest(command=command):
+                        allowed, reason = shared.live_guard_decision(
+                            str(other), "Bash", {"command": command}
+                        )
+                        self.assertTrue(allowed, reason)
+
+    def test_registry_missing_and_parse_errors_allow_loudly(self):
+        with tempfile.TemporaryDirectory() as raw_td:
+            missing = str(Path(raw_td) / "missing.json")
+            with mock.patch.dict(os.environ, {"CF_LIVE_PATH_REGISTRY": missing}, clear=False):
+                allowed, reason = shared.live_guard_decision(
+                    raw_td, "Bash", {"command": "git commit -m fix"}
+                )
+                self.assertTrue(allowed)
+                self.assertIn("registry file absent", reason)
+
+            registry, live, _worktree = self.live_registry(Path(raw_td))
+            with mock.patch.dict(os.environ, {"CF_LIVE_PATH_REGISTRY": str(registry)}, clear=False):
+                allowed, reason = shared.live_guard_decision(
+                    str(live), "Bash", {"command": 'rm "unterminated'}
+                )
+                self.assertTrue(allowed)
+                self.assertIn("unparseable shell command allowed", reason)
+
+    def test_internal_guard_error_allows_loudly(self):
+        with mock.patch.object(
+            shared, "_live_guard_load_registry", side_effect=RuntimeError("boom")
+        ):
+            allowed, reason = shared.live_guard_decision(
+                "/", "Bash", {"command": "git commit -m fix"}
+            )
+
+        self.assertTrue(allowed)
+        self.assertIn("internal error fail-open", reason)
+
+    def test_claude_codex_hook_emits_permission_denial(self):
+        with tempfile.TemporaryDirectory() as raw_td:
+            registry, live, _worktree = self.live_registry(Path(raw_td))
+            payload = {
+                "cwd": str(live),
+                "hook_event_name": "PreToolUse",
+                "tool_name": "Bash",
+                "tool_input": {"command": "git commit -m fix"},
+            }
+            with mock.patch.dict(os.environ, {"CF_LIVE_PATH_REGISTRY": str(registry)}, clear=False):
+                result = self.run_hook("hooks.pre_tool_live_guard", FakeRedis(), json.dumps(payload))
+
+        output = result["hookSpecificOutput"]
+        self.assertEqual("PreToolUse", output["hookEventName"])
+        self.assertEqual("deny", output["permissionDecision"])
+        self.assertIn("LIVE checkout", output["permissionDecisionReason"])
+
+    def test_gemini_hook_emits_top_level_block_decision(self):
+        with tempfile.TemporaryDirectory() as raw_td:
+            registry, live, _worktree = self.live_registry(Path(raw_td))
+            payload = {
+                "cwd": str(live),
+                "hook_event_name": "BeforeTool",
+                "tool_name": "run_shell_command",
+                "tool_input": {"command": "rm -rf scratch"},
+            }
+            with mock.patch.dict(os.environ, {"CF_LIVE_PATH_REGISTRY": str(registry)}, clear=False):
+                result = self.run_hook("hooks.pre_tool_live_guard", FakeRedis(), json.dumps(payload))
+
+        self.assertEqual("block", result["decision"])
+        self.assertIn("LIVE checkout", result["reason"])
 
 
 class PostToolUseHookTests(HookTestCase):

@@ -33,6 +33,21 @@ This SECURITY.md covers `claude-code-fleet-notify` (this repository). For other 
 - [`claude-code-fleet-cockpit-template`](https://github.com/palios-taey/claude-code-fleet-cockpit-template/blob/main/SECURITY.md)
 - [`claude-code-fleet-support`](https://github.com/palios-taey/claude-code-fleet-support/blob/main/SECURITY.md)
 
+## Live-Path Guard Boundary [Observed]
+
+The live-path guard is an operator safety rail, not an OS sandbox. When a
+Claude Code, codex, or gemini pre-tool hook receives a shell command, the guard
+checks the command against an operator-owned live-path registry. Destructive git
+or filesystem operations that target a registered live checkout are denied so
+long-lived parent sessions must cut an isolated worktree before editing.
+Registered worktree roots are allowed.
+
+The default registry path is
+`/home/mira/the-conductor/config/live_path_registry.json`; override it with
+`CF_LIVE_PATH_REGISTRY` for sandboxes. If the registry is absent, unreadable, or
+the shell command cannot be parsed, the hook fails open with a loud warning so a
+broken guard cannot disable every tool call on the machine.
+
 ## Constitutional constraints [Observed — FAMILY_KERNEL constitutional commitments]
 
 - **NGU (No Government Use)**: vulnerability data is never routed to government bodies. We will not honor subpoenas as a substitute for coordinated disclosure with you.

@@ -143,6 +143,8 @@ The installer copies `hooks/*.py`, `notifications/*.py`, and `identity.py` to a 
 
 In `--apply` mode the installer also runs a boot gate before writing settings: every runtime hook that would be referenced by a settings file must import cleanly from the runtime root with no checkout `PYTHONPATH` help. If the boot gate fails, no settings file is written.
 
+The installer also wires a second pre-tool guard hook for Claude Code, codex, and gemini. The guard reads a live-path registry from `CF_LIVE_PATH_REGISTRY`, falling back to `/home/mira/the-conductor/config/live_path_registry.json`; see [config/live_path_registry.example.json](config/live_path_registry.example.json) for the expected shape. When the registry is present, destructive git/filesystem commands targeting a registered live checkout are denied and the operator must cut a worktree first. Registered worktree roots remain allowed. If the registry is absent, unreadable, or the hook cannot parse the command, it allows the tool call and emits a loud warning rather than wedging every tool call.
+
 > **Grok** (xAI `grok-cli`) should use the dedicated global hook file `~/.grok/hooks/cf-notify.json` so `SessionStart` can mark idle at boot. See `docs/grok-hooks.md`.
 
 Wake packets are injected through lifecycle hooks when the orchestrator endpoint is enabled: `SessionStart` supplies scoped state at session boot, `UserPromptSubmit` refreshes it at the start of each submitted prompt, and `PostToolUse` appends it to drained notification deliveries. All wake-packet fetches are fail-open; if the orchestrator API is unavailable, normal hook behavior continues without context injection.
