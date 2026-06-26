@@ -25,13 +25,13 @@ from pathlib import Path
 
 REAL_REPO = Path(__file__).resolve().parent.parent
 EVENTS = ("SessionStart", "PreToolUse", "PostToolUse", "Stop", "UserPromptSubmit")
-# Event -> script basename, mirroring CLI_SPECS["claude"] in the installer.
+# Event -> script basename(s), mirroring CLI_SPECS["claude"] in the installer.
 SCRIPTS = {
-    "SessionStart": "session_start.py",
-    "PreToolUse": "pre_tool_activity.py",
-    "PostToolUse": "check_notifications.py",
-    "Stop": "stop_idle.py",
-    "UserPromptSubmit": "prompt_activity.py",
+    "SessionStart": ("session_start.py",),
+    "PreToolUse": ("pre_tool_activity.py", "pre_tool_live_guard.py"),
+    "PostToolUse": ("check_notifications.py",),
+    "Stop": ("stop_idle.py",),
+    "UserPromptSubmit": ("prompt_activity.py",),
 }
 
 
@@ -98,14 +98,15 @@ class StableInstallShape(unittest.TestCase):
             runtime_hooks = td / "runtime" / "hooks"
             for event in EVENTS:
                 cmds = _commands(settings, event)
-                self.assertEqual(len(cmds), 1, f"{event}: {cmds}")
-                argv = shlex.split(cmds[0])
-                self.assertEqual(argv[0], "python3")
-                self.assertEqual(len(argv), 2,
-                                 f"{event} command is not a bare argv: {cmds[0]}")
-                self.assertEqual(Path(argv[1]), runtime_hooks / SCRIPTS[event])
-                self.assertTrue(Path(argv[1]).is_file(),
-                                f"runtime copy missing: {argv[1]}")
+                self.assertEqual(len(cmds), len(SCRIPTS[event]), f"{event}: {cmds}")
+                for cmd, script in zip(cmds, SCRIPTS[event]):
+                    argv = shlex.split(cmd)
+                    self.assertEqual(argv[0], "python3")
+                    self.assertEqual(len(argv), 2,
+                                     f"{event} command is not a bare argv: {cmd}")
+                    self.assertEqual(Path(argv[1]), runtime_hooks / script)
+                    self.assertTrue(Path(argv[1]).is_file(),
+                                    f"runtime copy missing: {argv[1]}")
 
     def test_env_seeded_once_then_durable(self):
         with tempfile.TemporaryDirectory() as td:
@@ -127,36 +128,42 @@ class StableInstallShape(unittest.TestCase):
             td = Path(td)
             checkout = _make_checkout(td)
             old = "/old/moved/checkout/hooks"
-            pre = {"hooks": {event: [
-                # old bare form
-                {"hooks": [{"type": "command",
-                            "command": f"python3 {old}/{script}",
-                            "timeout": 5000}]},
-                # guard-wrapped form (PR#15 shape, in case any machine got it)
-                {"hooks": [
-                    {"type": "command",
-                     "command": (f'if [ -f "{old}/{script}" ]; then python3 '
-                                 f'"{old}/{script}"; else exit 0; fi'),
-                     "timeout": 5000},
-                    # foreign hook sharing a group with ours must survive
-                    {"type": "command",
-                     "command": "python3 /somewhere/other_tool.py",
-                     "timeout": 1000},
-                ]},
-                # duplicate bare form
-                {"hooks": [{"type": "command",
-                            "command": f"python3 {old}/{script}",
-                            "timeout": 5000}]},
-            ] for event, script in SCRIPTS.items()}}
+            pre = {"hooks": {}}
+            for event, scripts in SCRIPTS.items():
+                entries = []
+                for script in scripts:
+                    entries.extend([
+                        # old bare form
+                        {"hooks": [{"type": "command",
+                                    "command": f"python3 {old}/{script}",
+                                    "timeout": 5000}]},
+                        # guard-wrapped form (PR#15 shape, in case any machine got it)
+                        {"hooks": [
+                            {"type": "command",
+                             "command": (f'if [ -f "{old}/{script}" ]; then python3 '
+                                         f'"{old}/{script}"; else exit 0; fi'),
+                             "timeout": 5000},
+                            # foreign hook sharing a group with ours must survive
+                            {"type": "command",
+                             "command": "python3 /somewhere/other_tool.py",
+                             "timeout": 1000},
+                        ]},
+                        # duplicate bare form
+                        {"hooks": [{"type": "command",
+                                    "command": f"python3 {old}/{script}",
+                                    "timeout": 5000}]},
+                    ])
+                pre["hooks"][event] = entries
             (td / "settings.json").write_text(json.dumps(pre))
             _run_installer(checkout, td)
             settings = _settings(td)
-            for event, script in SCRIPTS.items():
+            for event, scripts in SCRIPTS.items():
                 cmds = _commands(settings, event)
-                ours = [c for c in cmds if script in c]
-                self.assertEqual(len(ours), 1,
-                                 f"{event} not deduped to one entry: {cmds}")
-                self.assertIn(str(td / "runtime"), ours[0])
+                for script in scripts:
+                    ours = [c for c in cmds if script in c]
+                    self.assertEqual(len(ours), 1,
+                                     f"{event} {script} not deduped to one entry: {cmds}")
+                    self.assertIn(str(td / "runtime"), ours[0])
                 self.assertIn("python3 /somewhere/other_tool.py", cmds,
                               f"{event} dropped a foreign hook: {cmds}")
 
@@ -168,9 +175,10 @@ class StableInstallShape(unittest.TestCase):
             settings = _settings(td)
             checkout.rename(td / "checkout" / "moved-away")
             for event in EVENTS:
-                path = shlex.split(_commands(settings, event)[0])[1]
-                self.assertTrue(Path(path).is_file(),
-                                f"{event} runtime copy vanished with checkout")
+                for command in _commands(settings, event):
+                    path = shlex.split(command)[1]
+                    self.assertTrue(Path(path).is_file(),
+                                    f"{event} runtime copy vanished with checkout")
             probe = subprocess.run(
                 ["sh", "-c", f"python3 {shlex.quote(str(td / 'runtime' / 'hooks' / 'probe_stable_install.py'))}"],
                 capture_output=True, text=True)

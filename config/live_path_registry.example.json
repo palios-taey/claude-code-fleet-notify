@@ -1,0 +1,24 @@
+{
+  "live_checkout_paths": [
+    "/home/mira/claude-code-fleet-orchestrator",
+    "/home/mira/the-conductor",
+    "/home/mira/infra-soul",
+    "/home/mira/treasurer",
+    "/home/mira/embedding-server",
+    "/home/mira/isma-core",
+    "/home/mira/taeys-hands",
+    "/home/mira/claude-code-fleet-notify"
+  ],
+  "worktree_roots": [
+    "/home/mira/.peer-worktrees"
+  ],
+  "live_db_endpoints": [
+    {"kind": "neo4j", "host": "127.0.0.1", "port": 7687},
+    {"kind": "neo4j", "host": "127.0.0.1", "port": 7689},
+    {"kind": "redis", "host": "127.0.0.1", "port": 6379}
+  ],
+  "warn_only_endpoints": [
+    {"kind": "weaviate", "url": "http://127.0.0.1:8088"},
+    {"kind": "isma", "url": "http://127.0.0.1:8095"}
+  ]
+}

@@ -22,6 +22,7 @@ features implemented in `claude-code-fleet-orchestrator`.
 | Trace | Live best-effort. Notify enqueue/drain/idle/inject events append to Redis stream `taey:notify_trace`; failures never break delivery. | `taey-trace`; `notifications/trace.py`; `redis-cli XREVRANGE taey:notify_trace + - COUNT 20`. |
 | Stable runtime root | Live. `install-hooks.sh --apply` copies hooks, `notifications`, and `identity.py` to `~/.local/share/claude-code-fleet-notify/hooks-runtime` or `CF_INSTALL_DIR`; settings reference only runtime copies. | `bash scripts/install-hooks.sh --apply`; inspect `~/.claude/settings.json` or sandbox settings for `hooks-runtime`. |
 | Hook boot gate | Live. In apply mode the installer imports every runtime hook from a neutral cwd before writing settings; failures leave settings untouched. | `tests/test_install_hooks_stable_install.py`; installer output `[boot-gate] ... runtime hooks import cleanly.` |
+| Live-path guard | Live when the registry exists. The second PreToolUse/BeforeTool hook denies destructive shell operations targeting registered live checkouts; registered worktree roots are allowed. Missing/unreadable registry or unparseable commands fail open with a warning. | `hooks/pre_tool_live_guard.py`; `hooks/_shared.py:live_guard_decision`; `tests/test_hooks.py:LivePathGuardTests`; registry example `config/live_path_registry.example.json`. |
 
 Documentation rule: if a row cannot be observed by the command/file named in
 the right column, treat it as a bug in either the docs or the implementation.

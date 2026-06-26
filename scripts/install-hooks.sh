@@ -212,7 +212,8 @@ def sync_runtime() -> list[str]:
             )
     return actions
 
-# Per-CLI hook specs. Each entry: (config file, format, event-to-script map, timeout)
+# Per-CLI hook specs. Hook map values are either one (script, timeout) pair
+# or an ordered list of pairs for events that need multiple hooks.
 # All three CLIs read JSON; only event names + script names differ.
 # Codex + Claude Code use the same event names; Gemini uses BeforeTool/
 # AfterTool/BeforeAgent/AfterAgent.
@@ -221,7 +222,10 @@ CLI_SPECS = {
         "path": claude_path,
         "hooks": {
             "SessionStart":     ("session_start.py",       5000),
-            "PreToolUse":       ("pre_tool_activity.py",   3000),
+            "PreToolUse":       [
+                ("pre_tool_activity.py",   3000),
+                ("pre_tool_live_guard.py", 3000),
+            ],
             "PostToolUse":      ("check_notifications.py", 5000),
             "Stop":             ("stop_idle.py",           5000),
             "UserPromptSubmit": ("prompt_activity.py",     5000),
@@ -232,7 +236,10 @@ CLI_SPECS = {
         "path": codex_path,
         "hooks": {
             "SessionStart":     ("codex_session_start.py", 10000),
-            "PreToolUse":       ("codex_pre_tool.py",      10000),
+            "PreToolUse":       [
+                ("codex_pre_tool.py",      10000),
+                ("pre_tool_live_guard.py", 3000),
+            ],
             "PostToolUse":      ("codex_post_tool.py",     10000),
             "Stop":             ("codex_stop.py",          10000),
             "UserPromptSubmit": ("codex_user_prompt.py",   10000),
@@ -242,7 +249,10 @@ CLI_SPECS = {
     "gemini": {
         "path": gemini_path,
         "hooks": {
-            "BeforeTool":   ("gemini_before_tool.py",   10000),
+            "BeforeTool":   [
+                ("gemini_before_tool.py",   10000),
+                ("pre_tool_live_guard.py",  3000),
+            ],
             "AfterTool":    ("gemini_after_tool.py",    10000),
             "BeforeAgent":  ("gemini_before_agent.py",  10000),
             "AfterAgent":   ("gemini_after_agent.py",   10000),
@@ -250,6 +260,16 @@ CLI_SPECS = {
         "enabled": do_gemini,
     },
 }
+
+
+def normalized_hook_specs(event_spec) -> list[tuple[str, int]]:
+    if (
+        isinstance(event_spec, tuple)
+        and len(event_spec) == 2
+        and isinstance(event_spec[0], str)
+    ):
+        return [event_spec]
+    return list(event_spec)
 
 
 def patch_one(cli_name: str, spec: dict) -> tuple[str, str, str]:
@@ -268,25 +288,14 @@ def patch_one(cli_name: str, spec: dict) -> tuple[str, str, str]:
         settings = {}
 
     settings.setdefault("hooks", {})
-    for event, (script_name, timeout) in hook_specs.items():
-        # Plain argv command — a quoted path and nothing else. No shell
-        # compounds, no conditionals: the hook's own exit code (including an
-        # intentional Stop block) passes through untouched.
-        command = f"python3 {shlex.quote(str(hooks_dir / script_name))}"
-        entry = {
-            "hooks": [
-                {
-                    "type": "command",
-                    "command": command,
-                    "timeout": timeout,
-                }
-            ]
-        }
+    for event, event_specs in hook_specs.items():
+        script_specs = normalized_hook_specs(event_specs)
+        script_names = [script_name for script_name, _timeout in script_specs]
         event_entries = settings["hooks"].setdefault(event, [])
-        # Migration + dedupe: drop every existing hook that runs this script
+        # Migration + dedupe: drop every existing hook that runs these scripts
         # under ANY historical path or wrapping (old checkout paths,
         # guard-wrapped forms, duplicates), preserve unrelated hooks and
-        # group attributes, then append exactly one canonical entry.
+        # group attributes, then append exactly one canonical entry per script.
         kept = []
         for group in event_entries:
             if not isinstance(group, dict):
@@ -294,7 +303,10 @@ def patch_one(cli_name: str, spec: dict) -> tuple[str, str, str]:
                 continue
             group_hooks = [
                 hook for hook in group.get("hooks", [])
-                if not runs_script(str(hook.get("command", "")), script_name)
+                if not any(
+                    runs_script(str(hook.get("command", "")), script_name)
+                    for script_name in script_names
+                )
             ]
             if group_hooks:
                 new_group = dict(group)
@@ -302,7 +314,20 @@ def patch_one(cli_name: str, spec: dict) -> tuple[str, str, str]:
                 kept.append(new_group)
             elif "hooks" not in group:
                 kept.append(group)
-        kept.append(entry)
+        for script_name, timeout in script_specs:
+            # Plain argv command — a quoted path and nothing else. No shell
+            # compounds, no conditionals: the hook's own exit code (including
+            # an intentional Stop block) passes through untouched.
+            command = f"python3 {shlex.quote(str(hooks_dir / script_name))}"
+            kept.append({
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": command,
+                        "timeout": timeout,
+                    }
+                ]
+            })
         settings["hooks"][event] = kept
 
     new_text = json.dumps(settings, indent=2, sort_keys=False) + "\n"
@@ -451,7 +476,8 @@ def runtime_closure_sources() -> list[Path]:
 required = sorted({
     script_name
     for spec in CLI_SPECS.values() if spec["enabled"]
-    for script_name, _timeout in spec["hooks"].values()
+    for event_specs in spec["hooks"].values()
+    for script_name, _timeout in normalized_hook_specs(event_specs)
 } | {"_shared.py"})  # imported by every hook script
 missing = [name for name in required if not (hooks_src / name).is_file()]
 missing += [
