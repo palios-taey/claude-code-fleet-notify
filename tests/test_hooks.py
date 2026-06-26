@@ -4,6 +4,7 @@ import importlib
 import io
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -455,6 +456,77 @@ class LivePathGuardTests(HookTestCase):
                             str(live), "Bash", {"command": command}
                         )
                         self.assertTrue(allowed, reason)
+
+    def test_live_checkout_allows_only_ff_only_deploy_sync(self):
+        with tempfile.TemporaryDirectory() as raw_td:
+            registry, live, _worktree = self.live_registry(Path(raw_td))
+            subprocess.run(
+                ["git", "init", "-b", "main", str(live)],
+                check=True,
+                capture_output=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(live), "config", "user.email", "test@example.invalid"],
+                check=True,
+                capture_output=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(live), "config", "user.name", "Test User"],
+                check=True,
+                capture_output=True,
+            )
+            (live / "README.md").write_text("test\n")
+            subprocess.run(
+                ["git", "-C", str(live), "add", "README.md"],
+                check=True,
+                capture_output=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(live), "commit", "-m", "init"],
+                check=True,
+                capture_output=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(live), "config", "branch.main.remote", "origin"],
+                check=True,
+                capture_output=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(live), "config", "branch.main.merge", "refs/heads/main"],
+                check=True,
+                capture_output=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(live), "config", "pull.ff", "only"],
+                check=True,
+                capture_output=True,
+            )
+            with mock.patch.dict(os.environ, {"CF_LIVE_PATH_REGISTRY": str(registry)}, clear=False):
+                allowed_cases = (
+                    "git merge --ff-only origin/main",
+                    "git pull --ff-only",
+                    "git pull",
+                )
+                for command in allowed_cases:
+                    with self.subTest(allowed_command=command):
+                        allowed, reason = shared.live_guard_decision(
+                            str(live), "Bash", {"command": command}
+                        )
+                        self.assertTrue(allowed, reason)
+
+                denied_cases = (
+                    "git merge origin/main",
+                    "git merge --ff-only origin/feature",
+                    "git pull origin feature",
+                    "git reset --hard",
+                )
+                for command in denied_cases:
+                    with self.subTest(denied_command=command):
+                        allowed, reason = shared.live_guard_decision(
+                            str(live), "Bash", {"command": command}
+                        )
+                        self.assertFalse(allowed)
+                        self.assertIn("BLOCKED:", reason)
 
     def test_absolute_live_target_blocks_from_non_live_cwd(self):
         with tempfile.TemporaryDirectory() as raw_td:

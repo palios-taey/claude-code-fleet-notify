@@ -76,8 +76,9 @@ DEFAULT_LIVE_PATH_REGISTRY = "/home/mira/the-conductor/config/live_path_registry
 _LIVE_GUARD_WARNING = "LIVE-PATH GUARD WARNING"
 _GIT_WRITE_SUBCOMMANDS = {
     "add", "apply", "branch", "checkout", "cherry-pick", "clean", "commit",
-    "merge", "mv", "rebase", "reset", "restore", "rm", "stash", "switch",
+    "merge", "mv", "pull", "rebase", "reset", "restore", "rm", "stash", "switch",
 }
+_LIVE_GUARD_DEPLOY_REFS = {"origin/main", "refs/remotes/origin/main", "remotes/origin/main"}
 _FS_DESTRUCTIVE_COMMANDS = {"rm", "rmdir", "shred", "truncate", "mv"}
 _RECURSIVE_MUTATORS = {"chmod", "chown"}
 _SHELL_CONTROL_TOKENS = {"&&", "||", ";"}
@@ -231,6 +232,60 @@ def _live_guard_nested_shell_commands(tokens: list[str]) -> list[str]:
     return []
 
 
+def _live_guard_git_config(target_cwd: str, *args: str) -> Optional[str]:
+    try:
+        result = subprocess.run(
+            ["git", "-C", target_cwd, *args],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    value = result.stdout.strip()
+    return value or None
+
+
+def _live_guard_git_upstream_ref(target_cwd: str) -> Optional[str]:
+    branch = _live_guard_git_config(target_cwd, "rev-parse", "--abbrev-ref", "HEAD")
+    if not branch or branch == "HEAD":
+        return None
+    remote = _live_guard_git_config(target_cwd, "config", "--get", f"branch.{branch}.remote")
+    merge_ref = _live_guard_git_config(target_cwd, "config", "--get", f"branch.{branch}.merge")
+    if not remote or not merge_ref:
+        return None
+    if merge_ref.startswith("refs/heads/"):
+        merge_ref = merge_ref[len("refs/heads/"):]
+    return f"{remote}/{merge_ref}"
+
+
+def _live_guard_git_ff_only_sync(subcommand: str, args: list[str], target_cwd: str) -> bool:
+    positionals = [arg for arg in args if not arg.startswith("-")]
+    if subcommand == "merge":
+        return (
+            "--ff-only" in args
+            and len(positionals) == 1
+            and positionals[0] in _LIVE_GUARD_DEPLOY_REFS
+        )
+    if subcommand != "pull":
+        return False
+    if positionals:
+        return False
+    upstream = _live_guard_git_upstream_ref(target_cwd)
+    if upstream not in _LIVE_GUARD_DEPLOY_REFS:
+        return False
+    if "--ff-only" in args:
+        return True
+    # The live deploy sync advances only to r5-gated, branch-protected
+    # origin/main and refuses dirty/divergent trees. Treat config-declared
+    # ff-only pull as that same sanctioned sync path, not arbitrary live editing.
+    pull_ff = _live_guard_git_config(target_cwd, "config", "--get", "pull.ff")
+    return pull_ff is not None and pull_ff.strip().lower() == "only"
+
+
 def _live_guard_git_command(tokens: list[str], cwd: str) -> Optional[tuple[str, str]]:
     if "git" not in [os.path.basename(token) for token in tokens]:
         return None
@@ -254,8 +309,11 @@ def _live_guard_git_command(tokens: list[str], cwd: str) -> Optional[tuple[str, 
         break
     if not subcommand or subcommand not in _GIT_WRITE_SUBCOMMANDS:
         return None
+    args = tokens[idx + 1:]
+    if _live_guard_git_ff_only_sync(subcommand, args, target_cwd):
+        return None
     if subcommand == "branch" and not any(
-        token in {"-D", "-d", "--delete"} for token in tokens[idx + 1:]
+        token in {"-D", "-d", "--delete"} for token in args
     ):
         return None
     return f"git {subcommand}", target_cwd
