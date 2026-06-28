@@ -13,6 +13,7 @@ import logging
 import os
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -56,11 +57,81 @@ DEFAULT_POLL_INTERVAL = 3
 # every-3s keystroke hammer that disrupts wedged sessions fleet-wide.
 POINTER_INJECT_BACKOFF_SECS = 90
 HANDOFF_VALIDATION_TIMEOUT_SECS = 5.0
+HANDOFF_VALIDATION_SHUTDOWN_GRACE_SECS = 0.1
 DEFAULT_INJECT_FAILURE_ESCALATE_AFTER = 3
 DEFAULT_INJECT_FAILURE_ESCALATION_TTL_SECS = 900
 MAX_MESSAGE_LENGTH = 4000
 DAEMON_HEARTBEAT_NODE = "_notify_daemon"
 DAEMON_HEARTBEAT_SUFFIX = "heartbeat"
+
+
+class _HandoffValidationJob:
+    def __init__(self, redis_client, *, prefix: str, timeout_sec: float):
+        self.redis_client = redis_client
+        self.prefix = prefix
+        self.timeout_sec = timeout_sec
+        self.started_at = time.monotonic()
+        self.warned = False
+        self.updated = 0
+        self.error: Exception | None = None
+        self.done = threading.Event()
+        self.thread = threading.Thread(
+            target=self._run,
+            name="notify-handoff-activation-validation",
+            daemon=True,
+        )
+
+    def start(self) -> "_HandoffValidationJob":
+        self.thread.start()
+        return self
+
+    def _run(self) -> None:
+        try:
+            self.updated = validate_handoff_activation(
+                self.redis_client,
+                prefix=self.prefix,
+                timeout_sec=self.timeout_sec,
+            )
+        except Exception as exc:
+            self.error = exc
+        finally:
+            self.done.set()
+
+
+def _consume_handoff_validation_job(
+    job: _HandoffValidationJob | None,
+    *,
+    wait_sec: float = 0.0,
+) -> _HandoffValidationJob | None:
+    if job is None:
+        return None
+    if wait_sec > 0:
+        job.thread.join(wait_sec)
+    if not job.done.is_set():
+        return job
+    if job.error is not None:
+        logger.error("handoff activation validation failed: %s", job.error)
+    return None
+
+
+def _advance_handoff_validation_job(
+    job: _HandoffValidationJob | None,
+    redis_client,
+    *,
+    prefix: str,
+    timeout_sec: float,
+) -> _HandoffValidationJob | None:
+    job = _consume_handoff_validation_job(job)
+    if job is None:
+        return _HandoffValidationJob(redis_client, prefix=prefix, timeout_sec=timeout_sec).start()
+    elapsed = time.monotonic() - job.started_at
+    if not job.warned and elapsed >= timeout_sec:
+        logger.error(
+            "handoff activation validation still running after %.3fs; heartbeat/delivery continue",
+            timeout_sec,
+        )
+        job.warned = True
+    return job
 
 
 def get_local_tmux_sessions() -> list[str]:
@@ -348,6 +419,7 @@ def run_daemon(
     )
     logger.info("Using Redis key prefix: %s", key_prefix())
 
+    handoff_validation_job: _HandoffValidationJob | None = None
     while True:
         try:
             local_sessions = get_local_tmux_sessions()
@@ -359,7 +431,8 @@ def run_daemon(
                 logger.error("daemon heartbeat write failed: %s", exc)
 
             try:
-                validate_handoff_activation(
+                handoff_validation_job = _advance_handoff_validation_job(
+                    handoff_validation_job,
                     r,
                     prefix=key_prefix(),
                     timeout_sec=HANDOFF_VALIDATION_TIMEOUT_SECS,
@@ -518,6 +591,10 @@ def run_daemon(
                 pass
             time.sleep(poll_interval)
         except KeyboardInterrupt:
+            _consume_handoff_validation_job(
+                handoff_validation_job,
+                wait_sec=HANDOFF_VALIDATION_SHUTDOWN_GRACE_SECS,
+            )
             logger.info("Daemon stopped")
             break
         except Exception as exc:
