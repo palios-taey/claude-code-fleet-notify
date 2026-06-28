@@ -112,6 +112,96 @@ class DaemonTests(unittest.TestCase):
         self.assertEqual("1234.500000+%s" % daemon.socket.gethostname(),
                          r.get(state_key("_notify_daemon", "heartbeat")))
 
+    def test_handoff_validation_job_stays_nonblocking_while_running(self):
+        r = FakeRedis()
+        started = threading.Event()
+        release = threading.Event()
+        calls = []
+        job = None
+
+        def blocking_validation(redis_client, *, prefix, timeout_sec):
+            calls.append((redis_client, prefix, timeout_sec))
+            started.set()
+            release.wait(1.0)
+            return 1
+
+        try:
+            with mock.patch.object(daemon, "validate_handoff_activation", side_effect=blocking_validation):
+                job = daemon._advance_handoff_validation_job(
+                    None,
+                    r,
+                    prefix=key_prefix(),
+                    timeout_sec=0.02,
+                )
+                self.assertTrue(started.wait(0.5))
+                time_module.sleep(0.03)
+
+                latencies = []
+                for _ in range(5):
+                    started_at = time_module.monotonic()
+                    next_job = daemon._advance_handoff_validation_job(
+                        job,
+                        r,
+                        prefix=key_prefix(),
+                        timeout_sec=0.02,
+                    )
+                    latencies.append(time_module.monotonic() - started_at)
+                    self.assertIs(next_job, job)
+
+                self.assertEqual(1, len(calls))
+                self.assertTrue(job.warned)
+                self.assertLess(max(latencies), 0.25)
+        finally:
+            release.set()
+            if job is not None:
+                self.assertTrue(job.done.wait(1.0))
+
+    def test_handoff_validation_job_consumes_logs_and_restarts(self):
+        r = FakeRedis()
+        calls = []
+
+        def validation(redis_client, *, prefix, timeout_sec):
+            del redis_client, prefix, timeout_sec
+            calls.append(len(calls) + 1)
+            if calls[-1] == 1:
+                raise RuntimeError("validation failed")
+            return calls[-1]
+
+        with mock.patch.object(daemon, "validate_handoff_activation", side_effect=validation):
+            with mock.patch.object(daemon.logger, "error") as log_error:
+                job_one = daemon._advance_handoff_validation_job(
+                    None,
+                    r,
+                    prefix=key_prefix(),
+                    timeout_sec=0.02,
+                )
+                self.assertTrue(job_one.done.wait(1.0))
+
+                job_two = daemon._advance_handoff_validation_job(
+                    job_one,
+                    r,
+                    prefix=key_prefix(),
+                    timeout_sec=0.02,
+                )
+                self.assertIsNot(job_two, job_one)
+                self.assertTrue(job_two.done.wait(1.0))
+                self.assertEqual(2, job_two.updated)
+                self.assertEqual(2, len(calls))
+                log_error.assert_called_once()
+                self.assertIn("handoff activation validation failed", log_error.call_args.args[0])
+                self.assertIsInstance(log_error.call_args.args[1], RuntimeError)
+
+                job_three = daemon._advance_handoff_validation_job(
+                    job_two,
+                    r,
+                    prefix=key_prefix(),
+                    timeout_sec=0.02,
+                )
+                self.assertIsNot(job_three, job_two)
+                self.assertTrue(job_three.done.wait(1.0))
+                self.assertEqual(3, job_three.updated)
+                self.assertEqual(3, len(calls))
+
     def test_idle_flagged_session_injects_even_with_tool_running_and_activity_markers(self):
         r = FakeRedis()
         r.set(state_key("idle-session", "idle"), "1")
