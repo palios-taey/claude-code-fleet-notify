@@ -55,6 +55,7 @@ DEFAULT_POLL_INTERVAL = 3
 # submits the pointer clears idle and is never re-injected. Prevents the
 # every-3s keystroke hammer that disrupts wedged sessions fleet-wide.
 POINTER_INJECT_BACKOFF_SECS = 90
+HANDOFF_VALIDATION_TIMEOUT_SECS = 5.0
 DEFAULT_INJECT_FAILURE_ESCALATE_AFTER = 3
 DEFAULT_INJECT_FAILURE_ESCALATION_TTL_SECS = 900
 MAX_MESSAGE_LENGTH = 4000
@@ -358,7 +359,11 @@ def run_daemon(
                 logger.error("daemon heartbeat write failed: %s", exc)
 
             try:
-                validate_handoff_activation(r, prefix=key_prefix())
+                validate_handoff_activation(
+                    r,
+                    prefix=key_prefix(),
+                    timeout_sec=HANDOFF_VALIDATION_TIMEOUT_SECS,
+                )
             except Exception as exc:
                 logger.error("handoff activation validation failed: %s", exc)
 
