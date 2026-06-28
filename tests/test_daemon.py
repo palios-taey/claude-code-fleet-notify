@@ -2,13 +2,15 @@ from __future__ import annotations
 
 import json
 import sys
+import threading
+import time as time_module
 import unittest
 from types import SimpleNamespace
 from unittest import mock
 
 from hooks import _shared as shared
 from notifications import daemon
-from notifications.inbox import inbox_key, state_key
+from notifications.inbox import inbox_key, key_prefix, state_key
 from notifications.handoff import create_explicit_handoff, explicit_ack_key, explicit_handoff_key
 from tests.fakes import FakeRedis
 
@@ -64,6 +66,51 @@ class DaemonTests(unittest.TestCase):
                             daemon.run_daemon("127.0.0.1", 6379, 1)
 
         self.assertEqual("1234.500000+notify-host", r.get(state_key("_notify_daemon", "heartbeat")))
+
+    def test_handoff_validation_timeout_does_not_wedge_delivery(self):
+        class BlockingHandoffScanRedis(FakeRedis):
+            def __init__(self):
+                super().__init__()
+                self.validation_started = threading.Event()
+                self.release_validation = threading.Event()
+                self.validation_done = threading.Event()
+
+            def scan_iter(self, match=None, count=None):
+                if match == f"{key_prefix()}:handoff:*":
+                    self.validation_started.set()
+                    self.release_validation.wait(1.0)
+                    self.validation_done.set()
+                    if False:
+                        yield None
+                    return
+                yield from super().scan_iter(match=match, count=count)
+
+        r = BlockingHandoffScanRedis()
+        r.set(state_key("wedged", "idle"), "1")
+        r.lpush(inbox_key("wedged"), json.dumps({"from": "sender", "type": "message", "body": "queued"}))
+
+        fake_redis_module = SimpleNamespace(Redis=lambda **kwargs: r)
+        started_at = time_module.monotonic()
+        try:
+            with mock.patch.object(daemon, "HANDOFF_VALIDATION_TIMEOUT_SECS", 0.05):
+                with mock.patch.dict(sys.modules, {"redis": fake_redis_module}):
+                    with mock.patch.object(daemon, "get_local_tmux_sessions", return_value=["wedged"]):
+                        with mock.patch.object(daemon, "inject_via_tmux", return_value=True) as inject:
+                            with mock.patch.object(daemon.time, "time", return_value=1234.5):
+                                with mock.patch.object(daemon.time, "sleep", side_effect=KeyboardInterrupt):
+                                    daemon.run_daemon("127.0.0.1", 6379, 1)
+        finally:
+            r.release_validation.set()
+            r.validation_done.wait(1.0)
+            time_module.sleep(0.02)
+
+        elapsed = time_module.monotonic() - started_at
+        self.assertTrue(r.validation_started.is_set())
+        self.assertLess(elapsed, 0.5)
+        inject.assert_called_once()
+        self.assertEqual("wedged", inject.call_args.args[0])
+        self.assertEqual("1234.500000+%s" % daemon.socket.gethostname(),
+                         r.get(state_key("_notify_daemon", "heartbeat")))
 
     def test_idle_flagged_session_injects_even_with_tool_running_and_activity_markers(self):
         r = FakeRedis()
