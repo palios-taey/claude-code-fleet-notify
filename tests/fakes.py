@@ -89,6 +89,14 @@ class FakeRedis:
                 yield key
 
     def eval(self, script, numkeys, *args):
+        if numkeys == 1:
+            key = args[0]
+            observed_value = args[1]
+            if self.store.get(key) == observed_value:
+                self.delete(key)
+                return 1
+            return 0
+
         current_task_key, last_outcome_key, marker_key = args[:3]
         observed_task_id = args[3]
         raw = self.store.get(current_task_key)

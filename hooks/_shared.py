@@ -899,6 +899,40 @@ return 0
 """
 
 
+_CONSUME_LAST_OUTCOME_LUA = """
+local cur = redis.call('GET', KEYS[1])
+if cur == ARGV[1] then
+    redis.call('DEL', KEYS[1])
+    return 1
+end
+return 0
+"""
+
+
+def _consume_delivered_last_outcome(
+    r,
+    node_id: str,
+    supervisor: str,
+    observed_last_outcome_raw: Optional[str],
+) -> None:
+    if not observed_last_outcome_raw:
+        return
+    try:
+        from notifications.inbox import state_key
+
+        cleared = r.eval(
+            _CONSUME_LAST_OUTCOME_LUA, 1,
+            state_key(node_id, "last_outcome"),
+            observed_last_outcome_raw,
+        )
+        if cleared:
+            # The delivered outcome already represented this idle transition;
+            # suppress the follow-up bare no-task stop until the next prompt.
+            r.set(_no_task_peer_idle_marker_key(node_id, supervisor), "1")
+    except Exception as exc:
+        log_debug(node_id, f"STOP last_outcome consume failed: {exc}")
+
+
 def _stage_b_enabled() -> bool:
     """Stage B engine activation check. Two sources, OR-combined:
 
@@ -968,11 +1002,12 @@ def _notify_supervisor_of_stop(r, node_id: str, supervisor: str) -> None:
         # peer_idle MUST be self-describing. Surface task_id/task_description
         # when the observed task is still active; otherwise report the stop
         # honestly as no-task rather than claiming a stale task.
+        observed_last_outcome_raw = None
         observed_outcome_struct = None
         try:
-            lo = r.get(state_key(node_id, "last_outcome"))
-            if lo:
-                observed_outcome_struct = json.loads(lo)
+            observed_last_outcome_raw = r.get(state_key(node_id, "last_outcome"))
+            if observed_last_outcome_raw:
+                observed_outcome_struct = json.loads(observed_last_outcome_raw)
                 if outcome is None:
                     candidate_outcome = observed_outcome_struct.get("outcome", "unknown")
                     outcome = candidate_outcome if candidate_outcome in _VALID_OUTCOMES else "unknown"
@@ -1034,6 +1069,7 @@ def _notify_supervisor_of_stop(r, node_id: str, supervisor: str) -> None:
                 r.set(peer_idle_dedup, "1")
             else:
                 r.set(peer_idle_dedup, "1", ex=60)
+            _consume_delivered_last_outcome(r, node_id, supervisor, observed_last_outcome_raw)
             if outcome == "done" and observed_task_id:
                 try:
                     r.eval(
@@ -1074,6 +1110,7 @@ def _notify_supervisor_of_stop(r, node_id: str, supervisor: str) -> None:
                 r.set(peer_idle_dedup, "1")
             else:
                 r.set(peer_idle_dedup, "1", ex=60)
+            _consume_delivered_last_outcome(r, node_id, supervisor, observed_last_outcome_raw)
             if outcome == "done" and observed_task_id:
                 try:
                     cleared = r.eval(
