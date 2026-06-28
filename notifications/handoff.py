@@ -15,6 +15,8 @@ _FLAG_CACHE_PATH: str | None = None
 _FLAG_CACHE_AT = 0.0
 _FLAG_CACHE_DATA: dict[str, dict[str, bool]] = {}
 _FLAG_CACHE_LOCK = threading.Lock()
+DEFAULT_VALIDATION_TIMEOUT_SECS = 5.0
+_VALIDATION_LOCK = threading.Lock()
 
 
 def _truthy(raw: Any) -> bool:
@@ -337,7 +339,7 @@ def _notify_activation_failed(redis_client, prefix: str, record: dict[str, Any],
     redis_client.lpush(f"{prefix}:{dispatcher}:inbox", json.dumps(msg, separators=(",", ":")))
 
 
-def validate_handoff_activation(redis_client, *, prefix: str, now: float | None = None) -> int:
+def _validate_handoff_activation_once(redis_client, *, prefix: str, now: float | None = None) -> int:
     now = time.time() if now is None else now
     updated = 0
     for record_key in redis_client.scan_iter(match=f"{prefix}:handoff:*"):
@@ -372,6 +374,48 @@ def validate_handoff_activation(redis_client, *, prefix: str, now: float | None 
         redis_client.set(record_key, json.dumps(record, separators=(",", ":")))
         updated += 1
     return updated
+
+
+def validate_handoff_activation(
+    redis_client,
+    *,
+    prefix: str,
+    now: float | None = None,
+    timeout_sec: float | None = DEFAULT_VALIDATION_TIMEOUT_SECS,
+) -> int:
+    if timeout_sec is None:
+        return _validate_handoff_activation_once(redis_client, prefix=prefix, now=now)
+    try:
+        timeout = float(timeout_sec)
+    except (TypeError, ValueError):
+        timeout = DEFAULT_VALIDATION_TIMEOUT_SECS
+    timeout = max(0.001, timeout)
+    if not _VALIDATION_LOCK.acquire(blocking=False):
+        raise TimeoutError("handoff activation validation already running")
+
+    result: dict[str, Any] = {}
+
+    def run_validation() -> None:
+        try:
+            result["updated"] = _validate_handoff_activation_once(redis_client, prefix=prefix, now=now)
+        except BaseException as exc:
+            result["error"] = exc
+        finally:
+            _VALIDATION_LOCK.release()
+
+    worker = threading.Thread(
+        target=run_validation,
+        name="handoff-activation-validation",
+        daemon=True,
+    )
+    worker.start()
+    worker.join(timeout)
+    if worker.is_alive():
+        raise TimeoutError(f"handoff activation validation exceeded {timeout:.3f}s")
+    error = result.get("error")
+    if error is not None:
+        raise error
+    return int(result.get("updated", 0))
 
 
 def queue_pending_receipts(redis_client, *, prefix: str, target_session_id: str,
