@@ -58,6 +58,7 @@ DEFAULT_POLL_INTERVAL = 3
 POINTER_INJECT_BACKOFF_SECS = 90
 HANDOFF_VALIDATION_TIMEOUT_SECS = 5.0
 HANDOFF_VALIDATION_SHUTDOWN_GRACE_SECS = 0.1
+REDIS_SOCKET_TIMEOUT_SECS = 2.0
 DEFAULT_INJECT_FAILURE_ESCALATE_AFTER = 3
 DEFAULT_INJECT_FAILURE_ESCALATION_TTL_SECS = 900
 MAX_MESSAGE_LENGTH = 4000
@@ -399,7 +400,8 @@ def run_daemon(
         host=redis_host,
         port=redis_port,
         decode_responses=True,
-        socket_timeout=2,
+        socket_timeout=REDIS_SOCKET_TIMEOUT_SECS,
+        socket_connect_timeout=REDIS_SOCKET_TIMEOUT_SECS,
     )
 
     try:

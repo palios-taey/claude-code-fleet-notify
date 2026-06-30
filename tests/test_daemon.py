@@ -67,6 +67,26 @@ class DaemonTests(unittest.TestCase):
 
         self.assertEqual("1234.500000+notify-host", r.get(state_key("_notify_daemon", "heartbeat")))
 
+    def test_daemon_redis_client_has_socket_timeout_for_validation_scan(self):
+        r = FakeRedis()
+        redis_kwargs = {}
+
+        def redis_factory(**kwargs):
+            redis_kwargs.update(kwargs)
+            return r
+
+        fake_redis_module = SimpleNamespace(Redis=redis_factory)
+        with mock.patch.dict(sys.modules, {"redis": fake_redis_module}):
+            with mock.patch.object(daemon, "get_local_tmux_sessions", return_value=[]):
+                with mock.patch.object(daemon.socket, "gethostname", return_value="notify-host"):
+                    with mock.patch.object(daemon.time, "time", return_value=1234.5):
+                        with mock.patch.object(daemon.time, "sleep", side_effect=KeyboardInterrupt):
+                            daemon.run_daemon("127.0.0.1", 6379, 1)
+
+        self.assertEqual(daemon.REDIS_SOCKET_TIMEOUT_SECS, redis_kwargs.get("socket_timeout"))
+        self.assertEqual(daemon.REDIS_SOCKET_TIMEOUT_SECS, redis_kwargs.get("socket_connect_timeout"))
+        self.assertLess(daemon.REDIS_SOCKET_TIMEOUT_SECS, daemon.HANDOFF_VALIDATION_TIMEOUT_SECS)
+
     def test_handoff_validation_timeout_does_not_wedge_delivery(self):
         class BlockingHandoffScanRedis(FakeRedis):
             def __init__(self):
