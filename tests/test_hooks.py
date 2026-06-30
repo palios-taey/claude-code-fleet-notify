@@ -223,7 +223,7 @@ class StopHookTests(HookTestCase):
         self.assertEqual("task-orphan", msg["stale_task_id"])
         self.assertIn("not active", msg["body"])
 
-    def test_allow_stop_dedups_no_task_peer_idle_until_activity(self):
+    def test_allow_stop_rate_limits_no_task_peer_idle_across_activity(self):
         r = FakeRedis()
 
         with mock.patch.object(shared, "fetch_stop_decision", return_value={
@@ -236,7 +236,9 @@ class StopHookTests(HookTestCase):
             shared._notify_supervisor_of_stop(r, "worker-codex", "conductor")
             self.assertEqual(1, r.llen(inbox_key("conductor")))
             marker_key = shared._no_task_peer_idle_marker_key("worker-codex", "conductor")
+            rate_key = shared._no_task_peer_idle_rate_key("worker-codex", "conductor")
             self.assertEqual("1", r.get(marker_key))
+            self.assertEqual("1", r.get(rate_key))
 
             r.set(state_key("worker-codex", "last_activity"), "1001.0")
             shared._notify_supervisor_of_stop(r, "worker-codex", "conductor")
@@ -246,6 +248,11 @@ class StopHookTests(HookTestCase):
             self.assertNotIn(marker_key, r.store)
 
             r.set(state_key("worker-codex", "last_activity"), "1002.0")
+            shared._notify_supervisor_of_stop(r, "worker-codex", "conductor")
+            self.assertEqual(1, r.llen(inbox_key("conductor")))
+
+            r.delete(rate_key)
+            r.set(state_key("worker-codex", "last_activity"), "1003.0")
             shared._notify_supervisor_of_stop(r, "worker-codex", "conductor")
             self.assertEqual(2, r.llen(inbox_key("conductor")))
 
