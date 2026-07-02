@@ -57,7 +57,7 @@ and delegated orchestrator capabilities, see
 
 This is complementary to claudemesh, not a replacement. If you want interactive multi-session coordination, see claudemesh. If you want autonomous wake for unattended Claude Code fleets, use this.
 
-The architectural split is the wake invariant: `Stop` sets durable idle, prompt/tool activity clears idle, and the daemon only injects a pointer when `idle=1`. A v0.1.x/v0.2 backlog item is to propose that autonomous-wake invariant upstream to claudemesh.
+The architectural split is the wake invariant: `Stop` and `SessionStart` set durable idle, prompt/tool activity clears idle, and the daemon only injects a pointer when `idle=1`. If Claude Code parks at a session/usage-limit banner without firing `Stop`, the daemon repairs that specific resting state back to `idle=1` before applying the same one-flag injection rule.
 
 ## Install
 
