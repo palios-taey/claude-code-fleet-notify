@@ -106,6 +106,8 @@ Tmux is used only when the session is stopped and `idle=1`, and it carries only 
 | `${NOTIFY_KEY_PREFIX:-taey}:SESSION:idle` | durable idle flag set by lifecycle hooks, or by daemon repair for a parked Claude Code usage-limit banner |
 | `${NOTIFY_KEY_PREFIX:-taey}:SESSION:last_activity` | last hook activity timestamp, used for handoff activation observation |
 | `${NOTIFY_KEY_PREFIX:-taey}:SESSION:last_tool_activity` | last tool-hook activity timestamp, used for handoff activation observation |
+| `${NOTIFY_KEY_PREFIX:-taey}:_notify_daemon:heartbeat` | daemon process liveness timestamp, written from an independent heartbeat thread |
+| `${NOTIFY_KEY_PREFIX:-taey}:_notify_daemon:delivery_progress` | daemon delivery-loop progress cursor, advanced by the serial tmux-delivery loop |
 
 ## State rules
 
@@ -116,6 +118,11 @@ Tmux is used only when the session is stopped and `idle=1`, and it carries only 
 | `${NOTIFY_KEY_PREFIX:-taey}:SESSION:last_tool_activity` | tool-hook activity | overwritten by later tool-hook activity |
 
 The daemon's usage-limit repair is intentionally narrow: it only restores `idle=1` for a local tmux pane whose current bottom resting region visibly shows a Claude Code session/weekly/usage-limit banner while no tool is marked running. It is not a stale-activity, scrollback, or pane-active injection heuristic; after repair, the same one-flag `idle=1` authorization rule still decides pointer injection. The daemon never clears idle because tmux injection is not proof that the prompt was submitted.
+
+The daemon heartbeat is not proof that pointer delivery is advancing. It is a
+process-liveness signal emitted from an independent timer thread. Delivery
+watchdogs should use `_notify_daemon:delivery_progress` to distinguish a slow
+but advancing fan-out from a genuinely stalled delivery loop.
 
 ## Message format
 

@@ -15,6 +15,37 @@ from notifications.handoff import create_explicit_handoff, explicit_ack_key, exp
 from tests.fakes import FakeRedis
 
 
+class CountingRedis(FakeRedis):
+    def __init__(self, heartbeat_key: str):
+        super().__init__()
+        self.heartbeat_key = heartbeat_key
+        self._lock = threading.Lock()
+        self._heartbeat_writes = 0
+        self._heartbeat_changed = threading.Condition(self._lock)
+
+    def set(self, key, value, ex=None):
+        with self._lock:
+            result = super().set(key, value, ex=ex)
+            if key == self.heartbeat_key:
+                self._heartbeat_writes += 1
+                self._heartbeat_changed.notify_all()
+            return result
+
+    def heartbeat_writes(self) -> int:
+        with self._lock:
+            return self._heartbeat_writes
+
+    def wait_for_heartbeat_after(self, previous_count: int, timeout_sec: float) -> bool:
+        deadline = time_module.monotonic() + timeout_sec
+        with self._lock:
+            while self._heartbeat_writes <= previous_count:
+                remaining = deadline - time_module.monotonic()
+                if remaining <= 0:
+                    return False
+                self._heartbeat_changed.wait(remaining)
+            return True
+
+
 class DaemonTests(unittest.TestCase):
     def run_daemon_once(self, redis_client, sessions, *, inject_result=True, now=1000.0):
         fake_redis_module = SimpleNamespace(Redis=lambda **kwargs: redis_client)
@@ -66,6 +97,74 @@ class DaemonTests(unittest.TestCase):
                             daemon.run_daemon("127.0.0.1", 6379, 1)
 
         self.assertEqual("1234.500000+notify-host", r.get(state_key("_notify_daemon", "heartbeat")))
+
+    def test_run_daemon_writes_delivery_progress_cursor(self):
+        r = FakeRedis()
+
+        fake_redis_module = SimpleNamespace(Redis=lambda **kwargs: r)
+        with mock.patch.dict(sys.modules, {"redis": fake_redis_module}):
+            with mock.patch.object(daemon, "get_local_tmux_sessions", return_value=[]):
+                with mock.patch.object(daemon.socket, "gethostname", return_value="notify-host"):
+                    with mock.patch.object(daemon.time, "time", return_value=1234.5):
+                        with mock.patch.object(daemon.time, "sleep", side_effect=KeyboardInterrupt):
+                            daemon.run_daemon("127.0.0.1", 6379, 1)
+
+        progress = r.get(state_key("_notify_daemon", "delivery_progress"))
+        self.assertIsNotNone(progress)
+        self.assertRegex(progress, r"^1234\.500000\+notify-host\+\d+$")
+
+    def test_heartbeat_thread_keeps_beating_while_inject_blocks(self):
+        heartbeat_key = state_key("_notify_daemon", "heartbeat")
+        r = CountingRedis(heartbeat_key)
+        r.set(state_key("blocked-session", "idle"), "1")
+        r.lpush(inbox_key("blocked-session"), json.dumps({
+            "from": "sender",
+            "type": "message",
+            "body": "large fan-out payload",
+        }))
+        fake_redis_module = SimpleNamespace(Redis=lambda **kwargs: r)
+        inject_started = threading.Event()
+
+        def blocked_inject(_session_name, _summary):
+            heartbeat_count_at_block = r.heartbeat_writes()
+            inject_started.set()
+            self.assertTrue(r.wait_for_heartbeat_after(heartbeat_count_at_block, 1.0))
+            raise KeyboardInterrupt
+
+        with mock.patch.dict(sys.modules, {"redis": fake_redis_module}):
+            with mock.patch.object(daemon, "get_local_tmux_sessions", return_value=["blocked-session"]):
+                with mock.patch.object(daemon, "inject_via_tmux", side_effect=blocked_inject):
+                    daemon.run_daemon("127.0.0.1", 6379, 0.01)
+
+        self.assertTrue(inject_started.is_set())
+        self.assertGreaterEqual(r.heartbeat_writes(), 2)
+
+    def test_delivery_progress_stall_withholds_heartbeat(self):
+        heartbeat_key = state_key("_notify_daemon", "heartbeat")
+        r = CountingRedis(heartbeat_key)
+        progress = daemon._DaemonDeliveryProgress()
+        with progress._lock:
+            progress._last_monotonic = time_module.monotonic() - 10.0
+        fake_redis_module = SimpleNamespace(Redis=lambda **kwargs: r)
+
+        stop_event, heartbeat_thread = daemon._start_daemon_heartbeat_thread(
+            fake_redis_module,
+            "127.0.0.1",
+            6379,
+            "notify-host",
+            interval_sec=0.01,
+            delivery_progress=progress,
+            delivery_progress_max_age_sec=0.001,
+        )
+        try:
+            initial_writes = r.heartbeat_writes()
+            time_module.sleep(0.05)
+        finally:
+            stop_event.set()
+            heartbeat_thread.join(1.0)
+
+        self.assertEqual(1, initial_writes)
+        self.assertEqual(initial_writes, r.heartbeat_writes())
 
     def test_daemon_redis_client_has_socket_timeout_for_validation_scan(self):
         r = FakeRedis()

@@ -159,6 +159,14 @@ bash scripts/start_notify_daemons.sh status
 bash scripts/start_notify_daemons.sh stop
 ```
 
+The daemon writes `${NOTIFY_KEY_PREFIX:-taey}:_notify_daemon:heartbeat`
+from an independent timer thread, not from the delivery loop. The delivery
+loop separately advances
+`${NOTIFY_KEY_PREFIX:-taey}:_notify_daemon:delivery_progress`; watchdogs
+should treat a fresh heartbeat as process liveness and the progress cursor as
+delivery-loop movement. A slow broadcast fan-out that keeps advancing progress
+is healthy; sustained delivery-progress staleness is the delivery-stall signal.
+
 Smoke the Redis round trip:
 
 ```bash

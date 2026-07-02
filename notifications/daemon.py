@@ -64,6 +64,9 @@ DEFAULT_INJECT_FAILURE_ESCALATION_TTL_SECS = 900
 MAX_MESSAGE_LENGTH = 4000
 DAEMON_HEARTBEAT_NODE = "_notify_daemon"
 DAEMON_HEARTBEAT_SUFFIX = "heartbeat"
+DAEMON_DELIVERY_PROGRESS_SUFFIX = "delivery_progress"
+DEFAULT_DAEMON_HEARTBEAT_INTERVAL_SECS = 3.0
+DEFAULT_DELIVERY_PROGRESS_MAX_AGE_SECS = 15.0
 USAGE_LIMIT_IDLE_MARKERS = (
     "you've hit your session limit",
     "you have hit your session limit",
@@ -115,6 +118,23 @@ class _HandoffValidationJob:
             self.error = exc
         finally:
             self.done.set()
+
+
+class _DaemonDeliveryProgress:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._cursor = 0
+        self._last_monotonic = time.monotonic()
+
+    def mark(self) -> int:
+        with self._lock:
+            self._cursor += 1
+            self._last_monotonic = time.monotonic()
+            return self._cursor
+
+    def age(self) -> float:
+        with self._lock:
+            return time.monotonic() - self._last_monotonic
 
 
 def _consume_handoff_validation_job(
@@ -279,6 +299,88 @@ def write_daemon_heartbeat(r, machine: str, *, now: float | None = None) -> str:
     value = f"{ts:.6f}+{machine}"
     r.set(state_key(DAEMON_HEARTBEAT_NODE, DAEMON_HEARTBEAT_SUFFIX), value)
     return value
+
+
+def write_daemon_delivery_progress(
+    r,
+    machine: str,
+    *,
+    cursor: int,
+    now: float | None = None,
+) -> str:
+    ts = time.time() if now is None else float(now)
+    value = f"{ts:.6f}+{machine}+{int(cursor)}"
+    r.set(state_key(DAEMON_HEARTBEAT_NODE, DAEMON_DELIVERY_PROGRESS_SUFFIX), value)
+    return value
+
+
+def _connect_redis(redis_lib, redis_host: str, redis_port: int):
+    return redis_lib.Redis(
+        host=redis_host,
+        port=redis_port,
+        decode_responses=True,
+        socket_timeout=REDIS_SOCKET_TIMEOUT_SECS,
+        socket_connect_timeout=REDIS_SOCKET_TIMEOUT_SECS,
+    )
+
+
+def _mark_daemon_delivery_progress(
+    r,
+    progress: _DaemonDeliveryProgress,
+    machine: str,
+) -> None:
+    cursor = progress.mark()
+    try:
+        write_daemon_delivery_progress(r, machine, cursor=cursor, now=time.time())
+    except Exception as exc:
+        logger.error("daemon delivery progress write failed: %s", exc)
+
+
+def _start_daemon_heartbeat_thread(
+    redis_lib,
+    redis_host: str,
+    redis_port: int,
+    machine: str,
+    *,
+    interval_sec: float,
+    delivery_progress: _DaemonDeliveryProgress,
+    delivery_progress_max_age_sec: float,
+) -> tuple[threading.Event, threading.Thread]:
+    stop_event = threading.Event()
+    heartbeat_redis = _connect_redis(redis_lib, redis_host, redis_port)
+
+    def beat() -> None:
+        stalled_logged = False
+        while not stop_event.is_set():
+            progress_age = delivery_progress.age()
+            if progress_age > delivery_progress_max_age_sec:
+                if not stalled_logged:
+                    logger.critical(
+                        "daemon delivery loop progress stalled for %.3fs; heartbeat withheld",
+                        progress_age,
+                    )
+                    stalled_logged = True
+                stop_event.wait(interval_sec)
+                continue
+            stalled_logged = False
+            try:
+                write_daemon_heartbeat(heartbeat_redis, machine, now=time.time())
+            except Exception as exc:
+                logger.error("daemon heartbeat write failed: %s", exc)
+            stop_event.wait(interval_sec)
+
+    try:
+        write_daemon_heartbeat(heartbeat_redis, machine, now=time.time())
+    except Exception as exc:
+        logger.error("daemon heartbeat write failed: %s", exc)
+
+    thread = threading.Thread(
+        target=beat,
+        name="notify-daemon-heartbeat",
+        daemon=True,
+    )
+    thread.start()
+    return stop_event, thread
 
 
 def _record_pointer_inject_result(r, node_id: str, *, ok: bool,
@@ -467,13 +569,7 @@ def run_daemon(
     """Main loop — one process handles all local tmux sessions."""
     import redis as redis_lib
 
-    r = redis_lib.Redis(
-        host=redis_host,
-        port=redis_port,
-        decode_responses=True,
-        socket_timeout=REDIS_SOCKET_TIMEOUT_SECS,
-        socket_connect_timeout=REDIS_SOCKET_TIMEOUT_SECS,
-    )
+    r = _connect_redis(redis_lib, redis_host, redis_port)
 
     try:
         r.ping()
@@ -481,11 +577,10 @@ def run_daemon(
         logger.error("Cannot connect to Redis at %s:%s: %s", redis_host, redis_port, exc)
         sys.exit(1)
 
-    import socket
-
+    machine = socket.gethostname()
     logger.info(
         "Started on %s: redis=%s:%s poll=%ss",
-        socket.gethostname(),
+        machine,
         redis_host,
         redis_port,
         poll_interval,
@@ -493,188 +588,206 @@ def run_daemon(
     logger.info("Using Redis key prefix: %s", key_prefix())
 
     handoff_validation_job: _HandoffValidationJob | None = None
-    while True:
-        try:
-            local_sessions = get_local_tmux_sessions()
-            local_session_set = set(local_sessions)
-            machine = socket.gethostname()
+    delivery_progress = _DaemonDeliveryProgress()
+    delivery_progress.mark()
+    heartbeat_stop, heartbeat_thread = _start_daemon_heartbeat_thread(
+        redis_lib,
+        redis_host,
+        redis_port,
+        machine,
+        interval_sec=max(0.01, min(float(poll_interval), DEFAULT_DAEMON_HEARTBEAT_INTERVAL_SECS)),
+        delivery_progress=delivery_progress,
+        delivery_progress_max_age_sec=max(
+            DEFAULT_DELIVERY_PROGRESS_MAX_AGE_SECS,
+            float(poll_interval) * 3,
+        ),
+    )
+    try:
+        while True:
             try:
-                write_daemon_heartbeat(r, machine, now=time.time())
-            except Exception as exc:
-                logger.error("daemon heartbeat write failed: %s", exc)
+                local_sessions = get_local_tmux_sessions()
+                local_session_set = set(local_sessions)
+                _mark_daemon_delivery_progress(r, delivery_progress, machine)
 
-            try:
-                handoff_validation_job = _advance_handoff_validation_job(
-                    handoff_validation_job,
-                    r,
-                    prefix=key_prefix(),
-                    timeout_sec=HANDOFF_VALIDATION_TIMEOUT_SECS,
-                )
-            except Exception as exc:
-                logger.error("handoff activation validation failed: %s", exc)
-
-            for session_name in local_sessions:
-                node_id = session_name
                 try:
-                    mark_session_machine(
+                    handoff_validation_job = _advance_handoff_validation_job(
+                        handoff_validation_job,
                         r,
                         prefix=key_prefix(),
-                        session_id=node_id,
-                        machine=machine,
+                        timeout_sec=HANDOFF_VALIDATION_TIMEOUT_SECS,
                     )
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.error("handoff activation validation failed: %s", exc)
 
-                if not has_pending_messages(r, node_id):
-                    continue
-                now = time.time()
-                if not is_node_idle(r, node_id):
-                    reconcile_usage_limit_idle(r, node_id, session_name)
-                if not is_node_idle(r, node_id):
-                    continue
-
-                # Per-session inject backoff. The inbox signature changes when a
-                # new message arrives (inject promptly) but stays identical for a
-                # wedged/non-submitting session (idle never clears) — in which
-                # case re-inject at most once per POINTER_INJECT_BACKOFF_SECS
-                # instead of every poll. Prevents the keystroke hammer.
-                try:
-                    inbox_sig = hashlib.sha1(
-                        b"\n".join(s.encode() for s in r.lrange(inbox_key(node_id), 0, -1))
-                    ).hexdigest()
-                except Exception:
-                    inbox_sig = None
-                if inbox_sig is not None:
-                    bo_raw = r.get(state_key(node_id, "pointer_inject_backoff"))
-                    if bo_raw:
-                        try:
-                            bo = json.loads(bo_raw)
-                            if (bo.get("sig") == inbox_sig
-                                    and (now - float(bo.get("ts", 0))) < POINTER_INJECT_BACKOFF_SECS):
-                                continue  # same undrained inbox, injected recently -> back off
-                        except Exception:
-                            pass
-
-                # Grok-cli does NOT honor additionalContext from prompt hooks
-                # the way Claude Code / codex / gemini do. For *-grok targets
-                # we inject FULL message bodies via tmux instead of the
-                # pointer; for everyone else we keep the pointer pattern.
-                # Inbox still drains via the hook on grok's submit
-                # (idempotent — bodies already delivered inline).
-                # Verified 2026-05-26 by x-claude + treasurer independently
-                # with 3-fact chains showing the pointer pattern silently
-                # dropped grok's dispatched bodies.
-                if node_id.endswith("-grok"):
-                    summary = build_grok_full_body(r, node_id)
-                else:
-                    # POINTER ONLY — peek inbox, build summary, inject into tmux.
-                    # Full bodies stay in Redis; recipient reads via hook on
-                    # next tool call / prompt submit.
-                    summary = build_pointer_summary(r, node_id)
-                if not summary:
-                    continue
-
-                # DO NOT clear idle here. idle is removed ONLY by the
-                # UserPromptSubmit hook — i.e. only when the recipient actually
-                # SUBMITS the injected pointer as a prompt (= real, validated
-                # delivery). Clearing it here ASSUMED the injection landed; when an
-                # injection silently failed, idle was gone with no prompt ever
-                # submitted, so the message stranded with nothing to re-trigger
-                # delivery.
-                #
-                # Leaving idle set: a failed / unsubmitted injection simply retries
-                # on the next poll; a SUCCESSFUL one is cleared by the hook at
-                # submit-time (within one poll window), so it does not re-inject.
-                # Double-delivery is therefore prevented by the hook, not by the
-                # daemon pre-emptively clearing a flag it cannot validate.
-                logger.info("Notifying %s: %s", session_name, summary)
-                ok = inject_via_tmux(session_name, summary)
-                # Stamp the backoff on every attempt (ok or not): whether the
-                # inject lands or fails, do not re-inject this same inbox for
-                # POINTER_INJECT_BACKOFF_SECS. A new message changes inbox_sig and
-                # injects promptly; a successful submit clears idle (no re-inject).
-                if inbox_sig is not None:
+                for session_name in local_sessions:
+                    node_id = session_name
+                    _mark_daemon_delivery_progress(r, delivery_progress, machine)
                     try:
-                        r.set(
-                            state_key(node_id, "pointer_inject_backoff"),
-                            json.dumps({"sig": inbox_sig, "ts": now}),
-                            ex=POINTER_INJECT_BACKOFF_SECS * 4,
+                        mark_session_machine(
+                            r,
+                            prefix=key_prefix(),
+                            session_id=node_id,
+                            machine=machine,
                         )
                     except Exception:
                         pass
-                try:
-                    from notifications.trace import trace
-                    trace(r, "inject", node=session_name, ok=ok)
-                except Exception:
-                    pass
-                try:
-                    record_delivery_signal(
-                        r,
-                        prefix=key_prefix(),
-                        target_session_id=node_id,
-                        signal="inject_ok" if ok else "inject_failed",
-                        signal_source="notify-daemon",
-                        machine=machine,
-                    )
-                except Exception:
-                    pass
-                try:
-                    _record_pointer_inject_result(
-                        r,
-                        node_id,
-                        ok=ok,
-                        machine=machine,
-                        now=now,
-                    )
-                except Exception:
-                    pass
-                if not ok:
-                    logger.error(
-                        "Injection failed for %s; message left queued, will retry",
-                        session_name,
-                    )
 
-            inbox_pattern = f"{key_prefix()}:*:inbox"
-            for inbox in r.scan_iter(match=inbox_pattern):
-                parts = str(inbox).split(":")
-                if len(parts) < 3:
-                    continue
-                target_session_id = parts[-2]
-                if target_session_id in local_session_set:
-                    continue
-                if not has_pending_messages(r, target_session_id):
-                    continue
-                machine_key = session_machine_key(key_prefix(), target_session_id)
-                if r.get(machine_key) != machine:
-                    continue
+                    if not has_pending_messages(r, node_id):
+                        continue
+                    now = time.time()
+                    if not is_node_idle(r, node_id):
+                        reconcile_usage_limit_idle(r, node_id, session_name)
+                    if not is_node_idle(r, node_id):
+                        continue
+
+                    # Per-session inject backoff. The inbox signature changes when a
+                    # new message arrives (inject promptly) but stays identical for a
+                    # wedged/non-submitting session (idle never clears) — in which
+                    # case re-inject at most once per POINTER_INJECT_BACKOFF_SECS
+                    # instead of every poll. Prevents the keystroke hammer.
+                    try:
+                        inbox_sig = hashlib.sha1(
+                            b"\n".join(s.encode() for s in r.lrange(inbox_key(node_id), 0, -1))
+                        ).hexdigest()
+                    except Exception:
+                        inbox_sig = None
+                    if inbox_sig is not None:
+                        bo_raw = r.get(state_key(node_id, "pointer_inject_backoff"))
+                        if bo_raw:
+                            try:
+                                bo = json.loads(bo_raw)
+                                if (bo.get("sig") == inbox_sig
+                                        and (now - float(bo.get("ts", 0))) < POINTER_INJECT_BACKOFF_SECS):
+                                    continue  # same undrained inbox, injected recently -> back off
+                            except Exception:
+                                pass
+
+                    # Grok-cli does NOT honor additionalContext from prompt hooks
+                    # the way Claude Code / codex / gemini do. For *-grok targets
+                    # we inject FULL message bodies via tmux instead of the
+                    # pointer; for everyone else we keep the pointer pattern.
+                    # Inbox still drains via the hook on grok's submit
+                    # (idempotent — bodies already delivered inline).
+                    # Verified 2026-05-26 by x-claude + treasurer independently
+                    # with 3-fact chains showing the pointer pattern silently
+                    # dropped grok's dispatched bodies.
+                    if node_id.endswith("-grok"):
+                        summary = build_grok_full_body(r, node_id)
+                    else:
+                        # POINTER ONLY — peek inbox, build summary, inject into tmux.
+                        # Full bodies stay in Redis; recipient reads via hook on
+                        # next tool call / prompt submit.
+                        summary = build_pointer_summary(r, node_id)
+                    if not summary:
+                        continue
+
+                    # DO NOT clear idle here. idle is removed ONLY by the
+                    # UserPromptSubmit hook — i.e. only when the recipient actually
+                    # SUBMITS the injected pointer as a prompt (= real, validated
+                    # delivery). Clearing it here ASSUMED the injection landed; when an
+                    # injection silently failed, idle was gone with no prompt ever
+                    # submitted, so the message stranded with nothing to re-trigger
+                    # delivery.
+                    #
+                    # Leaving idle set: a failed / unsubmitted injection simply retries
+                    # on the next poll; a SUCCESSFUL one is cleared by the hook at
+                    # submit-time (within one poll window), so it does not re-inject.
+                    # Double-delivery is therefore prevented by the hook, not by the
+                    # daemon pre-emptively clearing a flag it cannot validate.
+                    logger.info("Notifying %s: %s", session_name, summary)
+                    _mark_daemon_delivery_progress(r, delivery_progress, machine)
+                    ok = inject_via_tmux(session_name, summary)
+                    _mark_daemon_delivery_progress(r, delivery_progress, machine)
+                    # Stamp the backoff on every attempt (ok or not): whether the
+                    # inject lands or fails, do not re-inject this same inbox for
+                    # POINTER_INJECT_BACKOFF_SECS. A new message changes inbox_sig and
+                    # injects promptly; a successful submit clears idle (no re-inject).
+                    if inbox_sig is not None:
+                        try:
+                            r.set(
+                                state_key(node_id, "pointer_inject_backoff"),
+                                json.dumps({"sig": inbox_sig, "ts": now}),
+                                ex=POINTER_INJECT_BACKOFF_SECS * 4,
+                            )
+                        except Exception:
+                            pass
+                    try:
+                        from notifications.trace import trace
+                        trace(r, "inject", node=session_name, ok=ok)
+                    except Exception:
+                        pass
+                    try:
+                        record_delivery_signal(
+                            r,
+                            prefix=key_prefix(),
+                            target_session_id=node_id,
+                            signal="inject_ok" if ok else "inject_failed",
+                            signal_source="notify-daemon",
+                            machine=machine,
+                        )
+                    except Exception:
+                        pass
+                    try:
+                        _record_pointer_inject_result(
+                            r,
+                            node_id,
+                            ok=ok,
+                            machine=machine,
+                            now=now,
+                        )
+                    except Exception:
+                        pass
+                    if not ok:
+                        logger.error(
+                            "Injection failed for %s; message left queued, will retry",
+                            session_name,
+                        )
+
+                inbox_pattern = f"{key_prefix()}:*:inbox"
+                for inbox in r.scan_iter(match=inbox_pattern):
+                    _mark_daemon_delivery_progress(r, delivery_progress, machine)
+                    parts = str(inbox).split(":")
+                    if len(parts) < 3:
+                        continue
+                    target_session_id = parts[-2]
+                    if target_session_id in local_session_set:
+                        continue
+                    if not has_pending_messages(r, target_session_id):
+                        continue
+                    machine_key = session_machine_key(key_prefix(), target_session_id)
+                    if r.get(machine_key) != machine:
+                        continue
+                    try:
+                        record_delivery_signal(
+                            r,
+                            prefix=key_prefix(),
+                            target_session_id=target_session_id,
+                            signal="tmux_missing",
+                            signal_source="notify-daemon",
+                            machine=machine,
+                        )
+                    except Exception:
+                        pass
+
                 try:
-                    record_delivery_signal(
-                        r,
-                        prefix=key_prefix(),
-                        target_session_id=target_session_id,
-                        signal="tmux_missing",
-                        signal_source="notify-daemon",
-                        machine=machine,
-                    )
+                    from notifications.trace import trim_trace
+                    trim_trace(r)
                 except Exception:
                     pass
-
-            try:
-                from notifications.trace import trim_trace
-                trim_trace(r)
-            except Exception:
-                pass
-            time.sleep(poll_interval)
-        except KeyboardInterrupt:
-            _consume_handoff_validation_job(
-                handoff_validation_job,
-                wait_sec=HANDOFF_VALIDATION_SHUTDOWN_GRACE_SECS,
-            )
-            logger.info("Daemon stopped")
-            break
-        except Exception as exc:
-            logger.error("Error: %s", exc)
-            time.sleep(poll_interval)
+                time.sleep(poll_interval)
+            except KeyboardInterrupt:
+                logger.info("Daemon stopped")
+                break
+            except Exception as exc:
+                logger.error("Error: %s", exc)
+                time.sleep(poll_interval)
+    finally:
+        heartbeat_stop.set()
+        heartbeat_thread.join(1.0)
+        _consume_handoff_validation_job(
+            handoff_validation_job,
+            wait_sec=HANDOFF_VALIDATION_SHUTDOWN_GRACE_SECS,
+        )
 
 
 def main() -> None:
