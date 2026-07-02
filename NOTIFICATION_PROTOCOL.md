@@ -115,7 +115,7 @@ Tmux is used only when the session is stopped and `idle=1`, and it carries only 
 | `${NOTIFY_KEY_PREFIX:-taey}:SESSION:last_activity` | hook activity | overwritten by later hook activity |
 | `${NOTIFY_KEY_PREFIX:-taey}:SESSION:last_tool_activity` | tool-hook activity | overwritten by later tool-hook activity |
 
-The daemon's usage-limit repair is intentionally narrow: it only restores `idle=1` for a local tmux pane that visibly shows a Claude Code session/weekly/usage-limit banner while no tool is marked running. It is not a stale-activity or pane-active injection heuristic; after repair, the same one-flag `idle=1` authorization rule still decides pointer injection. The daemon never clears idle because tmux injection is not proof that the prompt was submitted.
+The daemon's usage-limit repair is intentionally narrow: it only restores `idle=1` for a local tmux pane whose current bottom resting region visibly shows a Claude Code session/weekly/usage-limit banner while no tool is marked running. It is not a stale-activity, scrollback, or pane-active injection heuristic; after repair, the same one-flag `idle=1` authorization rule still decides pointer injection. The daemon never clears idle because tmux injection is not proof that the prompt was submitted.
 
 ## Message format
 
@@ -186,7 +186,7 @@ taey-ack --peek
 
 ## Anti-patterns
 
-- Never set `idle=1` outside the `Stop` hook.
+- Never set `idle=1` from ad hoc code paths; valid setters are `Stop`, `SessionStart`, and the daemon's narrow current-pane usage-limit reconciliation.
 - Never send full message bodies through tmux injection; use Redis plus hook `additionalContext`.
 - Never clear queues with destructive `DELETE` during normal acknowledgement; drain with pops so messages arriving concurrently are not dropped.
 - Do not relay messages through a central human or agent when the sender can target the recipient directly.

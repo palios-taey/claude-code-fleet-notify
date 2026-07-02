@@ -71,12 +71,17 @@ USAGE_LIMIT_IDLE_MARKERS = (
     "you have reached your session limit",
     "you've hit your weekly limit",
     "you have hit your weekly limit",
+    "you've reached your weekly limit",
+    "you have reached your weekly limit",
     "you've hit your usage limit",
     "you have hit your usage limit",
+    "you've reached your usage limit",
+    "you have reached your usage limit",
 )
 USAGE_LIMIT_TRANSIENT_EXCLUSIONS = (
     "not your usage limit",
 )
+USAGE_LIMIT_RESTING_REGION_NONBLANK_LINES = 3
 
 
 class _HandoffValidationJob:
@@ -179,8 +184,13 @@ def _tmux_pane_tail(session_name: str, *, lines: int = 80) -> str:
     return ""
 
 
+def _usage_limit_resting_region(pane_text: str) -> str:
+    nonblank_lines = [line.strip() for line in (pane_text or "").splitlines() if line.strip()]
+    return "\n".join(nonblank_lines[-USAGE_LIMIT_RESTING_REGION_NONBLANK_LINES:])
+
+
 def _pane_shows_usage_limit_resting_state(pane_text: str) -> bool:
-    normalized = " ".join((pane_text or "").lower().split())
+    normalized = " ".join(_usage_limit_resting_region(pane_text).lower().split())
     if not normalized:
         return False
     if any(marker in normalized for marker in USAGE_LIMIT_TRANSIENT_EXCLUSIONS):
