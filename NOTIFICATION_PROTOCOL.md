@@ -35,7 +35,7 @@ For every tmux-session participant (Claude Code / codex / gemini / grok), notifi
 - The session sees the notification body in its next prompt context without any tmux involvement.
 - This is the **injection-during-tool-use** path. Used while `idle != 1`.
 
-**Path B — Idle (session has stopped, `idle=1` set by Stop hook)**:
+**Path B — Idle (session has stopped, `idle=1` set by Stop/SessionStart or usage-limit reconciliation)**:
 - The notification daemon (`notifications/daemon.py`) polls Redis, detects pending notifications for an idle session, and uses `scripts/tmux-send` to inject a pointer prompt into the session's tmux pane.
 - The session sees the pointer (e.g., "[NOTIFY] You have N messages...") and acts on it.
 - This is the **tmux-when-idle** path. Used only while `idle == 1`. The daemon does NOT clear idle; prompt/tool hooks clear it when the CLI becomes active again.
@@ -64,7 +64,7 @@ Use `bash scripts/install-hooks.sh --help` for the full installation matrix. `--
 
 When a worker stops, its Stop hook runs `_shared.py:action_stop` which:
 
-1. Sets `${NOTIFY_KEY_PREFIX:-taey}:<node>:idle=1` (load-bearing — this is the only setter).
+1. Sets `${NOTIFY_KEY_PREFIX:-taey}:<node>:idle=1` (load-bearing — this is the normal stopped-session setter).
 2. Resolves the supervisor via two-mechanism rule: explicit `${NOTIFY_KEY_PREFIX:-taey}:<node>:parent` Redis key wins, else suffix-strip (`<name>-codex` / `<name>-gemini` / `<name>-grok` → `<name>`). Top-level sessions resolve to `None` and skip the parent-notify.
 3. Reads `${NOTIFY_KEY_PREFIX:-taey}:<node>:current_task` (JSON `{task_id, description, supervisor, started_at}`, written by the dispatcher in [`claude-code-fleet-orchestrator`](https://github.com/palios-taey/claude-code-fleet-orchestrator)) + `${NOTIFY_KEY_PREFIX:-taey}:<node>:last_outcome` (JSON `{outcome, details}`, optionally set by the worker via `record_outcome()`).
 4. Pushes a single `peer_idle` message to the supervisor's inbox with the outcome enum (`done | error | interrupted | unknown`) inline.
@@ -84,7 +84,7 @@ Two paths:
 
 1. **Active session, hook path**: `PostToolUse` drains queues after a tool call and shows full message bodies through `hookSpecificOutput.additionalContext`. Full content is allowed here because it is structured hook output, not shell text sent through tmux.
 
-2. **Idle session, daemon path**: when the `Stop` hook has set `${NOTIFY_KEY_PREFIX:-taey}:SESSION:idle=1` and messages exist, the daemon injects only a pointer summary:
+2. **Idle session, daemon path**: when `${NOTIFY_KEY_PREFIX:-taey}:SESSION:idle=1` exists and messages exist, the daemon injects only a pointer summary:
 
    ```text
    [NOTIFY] You have 3 messages (from <session-A>, docs-agent; first=ESCALATION). Read with: redis-cli -h 127.0.0.1 LRANGE ${NOTIFY_KEY_PREFIX:-taey}:SESSION:inbox 0 -1
@@ -103,7 +103,7 @@ Tmux is used only when the session is stopped and `idle=1`, and it carries only 
 | `${NOTIFY_KEY_PREFIX:-taey}:SESSION:inbox` | inter-session queue, writers `LPUSH`, readers `RPOP` |
 | `${NOTIFY_KEY_PREFIX:-taey}:SESSION:notifications` | monitor / worker queue, writers `RPUSH`, readers `LPOP` |
 | `${NOTIFY_KEY_PREFIX:-taey}:notify:SESSION:orch` | auxiliary queue, writers `RPUSH`, readers `LPOP` |
-| `${NOTIFY_KEY_PREFIX:-taey}:SESSION:idle` | durable idle flag set only by `Stop` |
+| `${NOTIFY_KEY_PREFIX:-taey}:SESSION:idle` | durable idle flag set by lifecycle hooks, or by daemon repair for a parked Claude Code usage-limit banner |
 | `${NOTIFY_KEY_PREFIX:-taey}:SESSION:last_activity` | last hook activity timestamp, used for handoff activation observation |
 | `${NOTIFY_KEY_PREFIX:-taey}:SESSION:last_tool_activity` | last tool-hook activity timestamp, used for handoff activation observation |
 
@@ -111,11 +111,11 @@ Tmux is used only when the session is stopped and `idle=1`, and it carries only 
 
 | Flag | Who sets it | Who clears it |
 |---|---|---|
-| `${NOTIFY_KEY_PREFIX:-taey}:SESSION:idle` | **Only** the `Stop` hook | `UserPromptSubmit`/`BeforeAgent` and tool-activity hooks |
+| `${NOTIFY_KEY_PREFIX:-taey}:SESSION:idle` | `Stop`, `SessionStart`, and daemon usage-limit reconciliation | `UserPromptSubmit`/`BeforeAgent` and tool-activity hooks |
 | `${NOTIFY_KEY_PREFIX:-taey}:SESSION:last_activity` | hook activity | overwritten by later hook activity |
 | `${NOTIFY_KEY_PREFIX:-taey}:SESSION:last_tool_activity` | tool-hook activity | overwritten by later tool-hook activity |
 
-Nothing else sets `idle=1`. The daemon never clears idle because tmux injection is not proof that the prompt was submitted.
+The daemon's usage-limit repair is intentionally narrow: it only restores `idle=1` for a local tmux pane that visibly shows a Claude Code session/weekly/usage-limit banner while no tool is marked running. It is not a stale-activity or pane-active injection heuristic; after repair, the same one-flag `idle=1` authorization rule still decides pointer injection. The daemon never clears idle because tmux injection is not proof that the prompt was submitted.
 
 ## Message format
 

@@ -296,6 +296,67 @@ class DaemonTests(unittest.TestCase):
         self.assertIn("queued", context)
         self.assertEqual(0, r.llen(inbox_key("long-tool")))
 
+    def test_usage_limit_banner_reconciles_parent_idle_before_inject(self):
+        r = FakeRedis()
+        r.set(state_key("gatekeeper", "last_activity"), "1000")
+        r.lpush(inbox_key("gatekeeper"), json.dumps({"from": "sender", "type": "message", "body": "queued"}))
+
+        with mock.patch.object(
+            daemon,
+            "_tmux_pane_tail",
+            return_value="You've hit your session limit · resets 2:10am (Africa/Abidjan)",
+        ):
+            inject = self.run_daemon_once(r, ["gatekeeper"], now=2500.0)
+
+        inject.assert_called_once()
+        self.assertEqual("gatekeeper", inject.call_args.args[0])
+        self.assertTrue(r.exists(state_key("gatekeeper", "idle")))
+        self.assertEqual(1, r.llen(inbox_key("gatekeeper")))
+
+    def test_usage_limit_reconcile_does_not_restore_generic_stale_idle_absence(self):
+        r = FakeRedis()
+        r.set(state_key("gatekeeper", "last_activity"), "1000")
+        r.lpush(inbox_key("gatekeeper"), json.dumps({"from": "sender", "type": "message", "body": "queued"}))
+
+        with mock.patch.object(daemon, "_tmux_pane_tail", return_value="Claude Code ready at prompt"):
+            inject = self.run_daemon_once(r, ["gatekeeper"], now=2500.0)
+
+        inject.assert_not_called()
+        self.assertFalse(r.exists(state_key("gatekeeper", "idle")))
+        self.assertEqual(1, r.llen(inbox_key("gatekeeper")))
+
+    def test_transient_not_your_usage_limit_does_not_reconcile_idle(self):
+        r = FakeRedis()
+        r.set(state_key("gatekeeper", "last_activity"), "1000")
+        r.lpush(inbox_key("gatekeeper"), json.dumps({"from": "sender", "type": "message", "body": "queued"}))
+
+        with mock.patch.object(
+            daemon,
+            "_tmux_pane_tail",
+            return_value="API Error: Server is temporarily limiting requests (not your usage limit)",
+        ):
+            inject = self.run_daemon_once(r, ["gatekeeper"], now=2500.0)
+
+        inject.assert_not_called()
+        self.assertFalse(r.exists(state_key("gatekeeper", "idle")))
+
+    def test_usage_limit_reconcile_respects_tool_running(self):
+        r = FakeRedis()
+        r.set(state_key("gatekeeper", "last_activity"), "1000")
+        r.set(state_key("gatekeeper", "tool_running"), "1")
+        r.lpush(inbox_key("gatekeeper"), json.dumps({"from": "sender", "type": "message", "body": "queued"}))
+
+        with mock.patch.object(
+            daemon,
+            "_tmux_pane_tail",
+            return_value="You've hit your session limit · resets 2:10am (Africa/Abidjan)",
+        ):
+            inject = self.run_daemon_once(r, ["gatekeeper"], now=2500.0)
+
+        inject.assert_not_called()
+        self.assertFalse(r.exists(state_key("gatekeeper", "idle")))
+        self.assertEqual(1, r.llen(inbox_key("gatekeeper")))
+
     def test_idle_flag_is_authoritative_even_when_tool_running_exists(self):
         r = FakeRedis()
         r.set(state_key("mid-tool", "idle"), "1")

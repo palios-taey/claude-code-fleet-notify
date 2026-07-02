@@ -64,6 +64,19 @@ DEFAULT_INJECT_FAILURE_ESCALATION_TTL_SECS = 900
 MAX_MESSAGE_LENGTH = 4000
 DAEMON_HEARTBEAT_NODE = "_notify_daemon"
 DAEMON_HEARTBEAT_SUFFIX = "heartbeat"
+USAGE_LIMIT_IDLE_MARKERS = (
+    "you've hit your session limit",
+    "you have hit your session limit",
+    "you've reached your session limit",
+    "you have reached your session limit",
+    "you've hit your weekly limit",
+    "you have hit your weekly limit",
+    "you've hit your usage limit",
+    "you have hit your usage limit",
+)
+USAGE_LIMIT_TRANSIENT_EXCLUSIONS = (
+    "not your usage limit",
+)
 
 
 class _HandoffValidationJob:
@@ -149,6 +162,54 @@ def get_local_tmux_sessions() -> list[str]:
     except Exception:
         pass
     return []
+
+
+def _tmux_pane_tail(session_name: str, *, lines: int = 80) -> str:
+    try:
+        result = subprocess.run(
+            ["tmux", "capture-pane", "-p", "-t", session_name, "-S", f"-{lines}"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode == 0:
+            return result.stdout or ""
+    except Exception as exc:
+        logger.debug("tmux pane capture failed for %s: %s", session_name, exc)
+    return ""
+
+
+def _pane_shows_usage_limit_resting_state(pane_text: str) -> bool:
+    normalized = " ".join((pane_text or "").lower().split())
+    if not normalized:
+        return False
+    if any(marker in normalized for marker in USAGE_LIMIT_TRANSIENT_EXCLUSIONS):
+        return False
+    return any(marker in normalized for marker in USAGE_LIMIT_IDLE_MARKERS)
+
+
+def reconcile_usage_limit_idle(r, node_id: str, session_name: str) -> bool:
+    """Restore idle=1 when Claude Code parks at a usage-limit banner.
+
+    A session-limit abort can return the TUI to a resting prompt without firing
+    Stop, leaving the explicit idle flag absent. This helper repairs only that
+    observed parked state; normal idle-absent sessions remain active and wait
+    for PostToolUse/UserPromptSubmit delivery.
+    """
+    if is_node_idle(r, node_id):
+        return False
+    if r.exists(state_key(node_id, "tool_running")):
+        return False
+    if not _pane_shows_usage_limit_resting_state(_tmux_pane_tail(session_name)):
+        return False
+    r.set(state_key(node_id, "idle"), "1")
+    logger.warning("Reconciled idle=1 for %s after usage-limit banner", node_id)
+    try:
+        from notifications.trace import trace
+        trace(r, "idle_set", node=node_id, src="usage_limit_reconcile")
+    except Exception:
+        pass
+    return True
 
 
 def _clip_message(message: str) -> str:
@@ -457,6 +518,8 @@ def run_daemon(
                 if not has_pending_messages(r, node_id):
                     continue
                 now = time.time()
+                if not is_node_idle(r, node_id):
+                    reconcile_usage_limit_idle(r, node_id, session_name)
                 if not is_node_idle(r, node_id):
                     continue
 
