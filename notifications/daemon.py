@@ -112,7 +112,7 @@ class _HandoffValidationJob:
             self.updated = validate_handoff_activation(
                 self.redis_client,
                 prefix=self.prefix,
-                timeout_sec=self.timeout_sec,
+                timeout_sec=None,
             )
         except Exception as exc:
             self.error = exc

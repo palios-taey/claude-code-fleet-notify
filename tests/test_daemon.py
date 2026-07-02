@@ -11,7 +11,13 @@ from unittest import mock
 from hooks import _shared as shared
 from notifications import daemon
 from notifications.inbox import inbox_key, key_prefix, state_key
-from notifications.handoff import create_explicit_handoff, explicit_ack_key, explicit_handoff_key
+from notifications.handoff import (
+    DEFAULT_VALIDATION_SCAN_COUNT,
+    create_explicit_handoff,
+    explicit_ack_key,
+    explicit_handoff_key,
+    validate_handoff_activation,
+)
 from tests.fakes import FakeRedis
 
 
@@ -186,6 +192,33 @@ class DaemonTests(unittest.TestCase):
         self.assertEqual(daemon.REDIS_SOCKET_TIMEOUT_SECS, redis_kwargs.get("socket_connect_timeout"))
         self.assertLess(daemon.REDIS_SOCKET_TIMEOUT_SECS, daemon.HANDOFF_VALIDATION_TIMEOUT_SECS)
 
+    def test_handoff_validation_scan_uses_large_count(self):
+        class RecordingScanRedis(FakeRedis):
+            def __init__(self):
+                super().__init__()
+                self.scan_calls = []
+
+            def scan_iter(self, match=None, count=None):
+                self.scan_calls.append((match, count))
+                yield from super().scan_iter(match=match, count=count)
+
+        r = RecordingScanRedis()
+        with mock.patch.object(daemon.time, "time", return_value=1000):
+            create_explicit_handoff(
+                r,
+                prefix=key_prefix(),
+                dispatcher_session_id="conductor",
+                target_session_id="worker-codex",
+                body="dispatch body",
+                msg_type="command",
+                priority="normal",
+                dispatcher_task_id="task-59",
+            )
+
+        validate_handoff_activation(r, prefix=key_prefix(), now=1001, timeout_sec=None)
+
+        self.assertIn((f"{key_prefix()}:handoff:*", DEFAULT_VALIDATION_SCAN_COUNT), r.scan_calls)
+
     def test_handoff_validation_timeout_does_not_wedge_delivery(self):
         class BlockingHandoffScanRedis(FakeRedis):
             def __init__(self):
@@ -268,6 +301,7 @@ class DaemonTests(unittest.TestCase):
                     self.assertIs(next_job, job)
 
                 self.assertEqual(1, len(calls))
+                self.assertIsNone(calls[0][2])
                 self.assertTrue(job.warned)
                 self.assertLess(max(latencies), 0.25)
         finally:
