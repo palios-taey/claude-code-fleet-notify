@@ -16,6 +16,7 @@ _FLAG_CACHE_AT = 0.0
 _FLAG_CACHE_DATA: dict[str, dict[str, bool]] = {}
 _FLAG_CACHE_LOCK = threading.Lock()
 DEFAULT_VALIDATION_TIMEOUT_SECS = 5.0
+DEFAULT_VALIDATION_SCAN_COUNT = 1000
 _VALIDATION_LOCK = threading.Lock()
 
 
@@ -342,7 +343,7 @@ def _notify_activation_failed(redis_client, prefix: str, record: dict[str, Any],
 def _validate_handoff_activation_once(redis_client, *, prefix: str, now: float | None = None) -> int:
     now = time.time() if now is None else now
     updated = 0
-    for record_key in redis_client.scan_iter(match=f"{prefix}:handoff:*"):
+    for record_key in redis_client.scan_iter(match=f"{prefix}:handoff:*", count=DEFAULT_VALIDATION_SCAN_COUNT):
         try:
             record = json.loads(redis_client.get(record_key) or "")
         except Exception:
