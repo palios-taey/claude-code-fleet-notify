@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import threading
 import time as time_module
@@ -500,11 +501,171 @@ class DaemonTests(unittest.TestCase):
         }))
 
         fake_redis_module = SimpleNamespace(Redis=lambda **kwargs: r)
-        with mock.patch.dict(sys.modules, {"redis": fake_redis_module}):
-            with mock.patch.object(daemon, "get_local_tmux_sessions", return_value=[]):
-                with mock.patch.object(daemon.socket, "gethostname", return_value="test-host"):
-                    with mock.patch.object(daemon.time, "sleep", side_effect=KeyboardInterrupt):
-                        daemon.run_daemon("127.0.0.1", 6379, 1)
+        with mock.patch.dict(os.environ, {"ORCH_SESSION_IDS": "worker-codex"}, clear=False):
+            with mock.patch.dict(sys.modules, {"redis": fake_redis_module}):
+                with mock.patch.object(daemon, "get_local_tmux_sessions", return_value=[]):
+                    with mock.patch.object(daemon.socket, "gethostname", return_value="test-host"):
+                        with mock.patch.object(daemon.time, "sleep", side_effect=KeyboardInterrupt):
+                            daemon.run_daemon("127.0.0.1", 6379, 1)
+
+        record = json.loads(r.get(record_key))
+        self.assertEqual("not_deliverable", record["delivery_state"])
+        self.assertEqual("tmux_missing", record["delivery_failure_reason"])
+
+    def test_delivery_loop_does_not_scan_bloated_keyspace_for_inboxes(self):
+        class NoInboxScanRedis(FakeRedis):
+            def __init__(self):
+                super().__init__()
+                self.scan_matches = []
+
+            def scan_iter(self, match=None, count=None):
+                self.scan_matches.append(match)
+                if match == f"{key_prefix()}:*:inbox":
+                    raise AssertionError("delivery loop must not scan inbox keys")
+                yield from super().scan_iter(match=match, count=count)
+
+        r = NoInboxScanRedis()
+        for i in range(200_000):
+            r.store[f"isma:scale:{i}"] = "noise"
+        payload = {
+            "from": "conductor-codex",
+            "type": "command",
+            "body": "handoff body",
+            "msg_id": "323e4567-e89b-12d3-a456-426614174000",
+            "handoff_kind": "explicit_handoff",
+            "dispatcher_session_id": "conductor-codex",
+            "target_session_id": "worker-codex",
+            "message_hash": "hash-3",
+        }
+        record_key = "taey:handoff:conductor-codex:323e4567-e89b-12d3-a456-426614174000"
+        r.set("taey:worker-codex:machine", "test-host")
+        r.lpush(inbox_key("worker-codex"), json.dumps(payload))
+        r.set(record_key, json.dumps({
+            "kind": "explicit_handoff",
+            "dispatcher_session_id": "conductor-codex",
+            "target_session_id": "worker-codex",
+            "dispatcher_task_id": "task-789",
+            "msg_id": payload["msg_id"],
+            "message_hash": "hash-3",
+            "created_at": 1.0,
+            "ack_deadline_at": 9999999999.0,
+            "ack_backstop_at": 9999999999.0,
+            "pickup_poll_budget": 5,
+            "delivery_poll_count": 0,
+            "delivery_state": "queued",
+        }))
+
+        fake_redis_module = SimpleNamespace(Redis=lambda **kwargs: r)
+        started_at = time_module.monotonic()
+        with mock.patch.dict(os.environ, {"ORCH_SESSION_IDS": "worker-codex"}, clear=False):
+            with mock.patch.dict(sys.modules, {"redis": fake_redis_module}):
+                with mock.patch.object(daemon, "_advance_handoff_validation_job", return_value=None):
+                    with mock.patch.object(daemon, "get_local_tmux_sessions", return_value=[]):
+                        with mock.patch.object(daemon.socket, "gethostname", return_value="test-host"):
+                            with mock.patch.object(daemon.time, "sleep", side_effect=KeyboardInterrupt):
+                                daemon.run_daemon("127.0.0.1", 6379, 1)
+        elapsed = time_module.monotonic() - started_at
+
+        record = json.loads(r.get(record_key))
+        self.assertEqual("not_deliverable", record["delivery_state"])
+        self.assertEqual("tmux_missing", record["delivery_failure_reason"])
+        self.assertNotIn(f"{key_prefix()}:*:inbox", r.scan_matches)
+        self.assertLess(elapsed, 1.0)
+
+    def test_missing_tmux_checks_registered_sessions_without_env(self):
+        r = FakeRedis()
+        payload = {
+            "from": "conductor-codex",
+            "type": "command",
+            "body": "handoff body",
+            "msg_id": "523e4567-e89b-12d3-a456-426614174000",
+            "handoff_kind": "explicit_handoff",
+            "dispatcher_session_id": "conductor-codex",
+            "target_session_id": "worker-codex",
+            "message_hash": "hash-5",
+        }
+        record_key = "taey:handoff:conductor-codex:523e4567-e89b-12d3-a456-426614174000"
+        r.sadd(daemon._registered_sessions_key(), "worker-codex")
+        r.set("taey:worker-codex:machine", "test-host")
+        r.lpush(inbox_key("worker-codex"), json.dumps(payload))
+        r.set(record_key, json.dumps({
+            "kind": "explicit_handoff",
+            "dispatcher_session_id": "conductor-codex",
+            "target_session_id": "worker-codex",
+            "dispatcher_task_id": "task-888",
+            "msg_id": payload["msg_id"],
+            "message_hash": "hash-5",
+            "created_at": 1.0,
+            "ack_deadline_at": 9999999999.0,
+            "ack_backstop_at": 9999999999.0,
+            "pickup_poll_budget": 5,
+            "delivery_poll_count": 0,
+            "delivery_state": "queued",
+        }))
+
+        fake_redis_module = SimpleNamespace(Redis=lambda **kwargs: r)
+        with mock.patch.dict(os.environ, {"ORCH_SESSION_IDS": ""}, clear=False):
+            with mock.patch.dict(sys.modules, {"redis": fake_redis_module}):
+                with mock.patch.object(daemon, "_advance_handoff_validation_job", return_value=None):
+                    with mock.patch.object(daemon, "get_local_tmux_sessions", return_value=[]):
+                        with mock.patch.object(daemon.socket, "gethostname", return_value="test-host"):
+                            with mock.patch.object(daemon.time, "sleep", side_effect=KeyboardInterrupt):
+                                daemon.run_daemon("127.0.0.1", 6379, 1)
+
+        record = json.loads(r.get(record_key))
+        self.assertEqual("not_deliverable", record["delivery_state"])
+        self.assertEqual("tmux_missing", record["delivery_failure_reason"])
+
+    def test_missing_tmux_without_known_session_is_not_discovered_by_keyspace_scan(self):
+        r = FakeRedis()
+        payload = {
+            "from": "conductor-codex",
+            "type": "command",
+            "body": "handoff body",
+            "msg_id": "423e4567-e89b-12d3-a456-426614174000",
+            "handoff_kind": "explicit_handoff",
+            "dispatcher_session_id": "conductor-codex",
+            "target_session_id": "worker-codex",
+            "message_hash": "hash-4",
+        }
+        record_key = "taey:handoff:conductor-codex:423e4567-e89b-12d3-a456-426614174000"
+        r.set("taey:worker-codex:machine", "test-host")
+        r.lpush(inbox_key("worker-codex"), json.dumps(payload))
+        r.set(record_key, json.dumps({
+            "kind": "explicit_handoff",
+            "dispatcher_session_id": "conductor-codex",
+            "target_session_id": "worker-codex",
+            "dispatcher_task_id": "task-999",
+            "msg_id": payload["msg_id"],
+            "message_hash": "hash-4",
+            "created_at": 1.0,
+            "ack_deadline_at": 9999999999.0,
+            "ack_backstop_at": 9999999999.0,
+            "pickup_poll_budget": 5,
+            "delivery_poll_count": 0,
+            "delivery_state": "queued",
+        }))
+
+        fake_redis_module = SimpleNamespace(Redis=lambda **kwargs: r)
+        with mock.patch.dict(os.environ, {"ORCH_SESSION_IDS": ""}, clear=False):
+            with mock.patch.dict(sys.modules, {"redis": fake_redis_module}):
+                with mock.patch.object(daemon, "_advance_handoff_validation_job", return_value=None):
+                    with mock.patch.object(daemon, "get_local_tmux_sessions", return_value=[]):
+                        with mock.patch.object(daemon.socket, "gethostname", return_value="test-host"):
+                            with mock.patch.object(daemon.time, "sleep", side_effect=KeyboardInterrupt):
+                                daemon.run_daemon("127.0.0.1", 6379, 1)
+
+        record = json.loads(r.get(record_key))
+        self.assertEqual("queued", record["delivery_state"])
+
+        fake_redis_module = SimpleNamespace(Redis=lambda **kwargs: r)
+        with mock.patch.dict(os.environ, {"ORCH_SESSION_IDS": "worker-codex"}, clear=False):
+            with mock.patch.dict(sys.modules, {"redis": fake_redis_module}):
+                with mock.patch.object(daemon, "_advance_handoff_validation_job", return_value=None):
+                    with mock.patch.object(daemon, "get_local_tmux_sessions", return_value=[]):
+                        with mock.patch.object(daemon.socket, "gethostname", return_value="test-host"):
+                            with mock.patch.object(daemon.time, "sleep", side_effect=KeyboardInterrupt):
+                                daemon.run_daemon("127.0.0.1", 6379, 1)
 
         record = json.loads(r.get(record_key))
         self.assertEqual("not_deliverable", record["delivery_state"])

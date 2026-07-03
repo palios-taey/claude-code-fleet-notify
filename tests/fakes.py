@@ -59,6 +59,9 @@ class FakeRedis:
         current.update(values)
         return len(current) - before
 
+    def smembers(self, key):
+        return set(self.store.get(key, set()))
+
     def get(self, key):
         return self.store.get(key)
 

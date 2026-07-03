@@ -150,6 +150,51 @@ def get_local_tmux_sessions() -> list[str]:
     return []
 
 
+def _configured_session_ids() -> list[str]:
+    raw = os.environ.get("ORCH_SESSION_IDS", "").strip()
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        parsed = None
+    if isinstance(parsed, list):
+        tokens = [str(item).strip() for item in parsed]
+    else:
+        tokens = []
+        for chunk in raw.replace(";", ",").replace("\n", ",").split(","):
+            tokens.extend(chunk.split())
+    seen: set[str] = set()
+    sessions: list[str] = []
+    for token in tokens:
+        session_id = token.strip().strip("\"'")
+        if session_id and session_id not in seen:
+            sessions.append(session_id)
+            seen.add(session_id)
+    return sessions
+
+
+def _registered_sessions_key() -> str:
+    return f"{key_prefix()}:notify:registered_sessions"
+
+
+def _registered_session_ids(r) -> list[str]:
+    try:
+        return [str(session_id).strip() for session_id in r.smembers(_registered_sessions_key())]
+    except Exception:
+        return []
+
+
+def _known_delivery_sessions(r, local_sessions: list[str]) -> list[str]:
+    seen: set[str] = set()
+    sessions: list[str] = []
+    for session_id in [*local_sessions, *_configured_session_ids(), *_registered_session_ids(r)]:
+        if session_id and session_id not in seen:
+            sessions.append(session_id)
+            seen.add(session_id)
+    return sessions
+
+
 def _clip_message(message: str) -> str:
     if len(message) <= MAX_MESSAGE_LENGTH:
         return message
@@ -449,6 +494,7 @@ def run_daemon(
                         session_id=node_id,
                         machine=machine,
                     )
+                    r.sadd(_registered_sessions_key(), node_id)
                 except Exception:
                     pass
 
@@ -559,12 +605,7 @@ def run_daemon(
                         session_name,
                     )
 
-            inbox_pattern = f"{key_prefix()}:*:inbox"
-            for inbox in r.scan_iter(match=inbox_pattern):
-                parts = str(inbox).split(":")
-                if len(parts) < 3:
-                    continue
-                target_session_id = parts[-2]
+            for target_session_id in _known_delivery_sessions(r, local_sessions):
                 if target_session_id in local_session_set:
                     continue
                 if not has_pending_messages(r, target_session_id):
