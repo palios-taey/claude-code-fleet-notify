@@ -508,6 +508,11 @@ class PreToolUseHookTests(HookTestCase):
         self.assertEqual("PreToolUse", result["hookSpecificOutput"]["hookEventName"])
         self.assertIn(state_key("session-b", "last_activity"), r.store)
         self.assertIn(state_key("session-b", "last_tool_activity"), r.store)
+        self.assertEqual("1", r.store[state_key("session-b", "tool_running")])
+        self.assertEqual(
+            r.store[state_key("session-b", "last_tool_activity")],
+            r.store[state_key("session-b", "tool_running_at")],
+        )
         self.assertIn(state_key("session-b", "idle"), r.deleted)
 
     def test_cli_pre_tool_hooks_clear_idle_after_stop(self):
@@ -522,6 +527,11 @@ class PreToolUseHookTests(HookTestCase):
                 self.assertIn(state_key("session-b", "idle"), r.deleted)
                 self.assertFalse(r.exists(state_key("session-b", "idle")))
                 self.assertIn(state_key("session-b", "last_tool_activity"), r.store)
+                self.assertEqual("1", r.store[state_key("session-b", "tool_running")])
+                self.assertEqual(
+                    r.store[state_key("session-b", "last_tool_activity")],
+                    r.store[state_key("session-b", "tool_running_at")],
+                )
 
 
 class LivePathGuardTests(HookTestCase):
@@ -809,6 +819,8 @@ class PostToolUseHookTests(HookTestCase):
     def test_post_tool_stamps_activity_drains_all_queues_and_returns_context(self):
         r = FakeRedis()
         r.set(state_key("session-b", "idle"), "1")
+        r.set(state_key("session-b", "tool_running"), "1")
+        r.set(state_key("session-b", "tool_running_at"), "1000.0")
         r.lpush(inbox_key("session-b"), json.dumps({"from": "session-a", "type": "message", "body": "inbox"}))
         r.rpush(notifications_key("session-b"), json.dumps({"from": "worker", "type": "notification", "body": "notif"}))
 
@@ -817,6 +829,10 @@ class PostToolUseHookTests(HookTestCase):
         self.assertIn(state_key("session-b", "last_activity"), r.store)
         self.assertIn(state_key("session-b", "last_tool_activity"), r.store)
         self.assertIn(state_key("session-b", "idle"), r.deleted)
+        self.assertIn(state_key("session-b", "tool_running"), r.deleted)
+        self.assertIn(state_key("session-b", "tool_running_at"), r.deleted)
+        self.assertFalse(r.exists(state_key("session-b", "tool_running")))
+        self.assertFalse(r.exists(state_key("session-b", "tool_running_at")))
         self.assertEqual(0, r.llen(inbox_key("session-b")))
         self.assertEqual(0, r.llen(notifications_key("session-b")))
         context = result["hookSpecificOutput"]["additionalContext"]
@@ -828,6 +844,8 @@ class PostToolUseHookTests(HookTestCase):
             with self.subTest(module=module_name):
                 r = FakeRedis()
                 shared.action_stop(r, "session-b")
+                r.set(state_key("session-b", "tool_running"), "1")
+                r.set(state_key("session-b", "tool_running_at"), "1000.0")
                 self.assertEqual("1", r.store[state_key("session-b", "idle")])
 
                 self.run_hook(module_name, r, '{"tool_name":"Bash"}')
@@ -835,6 +853,10 @@ class PostToolUseHookTests(HookTestCase):
                 self.assertIn(state_key("session-b", "idle"), r.deleted)
                 self.assertFalse(r.exists(state_key("session-b", "idle")))
                 self.assertIn(state_key("session-b", "last_tool_activity"), r.store)
+                self.assertIn(state_key("session-b", "tool_running"), r.deleted)
+                self.assertIn(state_key("session-b", "tool_running_at"), r.deleted)
+                self.assertFalse(r.exists(state_key("session-b", "tool_running")))
+                self.assertFalse(r.exists(state_key("session-b", "tool_running_at")))
 
     def test_post_tool_appends_wake_packet_with_data_only_boundary(self):
         r = FakeRedis()

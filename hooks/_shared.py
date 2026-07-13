@@ -635,6 +635,8 @@ def action_pre_tool(r, node_id: str, tool_name: str = "") -> None:
         _clear_idle_flag(r, node_id, "pre_tool")
         r.set(state_key(node_id, "last_activity"), now)
         r.set(state_key(node_id, "last_tool_activity"), now)
+        r.set(state_key(node_id, "tool_running"), "1")
+        r.set(state_key(node_id, "tool_running_at"), now)
         log_debug(node_id, f"PRE-TOOL: idle cleared, tool={tool_name}")
     except Exception as e:
         log_debug(node_id, f"action_pre_tool error: {e}")
@@ -651,6 +653,7 @@ def action_post_tool(r, node_id: str, tool_name: str = "") -> str:
         _clear_idle_flag(r, node_id, "post_tool")
         r.set(state_key(node_id, "last_activity"), now)
         r.set(state_key(node_id, "last_tool_activity"), now)
+        r.delete(state_key(node_id, "tool_running"), state_key(node_id, "tool_running_at"))
     except Exception as e:
         log_debug(node_id, f"post_tool activity error: {e}")
 

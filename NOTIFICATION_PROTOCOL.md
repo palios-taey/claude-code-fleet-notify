@@ -106,6 +106,8 @@ Tmux is used only when the session is stopped and `idle=1`, and it carries only 
 | `${NOTIFY_KEY_PREFIX:-taey}:SESSION:idle` | durable idle flag set by lifecycle hooks, or by daemon repair for a parked Claude Code usage-limit banner |
 | `${NOTIFY_KEY_PREFIX:-taey}:SESSION:last_activity` | last hook activity timestamp, used for handoff activation observation |
 | `${NOTIFY_KEY_PREFIX:-taey}:SESSION:last_tool_activity` | last tool-hook activity timestamp, used for handoff activation observation |
+| `${NOTIFY_KEY_PREFIX:-taey}:SESSION:tool_running` | transient tool-running flag set by PreToolUse and cleared by PostToolUse |
+| `${NOTIFY_KEY_PREFIX:-taey}:SESSION:tool_running_at` | epoch timestamp stamped with `tool_running=1`, used by orchestrator liveness to age-bound long-running tools |
 | `${NOTIFY_KEY_PREFIX:-taey}:_notify_daemon:heartbeat` | daemon process liveness timestamp, written from an independent heartbeat thread |
 | `${NOTIFY_KEY_PREFIX:-taey}:_notify_daemon:delivery_progress` | daemon delivery-loop progress cursor, advanced by the serial tmux-delivery loop |
 
@@ -116,6 +118,8 @@ Tmux is used only when the session is stopped and `idle=1`, and it carries only 
 | `${NOTIFY_KEY_PREFIX:-taey}:SESSION:idle` | `Stop`, `SessionStart`, and daemon usage-limit reconciliation | `UserPromptSubmit`/`BeforeAgent` and tool-activity hooks |
 | `${NOTIFY_KEY_PREFIX:-taey}:SESSION:last_activity` | hook activity | overwritten by later hook activity |
 | `${NOTIFY_KEY_PREFIX:-taey}:SESSION:last_tool_activity` | tool-hook activity | overwritten by later tool-hook activity |
+| `${NOTIFY_KEY_PREFIX:-taey}:SESSION:tool_running` | `PreToolUse`/`BeforeTool` | `PostToolUse`/`AfterTool` |
+| `${NOTIFY_KEY_PREFIX:-taey}:SESSION:tool_running_at` | `PreToolUse`/`BeforeTool` with the same timestamp as `last_tool_activity` | `PostToolUse`/`AfterTool` |
 
 The daemon's usage-limit repair is intentionally narrow: it only restores `idle=1` for a local tmux pane whose current bottom resting region visibly shows a Claude Code session/weekly/usage-limit banner while no tool is marked running. It is not a stale-activity, scrollback, or pane-active injection heuristic; after repair, the same one-flag `idle=1` authorization rule still decides pointer injection. The daemon never clears idle because tmux injection is not proof that the prompt was submitted.
 

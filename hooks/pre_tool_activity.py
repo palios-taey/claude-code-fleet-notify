@@ -30,6 +30,8 @@ def main():
         r.delete(state_key(node_id, "idle"))
         r.set(state_key(node_id, "last_activity"), now)
         r.set(state_key(node_id, "last_tool_activity"), now)
+        r.set(state_key(node_id, "tool_running"), "1")
+        r.set(state_key(node_id, "tool_running_at"), now)
         try:
             from notifications.trace import trace
             trace(r, "idle_clear", node=node_id, src="pre_tool")
