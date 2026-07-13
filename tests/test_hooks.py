@@ -48,6 +48,64 @@ class StopHookTests(HookTestCase):
         self.assertIn(state_key("session-b", "last_activity"), r.store)
         self.assertNotIn(state_key("session-b", "last_tool_activity"), r.store)
 
+    def test_blocked_stop_hooks_set_idle_without_supervisor_notify(self):
+        for module_name in (
+            "hooks.stop_idle",
+            "hooks.codex_stop",
+            "hooks.grok_stop",
+            "hooks.gemini_after_agent",
+        ):
+            with self.subTest(module_name=module_name):
+                r = FakeRedis()
+                r.set(state_key("session-b", "parent"), "conductor")
+                r.set(state_key("session-b", "current_task"), json.dumps({
+                    "task_id": "task-blocked",
+                    "description": "blocked ship task",
+                    "supervisor": "conductor",
+                    "started_at": "1000",
+                }))
+                module = importlib.import_module(module_name)
+
+                with mock.patch.object(module, "fetch_stop_decision", return_value={
+                    "wake_type": "ready_work",
+                    "block": True,
+                    "reason": "keep going",
+                }):
+                    result = self.run_hook(module_name, r, '{"stop_hook_active": true}')
+
+                self.assertEqual({"decision": "block", "reason": "keep going"}, result)
+                self.assertEqual("1", r.store[state_key("session-b", "idle")])
+                self.assertIn(state_key("session-b", "last_activity"), r.store)
+                self.assertEqual(0, r.llen(inbox_key("conductor")))
+
+    def test_allow_stop_hook_still_sets_idle_and_notifies_supervisor(self):
+        r = FakeRedis()
+        r.set(state_key("session-b", "parent"), "conductor")
+        r.set(state_key("session-b", "current_task"), json.dumps({
+            "task_id": "task-allow",
+            "description": "allowed stop task",
+            "supervisor": "conductor",
+            "started_at": "1000",
+        }))
+        module = importlib.import_module("hooks.stop_idle")
+        hook_shared = sys.modules[module.action_stop.__module__]
+
+        with mock.patch.object(module, "fetch_stop_decision", return_value={
+            "wake_type": shared.WAKE_ALLOW_STOP,
+            "block": False,
+            "reason": None,
+        }):
+            with mock.patch.object(hook_shared, "peer_idle_allowed", return_value=(True, "in_progress", {"status": "in_progress"})):
+                result = self.run_hook("hooks.stop_idle", r, "{}")
+
+        self.assertEqual({}, result)
+        self.assertEqual("1", r.store[state_key("session-b", "idle")])
+        self.assertIn(state_key("session-b", "last_activity"), r.store)
+        msg = r.decoded_list(inbox_key("conductor"))[0]
+        self.assertEqual("peer_idle", msg["type"])
+        self.assertEqual("task-allow", msg["task_id"])
+        self.assertEqual("unknown", msg["outcome"])
+
     def test_allow_stop_still_notifies_supervisor_when_current_task_exists(self):
         r = FakeRedis()
         r.set(state_key("worker-codex", "last_activity"), "1000.0")
