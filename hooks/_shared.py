@@ -1233,21 +1233,8 @@ def _notify_supervisor_of_stop(r, node_id: str, supervisor: str) -> None:
         log_debug(node_id, f"notify_supervisor error: {e}")
 
 
-def action_stop(r, node_id: str) -> None:
-    """Stop / AfterAgent: set idle=1 with no TTL (stopped means stopped until
-    UserPromptSubmit clears it). Stamp last_activity. Notify supervisor (if
-    any) with completed-task summary.
-
-    NOTE: this is the ONLY place idle gets set. Per NOTIFICATION_PROTOCOL.md.
-
-    Universal Stop+notify primitive (v0.2.0): the Stop hook is the canonical
-    notifier for worker→supervisor signaling. Don't trust workers to call
-    taey-notify manually — every Stop fires the parent-notify automatically,
-    with task content from ``taey:<node>:current_task`` (set by the
-    dispatcher) and optional outcome from ``taey:<node>:last_outcome``
-    (worker may set this before stopping). Supervisor receives outcome
-    inline.
-    """
+def action_stop_idle(r, node_id: str) -> None:
+    """Stop / AfterAgent: set idle=1 with no TTL and stamp last_activity."""
     try:
         from notifications.inbox import state_key
 
@@ -1259,12 +1246,32 @@ def action_stop(r, node_id: str) -> None:
             trace(r, "idle_set", node=node_id)
         except Exception:
             pass
+    except Exception as e:
+        log_debug(node_id, f"action_stop_idle error: {e}")
 
+
+def action_stop_notify_supervisor(r, node_id: str) -> None:
+    """Notify the supervisor for a real stop. Blocked stops must not call this."""
+    try:
         supervisor = _resolve_supervisor(r, node_id)
         if supervisor:
             _notify_supervisor_of_stop(r, node_id, supervisor)
     except Exception as e:
-        log_debug(node_id, f"action_stop error: {e}")
+        log_debug(node_id, f"action_stop_notify_supervisor error: {e}")
+
+
+def action_stop(r, node_id: str) -> None:
+    """Stop / AfterAgent: mark the session idle, then notify supervisor if any.
+
+    Universal Stop+notify primitive (v0.2.0): the Stop hook is the canonical
+    notifier for worker->supervisor signaling. Don't trust workers to call
+    taey-notify manually -- every real Stop fires the parent-notify
+    automatically, with task content from ``taey:<node>:current_task`` (set by
+    the dispatcher) and optional outcome from ``taey:<node>:last_outcome``
+    (worker may set this before stopping). Supervisor receives outcome inline.
+    """
+    action_stop_idle(r, node_id)
+    action_stop_notify_supervisor(r, node_id)
 
 
 def action_session_start(r, node_id: str) -> str:

@@ -17,12 +17,12 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 _IMPORT_ERROR = None
 try:
     from _shared import (
-        read_stdin_json, get_redis_and_node, action_stop, emit_gemini,
+        read_stdin_json, get_redis_and_node, action_stop, action_stop_idle, emit_gemini,
         fetch_stop_decision, _cache_stop_decision,
     )
 except Exception as _exc:
     _IMPORT_ERROR = _exc
-    read_stdin_json = get_redis_and_node = action_stop = emit_gemini = fetch_stop_decision = _cache_stop_decision = None
+    read_stdin_json = get_redis_and_node = action_stop = action_stop_idle = emit_gemini = fetch_stop_decision = _cache_stop_decision = None
 
 
 def _emit_fail_open() -> None:
@@ -49,6 +49,7 @@ def main() -> None:
     if decision:
         _cache_stop_decision(r, node_id, decision)
         if decision.get("block"):
+            action_stop_idle(r, node_id)
             print(json.dumps({"decision": "block", "reason": decision.get("reason")}))
             sys.exit(0)
 

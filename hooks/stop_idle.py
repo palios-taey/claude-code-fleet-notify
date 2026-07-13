@@ -32,12 +32,12 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 _IMPORT_ERROR = None
 try:
     from _shared import (
-        read_stdin_json, get_redis_and_node, action_stop, emit_claude_or_codex,
+        read_stdin_json, get_redis_and_node, action_stop, action_stop_idle, emit_claude_or_codex,
         fetch_stop_decision, _cache_stop_decision,
     )
 except Exception as _exc:
     _IMPORT_ERROR = _exc
-    read_stdin_json = get_redis_and_node = action_stop = emit_claude_or_codex = fetch_stop_decision = _cache_stop_decision = None
+    read_stdin_json = get_redis_and_node = action_stop = action_stop_idle = emit_claude_or_codex = fetch_stop_decision = _cache_stop_decision = None
 
 
 def _emit_fail_open() -> None:
@@ -64,6 +64,7 @@ def main():
     if decision:
         _cache_stop_decision(r, node_id, decision)
         if decision.get("block"):
+            action_stop_idle(r, node_id)
             try:
                 from notifications.trace import trace
                 trace(r, "stop_blocked", node=node_id, wake_type=decision.get("wake_type"))
