@@ -3,14 +3,15 @@
 
 The daemon is the stopped-session delivery path. It periodically discovers tmux
 sessions, checks whether a session is safe to inject into, and submits a Redis
-pointer via ``scripts/tmux-send``. Messages remain queued until the recipient hook
-drains them after a real prompt/tool event.
+pointer with the same tmux choreography as ``scripts/tmux-send``. Messages remain
+queued until the recipient hook drains them after a real prompt/tool event.
 """
 from __future__ import annotations
 
 import argparse
 import logging
 import os
+import signal
 import subprocess
 import sys
 import threading
@@ -91,6 +92,137 @@ COMPOSER_PROMPT_MARKERS = ("❯", "›")
 COMPOSER_IGNORED_PROMPT_PREFIXES = (
     "use /skills to list available skills",
 )
+
+
+class _DaemonShutdown(BaseException):
+    def __init__(self, signum: int):
+        super().__init__(f"daemon shutdown signal {signum}")
+        self.signum = signum
+
+
+class _TmuxInjection:
+    def __init__(self, session_name: str, sequence: str):
+        self.session_name = session_name
+        self.sequence = sequence
+        self.phase = "created"
+        self.drained = False
+        self._lock = threading.RLock()
+
+    def set_phase(self, phase: str) -> None:
+        with self._lock:
+            if not self.drained:
+                self.phase = phase
+
+    def send_keys(self, *keys: str) -> bool:
+        return _run_tmux_command(["tmux", "send-keys", "-t", self.session_name, *keys])
+
+    def load_buffer(self, message: str) -> bool:
+        return _run_tmux_command(["tmux", "load-buffer", "-"], input_text=message)
+
+    def paste_buffer(self) -> bool:
+        return _run_tmux_command(["tmux", "paste-buffer", "-t", self.session_name, "-p", "-d"])
+
+    def drain(self) -> bool:
+        with self._lock:
+            if self.drained:
+                return True
+            phase = self.phase
+            self.drained = True
+            if phase == "submitted":
+                return True
+            if phase in {"created", "cleared"}:
+                return self.send_keys("C-u", "C-k")
+            if self.sequence == "grok":
+                return self.send_keys("Enter")
+            commands: list[tuple[str, ...]]
+            if phase == "text_sent":
+                commands = (
+                    ("Escape",),
+                    ("Enter",),
+                    ("-H", "1b", "5b", "31", "33", "75"),
+                )
+            elif phase == "escape_sent":
+                commands = (
+                    ("Enter",),
+                    ("-H", "1b", "5b", "31", "33", "75"),
+                )
+            elif phase == "legacy_enter_sent":
+                commands = (("-H", "1b", "5b", "31", "33", "75"),)
+            else:
+                commands = (("C-u", "C-k"),)
+            ok = True
+            for keys in commands:
+                ok = self.send_keys(*keys) and ok
+            return ok
+
+
+_SHUTDOWN_REQUESTED = threading.Event()
+_ACTIVE_INJECTION_LOCK = threading.RLock()
+_ACTIVE_INJECTION: _TmuxInjection | None = None
+
+
+def _run_tmux_command(
+    cmd: list[str],
+    *,
+    input_text: str | None = None,
+    timeout: float = 20,
+) -> bool:
+    result = subprocess.run(
+        cmd,
+        input=input_text,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+    if result.returncode != 0:
+        logger.error(
+            "tmux command failed: %s",
+            (result.stderr or result.stdout or " ".join(cmd)).strip(),
+        )
+        return False
+    return True
+
+
+def _set_active_injection(injection: _TmuxInjection | None) -> None:
+    global _ACTIVE_INJECTION
+    with _ACTIVE_INJECTION_LOCK:
+        _ACTIVE_INJECTION = injection
+
+
+def _drain_active_injection() -> bool:
+    with _ACTIVE_INJECTION_LOCK:
+        injection = _ACTIVE_INJECTION
+    if injection is None:
+        return True
+    return injection.drain()
+
+
+def _handle_shutdown_signal(signum: int, _frame) -> None:
+    _SHUTDOWN_REQUESTED.set()
+    try:
+        drained = _drain_active_injection()
+    except Exception as exc:
+        drained = False
+        logger.error("active injection drain failed during signal %s: %s", signum, exc)
+    logger.info("Received signal %s; active injection drained=%s", signum, drained)
+    raise _DaemonShutdown(signum)
+
+
+def _install_shutdown_signal_handlers() -> dict[int, object]:
+    if threading.current_thread() is not threading.main_thread():
+        return {}
+    previous: dict[int, object] = {}
+    for signum in (signal.SIGTERM, signal.SIGINT):
+        previous[signum] = signal.getsignal(signum)
+        signal.signal(signum, _handle_shutdown_signal)
+    return previous
+
+
+def _restore_shutdown_signal_handlers(previous: dict[int, object]) -> None:
+    if threading.current_thread() is not threading.main_thread():
+        return
+    for signum, handler in previous.items():
+        signal.signal(signum, handler)
 
 
 class _HandoffValidationJob:
@@ -340,30 +472,65 @@ def _clip_message(message: str) -> str:
     return message[: MAX_MESSAGE_LENGTH - 28].rstrip() + "\n...[notification block truncated]"
 
 
+def _send_sequence_for_session(session_name: str) -> str:
+    override = os.environ.get("SEND_SEQUENCE", "").strip()
+    if override:
+        return override
+    return "grok" if session_name.endswith("-grok") else "claude"
+
+
 def inject_via_tmux(session_name: str, message: str) -> bool:
     """Inject a message into a local Claude Code tmux session."""
-    tmux_send = Path(__file__).resolve().parent.parent / "scripts" / "tmux-send"
-
-    if tmux_send.exists():
-        cmd = ["bash", str(tmux_send), "local", session_name, message]
-    else:
-        # Fallback for stripped-down environments.
-        cmd = ["tmux", "send-keys", "-t", session_name, "--", message, "Enter"]
+    sequence = _send_sequence_for_session(session_name)
+    injection = _TmuxInjection(session_name, sequence)
+    _set_active_injection(injection)
 
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
-        if result.returncode != 0:
-            logger.error(
-                "tmux injection failed for %s: %s",
-                session_name,
-                (result.stderr or result.stdout).strip(),
-            )
+        if not injection.send_keys("C-u", "C-k"):
             return False
+        injection.set_phase("cleared")
+        time.sleep(0.1)
+
+        if sequence == "grok":
+            if not injection.load_buffer(message):
+                return False
+            if not injection.paste_buffer():
+                return False
+            injection.set_phase("text_sent")
+            time.sleep(0.5)
+            if not injection.send_keys("Enter"):
+                return False
+        else:
+            if not injection.send_keys("--", message):
+                return False
+            injection.set_phase("text_sent")
+            time.sleep(0.5)
+            if not injection.send_keys("Escape"):
+                return False
+            injection.set_phase("escape_sent")
+            time.sleep(0.2)
+            if not injection.send_keys("Enter"):
+                return False
+            injection.set_phase("legacy_enter_sent")
+            time.sleep(0.1)
+            if not injection.send_keys("-H", "1b", "5b", "31", "33", "75"):
+                return False
+        injection.set_phase("submitted")
+        logger.info("OK: %s (local, sequence=%s)", session_name, sequence)
         return True
+    except _DaemonShutdown:
+        raise
     except Exception as exc:
         logger.error("tmux injection exception for %s: %s", session_name, exc)
+        try:
+            injection.drain()
+        except Exception:
+            pass
         return False
-
+    finally:
+        with _ACTIVE_INJECTION_LOCK:
+            if _ACTIVE_INJECTION is injection:
+                _set_active_injection(None)
 
 def _resolve_supervisor(r, node_id: str) -> str | None:
     from notifications.targets import resolve_supervisor
@@ -661,6 +828,8 @@ def run_daemon(
     """Main loop — one process handles all local tmux sessions."""
     import redis as redis_lib
 
+    _SHUTDOWN_REQUESTED.clear()
+    previous_signal_handlers = _install_shutdown_signal_handlers()
     r = _connect_redis(redis_lib, redis_host, redis_port)
 
     try:
@@ -695,7 +864,7 @@ def run_daemon(
         ),
     )
     try:
-        while True:
+        while not _SHUTDOWN_REQUESTED.is_set():
             try:
                 local_sessions = get_local_tmux_sessions()
                 local_session_set = set(local_sessions)
@@ -879,6 +1048,9 @@ def run_daemon(
                 except Exception:
                     pass
                 time.sleep(poll_interval)
+            except _DaemonShutdown:
+                logger.info("Daemon stopped")
+                break
             except KeyboardInterrupt:
                 logger.info("Daemon stopped")
                 break
@@ -892,6 +1064,7 @@ def run_daemon(
             handoff_validation_job,
             wait_sec=HANDOFF_VALIDATION_SHUTDOWN_GRACE_SECS,
         )
+        _restore_shutdown_signal_handlers(previous_signal_handlers)
 
 
 def main() -> None:

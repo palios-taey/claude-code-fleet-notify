@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import signal
 import sys
 import threading
 import time as time_module
@@ -72,6 +73,43 @@ class DaemonTests(unittest.TestCase):
         self.assertIn("You have 1 messages", summary)
         self.assertIn(inbox_key("session-b"), summary)
         self.assertEqual(1, r.llen(inbox_key("session-b")))
+
+    def test_sigterm_mid_tmux_injection_drains_to_submitted_or_empty(self):
+        message = "SIGTERM drain payload"
+        state = {"composer": "", "submitted": []}
+        signalled = {"sent": False}
+
+        def fake_run(cmd, **_kwargs):
+            if cmd[:3] != ["tmux", "send-keys", "-t"]:
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+            keys = cmd[4:]
+            if keys == ["C-u", "C-k"]:
+                state["composer"] = ""
+            elif keys[:1] == ["--"]:
+                state["composer"] = str(keys[1])
+            elif keys in (["Enter"], ["-H", "1b", "5b", "31", "33", "75"]):
+                if state["composer"]:
+                    state["submitted"].append(state["composer"])
+                    state["composer"] = ""
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        def fake_sleep(_seconds):
+            if state["composer"] == message and not signalled["sent"]:
+                signalled["sent"] = True
+                daemon._handle_shutdown_signal(signal.SIGTERM, None)
+
+        with mock.patch.object(daemon.subprocess, "run", side_effect=fake_run):
+            with mock.patch.object(daemon.time, "sleep", side_effect=fake_sleep):
+                try:
+                    daemon.inject_via_tmux("worker-codex", message)
+                except BaseException:
+                    pass
+                finally:
+                    daemon._SHUTDOWN_REQUESTED.clear()
+
+        self.assertTrue(signalled["sent"])
+        self.assertEqual("", state["composer"])
+        self.assertIn(message, state["submitted"])
 
     def test_run_daemon_injects_only_idle_sessions_with_messages(self):
         r = FakeRedis()
