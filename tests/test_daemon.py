@@ -6,6 +6,7 @@ import sys
 import threading
 import time as time_module
 import unittest
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest import mock
 
@@ -91,14 +92,28 @@ class CountingRedis(FakeRedis):
 
 
 class DaemonTests(unittest.TestCase):
-    def run_daemon_once(self, redis_client, sessions, *, inject_result=True, now=1000.0):
+    def run_daemon_once(
+        self,
+        redis_client,
+        sessions,
+        *,
+        inject_result=True,
+        now=1000.0,
+        observe_composer=False,
+    ):
         fake_redis_module = SimpleNamespace(Redis=lambda **kwargs: redis_client)
+        observe_context = (
+            nullcontext()
+            if observe_composer
+            else mock.patch.object(daemon, "observe_composer_occupancy", return_value=False)
+        )
         with mock.patch.dict(sys.modules, {"redis": fake_redis_module}):
             with mock.patch.object(daemon, "get_local_tmux_sessions", return_value=sessions):
                 with mock.patch.object(daemon, "inject_via_tmux", return_value=inject_result) as inject:
-                    with mock.patch.object(daemon.time, "time", return_value=now):
-                        with mock.patch.object(daemon.time, "sleep", side_effect=KeyboardInterrupt):
-                            daemon.run_daemon("127.0.0.1", 6379, 1)
+                    with observe_context:
+                        with mock.patch.object(daemon.time, "time", return_value=now):
+                            with mock.patch.object(daemon.time, "sleep", side_effect=KeyboardInterrupt):
+                                daemon.run_daemon("127.0.0.1", 6379, 1)
         return inject
 
     def test_build_pointer_summary_does_not_pop_messages(self):
@@ -525,44 +540,54 @@ class DaemonTests(unittest.TestCase):
         self.assertIn((f"{key_prefix()}:handoff:*", DEFAULT_VALIDATION_SCAN_COUNT), r.scan_calls)
 
     def test_handoff_validation_timeout_does_not_wedge_delivery(self):
-        class BlockingHandoffScanRedis(FakeRedis):
-            def __init__(self):
-                super().__init__()
-                self.validation_started = threading.Event()
-                self.release_validation = threading.Event()
-                self.validation_done = threading.Event()
-
-            def scan_iter(self, match=None, count=None):
-                if match == f"{key_prefix()}:handoff:*":
-                    self.validation_started.set()
-                    self.release_validation.wait(1.0)
-                    self.validation_done.set()
-                    if False:
-                        yield None
-                    return
-                yield from super().scan_iter(match=match, count=count)
-
-        r = BlockingHandoffScanRedis()
+        r = FakeRedis()
+        validation_started = threading.Event()
+        release_validation = threading.Event()
+        validation_done = threading.Event()
         r.set(state_key("wedged", "idle"), "1")
         r.lpush(inbox_key("wedged"), json.dumps({"from": "sender", "type": "message", "body": "queued"}))
+
+        def blocking_validation(redis_client, *, prefix, timeout_sec):
+            self.assertIs(redis_client, r)
+            self.assertEqual(key_prefix(), prefix)
+            self.assertIsNone(timeout_sec)
+            validation_started.set()
+            release_validation.wait(1.0)
+            validation_done.set()
+            return 0
+
+        original_start = daemon._HandoffValidationJob.start
+
+        def start_and_wait_for_validation(job):
+            result = original_start(job)
+            self.assertTrue(validation_started.wait(0.5))
+            return result
+
+        def inject_while_validation_blocked(_session_name, _summary):
+            self.assertTrue(validation_started.is_set())
+            self.assertFalse(validation_done.is_set())
+            return True
 
         fake_redis_module = SimpleNamespace(Redis=lambda **kwargs: r)
         started_at = time_module.monotonic()
         try:
             with mock.patch.object(daemon, "HANDOFF_VALIDATION_TIMEOUT_SECS", 0.05):
-                with mock.patch.dict(sys.modules, {"redis": fake_redis_module}):
-                    with mock.patch.object(daemon, "get_local_tmux_sessions", return_value=["wedged"]):
-                        with mock.patch.object(daemon, "inject_via_tmux", return_value=True) as inject:
-                            with mock.patch.object(daemon.time, "time", return_value=1234.5):
-                                with mock.patch.object(daemon.time, "sleep", side_effect=KeyboardInterrupt):
-                                    daemon.run_daemon("127.0.0.1", 6379, 1)
+                with mock.patch.object(daemon, "validate_handoff_activation", side_effect=blocking_validation):
+                    with mock.patch.object(daemon._HandoffValidationJob, "start", start_and_wait_for_validation):
+                        with mock.patch.dict(sys.modules, {"redis": fake_redis_module}):
+                            with mock.patch.object(daemon, "get_local_tmux_sessions", return_value=["wedged"]):
+                                with mock.patch.object(daemon, "observe_composer_occupancy", return_value=False):
+                                    with mock.patch.object(daemon, "inject_via_tmux", side_effect=inject_while_validation_blocked) as inject:
+                                        with mock.patch.object(daemon.time, "time", return_value=1234.5):
+                                            with mock.patch.object(daemon.time, "sleep", side_effect=KeyboardInterrupt):
+                                                daemon.run_daemon("127.0.0.1", 6379, 1)
         finally:
-            r.release_validation.set()
-            r.validation_done.wait(1.0)
-            time_module.sleep(0.02)
+            elapsed = time_module.monotonic() - started_at
+            release_validation.set()
+            if validation_started.is_set():
+                self.assertTrue(validation_done.wait(1.0))
 
-        elapsed = time_module.monotonic() - started_at
-        self.assertTrue(r.validation_started.is_set())
+        self.assertTrue(validation_started.is_set())
         self.assertLess(elapsed, 0.5)
         inject.assert_called_once()
         self.assertEqual("wedged", inject.call_args.args[0])
@@ -845,8 +870,18 @@ class DaemonTests(unittest.TestCase):
             GROK_GENERATING_COMPOSER_PANE_2,
         ]
         with mock.patch.object(daemon, "_tmux_pane_tail", side_effect=panes):
-            first_inject = self.run_daemon_once(r, ["conductor-grok"], now=2500.0)
-            inject = self.run_daemon_once(r, ["conductor-grok"], now=2503.0)
+            first_inject = self.run_daemon_once(
+                r,
+                ["conductor-grok"],
+                now=2500.0,
+                observe_composer=True,
+            )
+            inject = self.run_daemon_once(
+                r,
+                ["conductor-grok"],
+                now=2503.0,
+                observe_composer=True,
+            )
 
         first_inject.assert_not_called()
         inject.assert_not_called()
