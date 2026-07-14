@@ -28,6 +28,29 @@ RESTING_COMPOSER_PANE = """
 ╰───────────────────────────────── gpt-5.5 · conductor-codex ─╯
 """
 
+GROK_RESTING_COMPOSER_PANE = """
+╭────────────────────────────────────────────────────────────────────╮
+│ ›                                                                  │
+╰────────────────────────────────────── grok · conductor-grok ─╯
+Shift+Tab:mode │ Esc:cancel │ Ctrl+x:shortcuts
+"""
+
+GROK_GENERATING_COMPOSER_PANE_1 = """
+Composing response chunk 17
+╭────────────────────────────────────────────────────────────────────╮
+│ ›                                                                  │
+╰────────────────────────────────────── grok · conductor-grok ─╯
+Shift+Tab:mode │ Esc:cancel │ Ctrl+x:shortcuts
+"""
+
+GROK_GENERATING_COMPOSER_PANE_2 = """
+Composing response chunk 18
+╭────────────────────────────────────────────────────────────────────╮
+│ ›                                                                  │
+╰────────────────────────────────────── grok · conductor-grok ─╯
+Shift+Tab:mode │ Esc:cancel │ Ctrl+x:shortcuts
+"""
+
 
 def queued_message(*, timestamp: float | None = 1000.0, body: str = "queued") -> str:
     payload = {"from": "sender", "type": "message", "body": body}
@@ -717,8 +740,10 @@ class DaemonTests(unittest.TestCase):
         r.lpush(inbox_key("gatekeeper"), queued_message(timestamp=1000.0))
 
         with mock.patch.object(daemon, "_tmux_pane_tail", return_value=RESTING_COMPOSER_PANE):
-            inject = self.run_daemon_once(r, ["gatekeeper"], now=2500.0)
+            first_inject = self.run_daemon_once(r, ["gatekeeper"], now=2500.0)
+            inject = self.run_daemon_once(r, ["gatekeeper"], now=2503.0)
 
+        first_inject.assert_not_called()
         inject.assert_called_once()
         self.assertEqual("gatekeeper", inject.call_args.args[0])
         self.assertTrue(r.exists(state_key("gatekeeper", "idle")))
@@ -731,8 +756,10 @@ class DaemonTests(unittest.TestCase):
         pane_tail = "You've reached your usage limit · resets 2:10am\n" + RESTING_COMPOSER_PANE
 
         with mock.patch.object(daemon, "_tmux_pane_tail", return_value=pane_tail):
-            inject = self.run_daemon_once(r, ["gatekeeper"], now=2500.0)
+            first_inject = self.run_daemon_once(r, ["gatekeeper"], now=2500.0)
+            inject = self.run_daemon_once(r, ["gatekeeper"], now=2503.0)
 
+        first_inject.assert_not_called()
         inject.assert_called_once()
         self.assertEqual("gatekeeper", inject.call_args.args[0])
         self.assertTrue(r.exists(state_key("gatekeeper", "idle")))
@@ -785,8 +812,10 @@ class DaemonTests(unittest.TestCase):
         r.lpush(inbox_key("gatekeeper"), queued_message(timestamp=1000.0))
 
         with mock.patch.object(daemon, "_tmux_pane_tail", return_value=RESTING_COMPOSER_PANE):
-            inject = self.run_daemon_once(r, ["gatekeeper"], now=5000.0)
+            first_inject = self.run_daemon_once(r, ["gatekeeper"], now=5000.0)
+            inject = self.run_daemon_once(r, ["gatekeeper"], now=5003.0)
 
+        first_inject.assert_not_called()
         inject.assert_called_once()
         self.assertEqual("gatekeeper", inject.call_args.args[0])
         self.assertTrue(r.exists(state_key("gatekeeper", "idle")))
@@ -804,16 +833,54 @@ class DaemonTests(unittest.TestCase):
         self.assertFalse(r.exists(state_key("gatekeeper", "idle")))
         self.assertEqual(1, r.llen(inbox_key("gatekeeper")))
 
-    def test_at_rest_reconcile_fails_closed_on_missing_message_timestamp(self):
+    def test_grok_generating_pane_does_not_reconcile_while_content_changes(self):
+        r = FakeRedis()
+        r.set(state_key("conductor-grok", "last_activity"), "1000")
+        r.lpush(inbox_key("conductor-grok"), queued_message(timestamp=1000.0))
+
+        panes = [
+            GROK_GENERATING_COMPOSER_PANE_1,
+            GROK_GENERATING_COMPOSER_PANE_1,
+            GROK_GENERATING_COMPOSER_PANE_2,
+            GROK_GENERATING_COMPOSER_PANE_2,
+        ]
+        with mock.patch.object(daemon, "_tmux_pane_tail", side_effect=panes):
+            first_inject = self.run_daemon_once(r, ["conductor-grok"], now=2500.0)
+            inject = self.run_daemon_once(r, ["conductor-grok"], now=2503.0)
+
+        first_inject.assert_not_called()
+        inject.assert_not_called()
+        self.assertFalse(r.exists(state_key("conductor-grok", "idle")))
+        self.assertEqual(1, r.llen(inbox_key("conductor-grok")))
+
+    def test_grok_resting_composer_reconciles_after_stable_pane(self):
+        r = FakeRedis()
+        r.set(state_key("conductor-grok", "last_activity"), "1000")
+        r.lpush(inbox_key("conductor-grok"), queued_message(timestamp=1000.0))
+
+        with mock.patch.object(daemon, "_tmux_pane_tail", return_value=GROK_RESTING_COMPOSER_PANE):
+            first_inject = self.run_daemon_once(r, ["conductor-grok"], now=2500.0)
+            inject = self.run_daemon_once(r, ["conductor-grok"], now=2503.0)
+
+        first_inject.assert_not_called()
+        inject.assert_called_once()
+        self.assertEqual("conductor-grok", inject.call_args.args[0])
+        self.assertTrue(r.exists(state_key("conductor-grok", "idle")))
+        self.assertEqual(1, r.llen(inbox_key("conductor-grok")))
+
+    def test_at_rest_reconcile_treats_missing_message_timestamp_as_old(self):
         r = FakeRedis()
         r.set(state_key("gatekeeper", "last_activity"), "1000")
         r.lpush(inbox_key("gatekeeper"), queued_message(timestamp=None))
 
         with mock.patch.object(daemon, "_tmux_pane_tail", return_value=RESTING_COMPOSER_PANE):
-            inject = self.run_daemon_once(r, ["gatekeeper"], now=2500.0)
+            first_inject = self.run_daemon_once(r, ["gatekeeper"], now=2500.0)
+            inject = self.run_daemon_once(r, ["gatekeeper"], now=2503.0)
 
-        inject.assert_not_called()
-        self.assertFalse(r.exists(state_key("gatekeeper", "idle")))
+        first_inject.assert_not_called()
+        inject.assert_called_once()
+        self.assertEqual("gatekeeper", inject.call_args.args[0])
+        self.assertTrue(r.exists(state_key("gatekeeper", "idle")))
         self.assertEqual(1, r.llen(inbox_key("gatekeeper")))
 
     def test_idle_flag_is_authoritative_even_when_tool_running_exists(self):

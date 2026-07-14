@@ -72,6 +72,8 @@ DEFAULT_DELIVERY_PROGRESS_MAX_AGE_SECS = 15.0
 DEFAULT_RECONCILE_AT_REST_GRACE_SECS = 60
 DEFAULT_FRESH_TOOL_RUNNING_MAX_AGE_SECS = 3600
 COMPOSER_OCCUPANCY_SUFFIX = "composer_occupancy"
+AT_REST_PANE_FINGERPRINT_SUFFIX = "at_rest_pane_fingerprint"
+DEFAULT_AT_REST_PANE_FINGERPRINT_TTL_SECS = 120
 COMPOSER_RESTING_REGION_NONBLANK_LINES = 12
 COMPOSER_PROMPT_MARKERS = ("❯", "›")
 COMPOSER_IGNORED_PROMPT_PREFIXES = (
@@ -512,10 +514,24 @@ def _pending_messages_old_enough(r, node_id: str, *, now: float, grace_sec: int)
             saw_message = True
             timestamp = _message_timestamp(raw)
             if timestamp is None:
-                return False
+                continue
             if max(0.0, now - timestamp) <= grace_sec:
                 return False
     return saw_message
+
+
+def _pane_fingerprint(pane_text: str) -> str:
+    return hashlib.sha1(
+        str(pane_text or "").encode("utf-8", errors="surrogatepass")
+    ).hexdigest()
+
+
+def _pane_content_stable(r, node_id: str, pane_text: str, *, ttl_sec: int) -> bool:
+    key = state_key(node_id, AT_REST_PANE_FINGERPRINT_SUFFIX)
+    fingerprint = _pane_fingerprint(pane_text)
+    previous = r.get(key)
+    r.set(key, fingerprint, ex=max(1, int(ttl_sec)))
+    return previous == fingerprint
 
 
 def _verify_tmux_submission_consumed(
@@ -623,6 +639,16 @@ def reconcile_idle_at_rest(
     if _pane_shows_active_turn(pane_text):
         return False
     if not _pane_shows_resting_composer_box(pane_text):
+        return False
+    if not _pane_content_stable(
+        r,
+        node_id,
+        pane_text,
+        ttl_sec=max(
+            DEFAULT_AT_REST_PANE_FINGERPRINT_TTL_SECS,
+            max(0, int(grace_sec)) * 2,
+        ),
+    ):
         return False
     r.set(state_key(node_id, "idle"), "1")
     logger.warning("Reconciled idle=1 for %s at resting composer", node_id)
