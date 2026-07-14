@@ -111,6 +111,116 @@ class DaemonTests(unittest.TestCase):
         self.assertEqual("", state["composer"])
         self.assertIn(message, state["submitted"])
 
+    def test_inject_via_tmux_retries_when_first_submit_is_swallowed(self):
+        message = "retry submit payload"
+        state = {"composer": "", "submitted": [], "submit_keys": 0}
+        captures = []
+
+        def fake_run(cmd, **_kwargs):
+            if cmd[:2] == ["tmux", "capture-pane"]:
+                captures.append(state["composer"])
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=f"› {state['composer']}\n",
+                    stderr="",
+                )
+            if cmd[:3] != ["tmux", "send-keys", "-t"]:
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+            keys = cmd[4:]
+            if keys == ["C-u", "C-k"]:
+                state["composer"] = ""
+            elif keys[:1] == ["--"]:
+                state["composer"] = str(keys[1])
+            elif keys in (["Enter"], ["-H", "1b", "5b", "31", "33", "75"]):
+                state["submit_keys"] += 1
+                if state["submit_keys"] > 2 and state["composer"]:
+                    state["submitted"].append(state["composer"])
+                    state["composer"] = ""
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with mock.patch.object(daemon.subprocess, "run", side_effect=fake_run):
+            ok = daemon.inject_via_tmux("worker-codex", message)
+
+        self.assertTrue(ok)
+        self.assertEqual("", state["composer"])
+        self.assertIn(message, state["submitted"])
+        self.assertGreater(state["submit_keys"], 2)
+        self.assertIn(message, captures)
+
+    def test_inject_via_tmux_ignores_transcript_echo_above_empty_composer(self):
+        message = "post submit payload"
+        state = {"composer": "", "submitted": [], "submit_keys": 0}
+
+        def pane_text():
+            transcript = (
+                f"❯ {state['submitted'][-1]}\n\n"
+                if state["submitted"]
+                else ""
+            )
+            return f"""
+{transcript}╭────────────────────────────────────────────────────────────────────╮
+│ ❯ {state['composer']:<62} │
+╰───────────────────────────────── gpt-5.5 · conductor-codex ─╯
+"""
+
+        def fake_run(cmd, **_kwargs):
+            if cmd[:2] == ["tmux", "capture-pane"]:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=pane_text(),
+                    stderr="",
+                )
+            if cmd[:3] != ["tmux", "send-keys", "-t"]:
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+            keys = cmd[4:]
+            if keys == ["C-u", "C-k"]:
+                state["composer"] = ""
+            elif keys[:1] == ["--"]:
+                state["composer"] = str(keys[1])
+            elif keys in (["Enter"], ["-H", "1b", "5b", "31", "33", "75"]):
+                state["submit_keys"] += 1
+                if state["composer"]:
+                    state["submitted"].append(state["composer"])
+                    state["composer"] = ""
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with mock.patch.object(daemon.subprocess, "run", side_effect=fake_run):
+            ok = daemon.inject_via_tmux("worker-codex", message)
+
+        self.assertTrue(ok)
+        self.assertEqual("", state["composer"])
+        self.assertEqual([message], state["submitted"])
+        self.assertEqual(2, state["submit_keys"])
+
+    def test_inject_via_tmux_fails_when_submit_verification_stays_stranded(self):
+        message = "still stranded payload"
+        state = {"composer": "", "submit_keys": 0}
+
+        def fake_run(cmd, **_kwargs):
+            if cmd[:2] == ["tmux", "capture-pane"]:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=f"› {state['composer']}\n",
+                    stderr="",
+                )
+            if cmd[:3] != ["tmux", "send-keys", "-t"]:
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+            keys = cmd[4:]
+            if keys == ["C-u", "C-k"]:
+                state["composer"] = ""
+            elif keys[:1] == ["--"]:
+                state["composer"] = str(keys[1])
+            elif keys in (["Enter"], ["-H", "1b", "5b", "31", "33", "75"]):
+                state["submit_keys"] += 1
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with mock.patch.object(daemon.subprocess, "run", side_effect=fake_run):
+            ok = daemon.inject_via_tmux("worker-codex", message)
+
+        self.assertFalse(ok)
+        self.assertEqual(message, state["composer"])
+        self.assertGreater(state["submit_keys"], 2)
+
     def test_run_daemon_injects_only_idle_sessions_with_messages(self):
         r = FakeRedis()
         r.set(state_key("idle-session", "idle"), "1")
@@ -172,6 +282,28 @@ class DaemonTests(unittest.TestCase):
 
         self.assertFalse(occupied)
         self.assertFalse(r.exists(state_key("worker-grok", "composer_occupancy")))
+
+    def test_observe_composer_occupancy_ignores_transcript_echo_above_empty_box(self):
+        r = FakeRedis()
+        r.set(state_key("worker-codex", "composer_occupancy"), json.dumps({"occupied": True}))
+        pane = """
+❯ Submit the queued supervisor packet
+
+╭────────────────────────────────────────────────────────────────────╮
+│ ❯                                                                  │
+╰───────────────────────────────── gpt-5.5 · conductor-codex ─╯
+"""
+        with mock.patch.object(daemon, "_tmux_pane_tail", return_value=pane):
+            occupied = daemon.observe_composer_occupancy(
+                r,
+                "worker-codex",
+                "worker-codex",
+                machine="notify-host",
+                now=1234.0,
+            )
+
+        self.assertFalse(occupied)
+        self.assertFalse(r.exists(state_key("worker-codex", "composer_occupancy")))
 
     def test_observe_composer_occupancy_ignores_codex_help_hint(self):
         r = FakeRedis()
