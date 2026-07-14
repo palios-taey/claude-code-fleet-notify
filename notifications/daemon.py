@@ -85,6 +85,12 @@ USAGE_LIMIT_TRANSIENT_EXCLUSIONS = (
     "not your usage limit",
 )
 USAGE_LIMIT_RESTING_REGION_NONBLANK_LINES = 3
+COMPOSER_OCCUPANCY_SUFFIX = "composer_occupancy"
+COMPOSER_RESTING_REGION_NONBLANK_LINES = 12
+COMPOSER_PROMPT_MARKERS = ("❯", "›")
+COMPOSER_IGNORED_PROMPT_PREFIXES = (
+    "use /skills to list available skills",
+)
 
 
 class _HandoffValidationJob:
@@ -216,6 +222,92 @@ def _pane_shows_usage_limit_resting_state(pane_text: str) -> bool:
     if any(marker in normalized for marker in USAGE_LIMIT_TRANSIENT_EXCLUSIONS):
         return False
     return any(marker in normalized for marker in USAGE_LIMIT_IDLE_MARKERS)
+
+
+def _recent_nonblank_pane_lines(pane_text: str, *, limit: int) -> list[str]:
+    nonblank_lines = [line for line in (pane_text or "").splitlines() if line.strip()]
+    return nonblank_lines[-limit:]
+
+
+def _strip_composer_box_edges(line: str) -> str:
+    text = line.strip()
+    if text.startswith("│"):
+        text = text[1:]
+    if text.endswith("│"):
+        text = text[:-1]
+    return text.strip()
+
+
+def _usable_composer_text(text: str) -> str:
+    candidate = " ".join(str(text or "").split())
+    if not candidate:
+        return ""
+    lowered = candidate.lower()
+    if any(lowered.startswith(prefix) for prefix in COMPOSER_IGNORED_PROMPT_PREFIXES):
+        return ""
+    return candidate
+
+
+def _composer_text_from_pane(pane_text: str) -> str:
+    recent_lines = _recent_nonblank_pane_lines(
+        pane_text,
+        limit=COMPOSER_RESTING_REGION_NONBLANK_LINES,
+    )
+    for index, raw_line in enumerate(recent_lines):
+        inner = _strip_composer_box_edges(raw_line)
+        marker_positions = [
+            (inner.find(marker), marker)
+            for marker in COMPOSER_PROMPT_MARKERS
+            if marker in inner
+        ]
+        marker_positions = [(pos, marker) for pos, marker in marker_positions if pos >= 0]
+        if not marker_positions:
+            continue
+        marker_pos, marker = min(marker_positions, key=lambda item: item[0])
+        inline = _usable_composer_text(inner[marker_pos + len(marker):])
+        if inline:
+            return inline[:160]
+        if not raw_line.strip().startswith("│"):
+            continue
+        for continuation in recent_lines[index + 1:]:
+            if not continuation.strip().startswith("│"):
+                break
+            text = _usable_composer_text(_strip_composer_box_edges(continuation))
+            if text:
+                return text[:160]
+    return ""
+
+
+def observe_composer_occupancy(
+    r,
+    node_id: str,
+    session_name: str,
+    *,
+    machine: str,
+    now: float | None = None,
+) -> bool:
+    pane_text = _tmux_pane_tail(session_name)
+    if not pane_text:
+        return False
+    key = state_key(node_id, COMPOSER_OCCUPANCY_SUFFIX)
+    composer_text = _composer_text_from_pane(pane_text)
+    if not composer_text:
+        r.delete(key)
+        return False
+    observed_at = time.time() if now is None else float(now)
+    r.set(
+        key,
+        json.dumps(
+            {
+                "occupied": True,
+                "observed_at": observed_at,
+                "machine": machine,
+            },
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ),
+    )
+    return True
 
 
 def reconcile_usage_limit_idle(r, node_id: str, session_name: str) -> bool:
@@ -622,6 +714,18 @@ def run_daemon(
                 for session_name in local_sessions:
                     node_id = session_name
                     _mark_daemon_delivery_progress(r, delivery_progress, machine)
+                    now = time.time()
+                    try:
+                        observe_composer_occupancy(
+                            r,
+                            node_id,
+                            session_name,
+                            machine=machine,
+                            now=now,
+                        )
+                    except Exception as exc:
+                        logger.error("composer occupancy observation failed for %s: %s",
+                                     node_id, exc)
                     try:
                         mark_session_machine(
                             r,

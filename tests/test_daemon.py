@@ -91,6 +91,69 @@ class DaemonTests(unittest.TestCase):
         self.assertEqual(1, r.llen(inbox_key("idle-session")))
         self.assertTrue(r.exists(state_key("idle-session", "idle")))
 
+    def test_observe_composer_occupancy_records_nonempty_input(self):
+        r = FakeRedis()
+        pane = """
+  ╭────────────────────────────────────────────────────────────────────╮
+  │ ❯ Click Post on the staged LinkedIn application                    │
+  ╰───────────────────────────────── Grok 4.5 (high) · always-approve ─╯
+"""
+        with mock.patch.object(daemon, "_tmux_pane_tail", return_value=pane):
+            occupied = daemon.observe_composer_occupancy(
+                r,
+                "worker-grok",
+                "worker-grok",
+                machine="notify-host",
+                now=1234.0,
+            )
+
+        payload = json.loads(r.get(state_key("worker-grok", "composer_occupancy")))
+        self.assertTrue(occupied)
+        self.assertTrue(payload["occupied"])
+        self.assertEqual(1234.0, payload["observed_at"])
+        self.assertEqual("notify-host", payload["machine"])
+        self.assertNotIn("excerpt", payload)
+        self.assertNotIn("Click Post on the staged LinkedIn application", json.dumps(payload))
+
+    def test_observe_composer_occupancy_clears_empty_input(self):
+        r = FakeRedis()
+        r.set(state_key("worker-grok", "composer_occupancy"), json.dumps({"occupied": True}))
+        pane = """
+  ╭────────────────────────────────────────────────────────────────────╮
+  │ ❯                                                                  │
+  ╰───────────────────────────────── Grok 4.5 (high) · always-approve ─╯
+"""
+        with mock.patch.object(daemon, "_tmux_pane_tail", return_value=pane):
+            occupied = daemon.observe_composer_occupancy(
+                r,
+                "worker-grok",
+                "worker-grok",
+                machine="notify-host",
+                now=1234.0,
+            )
+
+        self.assertFalse(occupied)
+        self.assertFalse(r.exists(state_key("worker-grok", "composer_occupancy")))
+
+    def test_observe_composer_occupancy_ignores_codex_help_hint(self):
+        r = FakeRedis()
+        pane = """
+› Use /skills to list available skills
+
+  gpt-5.5 xhigh · ~/.peer-worktrees/conductor-codex
+"""
+        with mock.patch.object(daemon, "_tmux_pane_tail", return_value=pane):
+            occupied = daemon.observe_composer_occupancy(
+                r,
+                "worker-codex",
+                "worker-codex",
+                machine="notify-host",
+                now=1234.0,
+            )
+
+        self.assertFalse(occupied)
+        self.assertFalse(r.exists(state_key("worker-codex", "composer_occupancy")))
+
     def test_run_daemon_writes_heartbeat_each_poll(self):
         r = FakeRedis()
 
