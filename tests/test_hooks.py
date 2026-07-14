@@ -533,6 +533,17 @@ class PreToolUseHookTests(HookTestCase):
                     r.store[state_key("session-b", "tool_running_at")],
                 )
 
+    def test_cli_pre_tool_hooks_fail_open_if_activity_stamp_raises(self):
+        for module_name in ("hooks.codex_pre_tool", "hooks.gemini_before_tool"):
+            with self.subTest(module=module_name):
+                r = FakeRedis()
+                module = importlib.import_module(module_name)
+
+                with mock.patch.object(module, "action_pre_tool", side_effect=RuntimeError("stamp failed")):
+                    result = self.run_hook(module_name, r, '{"tool_name":"Bash"}')
+
+                self.assertEqual({}, result)
+
 
 class LivePathGuardTests(HookTestCase):
     def live_registry(self, td: Path) -> tuple[Path, Path, Path]:
@@ -857,6 +868,17 @@ class PostToolUseHookTests(HookTestCase):
                 self.assertIn(state_key("session-b", "tool_running_at"), r.deleted)
                 self.assertFalse(r.exists(state_key("session-b", "tool_running")))
                 self.assertFalse(r.exists(state_key("session-b", "tool_running_at")))
+
+    def test_cli_post_tool_hooks_fail_open_if_activity_clear_raises(self):
+        for module_name in ("hooks.codex_post_tool", "hooks.gemini_after_tool"):
+            with self.subTest(module=module_name):
+                r = FakeRedis()
+                module = importlib.import_module(module_name)
+
+                with mock.patch.object(module, "action_post_tool", side_effect=RuntimeError("clear failed")):
+                    result = self.run_hook(module_name, r, '{"tool_name":"Bash"}')
+
+                self.assertEqual({}, result)
 
     def test_post_tool_appends_wake_packet_with_data_only_boundary(self):
         r = FakeRedis()
