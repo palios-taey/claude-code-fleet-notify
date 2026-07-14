@@ -5,9 +5,10 @@ Wired in ~/.codex/config.toml under [[hooks.Stop]].
 Codex stdin includes: session_id, transcript_path, cwd, hook_event_name,
 model, turn_id.
 
-This is the ONLY place idle gets set. Per NOTIFICATION_PROTOCOL.md the
-notification daemon will pointer-inject pending inbox messages via tmux
-once it sees idle=1.
+Stop is one valid setter for idle=1; SessionStart and the daemon's narrow
+at-rest reconciler can also set it. Per NOTIFICATION_PROTOCOL.md the
+notification daemon will pointer-inject pending inbox messages via tmux once
+it sees idle=1.
 """
 from __future__ import annotations
 import json
