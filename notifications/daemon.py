@@ -93,6 +93,8 @@ COMPOSER_IGNORED_PROMPT_PREFIXES = (
     "use /skills to list available skills",
     "how is claude doing this session?",
 )
+SUBMIT_VERIFY_RETRIES = 2
+SUBMIT_VERIFY_SETTLE_SECS = 0.25
 
 
 class _DaemonShutdown(BaseException):
@@ -122,6 +124,14 @@ class _TmuxInjection:
 
     def paste_buffer(self) -> bool:
         return _run_tmux_command(["tmux", "paste-buffer", "-t", self.session_name, "-p", "-d"])
+
+    def resend_submit(self) -> bool:
+        if self.sequence == "grok":
+            return self.send_keys("Enter")
+        if not self.send_keys("Enter"):
+            return False
+        time.sleep(0.1)
+        return self.send_keys("-H", "1b", "5b", "31", "33", "75")
 
     def drain(self) -> bool:
         with self._lock:
@@ -329,6 +339,11 @@ def get_local_tmux_sessions() -> list[str]:
 
 
 def _tmux_pane_tail(session_name: str, *, lines: int = 80) -> str:
+    ok, text = _capture_tmux_pane_tail(session_name, lines=lines)
+    return text if ok else ""
+
+
+def _capture_tmux_pane_tail(session_name: str, *, lines: int = 80) -> tuple[bool, str]:
     try:
         result = subprocess.run(
             ["tmux", "capture-pane", "-p", "-t", session_name, "-S", f"-{lines}"],
@@ -337,10 +352,10 @@ def _tmux_pane_tail(session_name: str, *, lines: int = 80) -> str:
             timeout=5,
         )
         if result.returncode == 0:
-            return result.stdout or ""
+            return True, result.stdout or ""
     except Exception as exc:
         logger.debug("tmux pane capture failed for %s: %s", session_name, exc)
-    return ""
+    return False, ""
 
 
 def _usage_limit_resting_region(pane_text: str) -> str:
@@ -381,34 +396,121 @@ def _usable_composer_text(text: str) -> str:
     return candidate
 
 
+def _marker_position(inner: str) -> tuple[int, str] | None:
+    marker_positions = [
+        (inner.find(marker), marker)
+        for marker in COMPOSER_PROMPT_MARKERS
+        if marker in inner
+    ]
+    marker_positions = [(pos, marker) for pos, marker in marker_positions if pos >= 0]
+    if not marker_positions:
+        return None
+    return min(marker_positions, key=lambda item: item[0])
+
+
+def _composer_text_from_box_lines(box_lines: list[str]) -> str:
+    for index, raw_line in enumerate(box_lines):
+        inner = _strip_composer_box_edges(raw_line)
+        marker_found = _marker_position(inner)
+        if marker_found is None:
+            continue
+        marker_pos, marker = marker_found
+        inline = _usable_composer_text(inner[marker_pos + len(marker):])
+        if inline:
+            return inline[:160]
+        for continuation in box_lines[index + 1:]:
+            text = _usable_composer_text(_strip_composer_box_edges(continuation))
+            if text:
+                return text[:160]
+        return ""
+    return ""
+
+
+def _composer_box_lines(recent_lines: list[str]) -> list[str] | None:
+    box_lines: list[str] = []
+    in_box = False
+    for raw_line in reversed(recent_lines):
+        stripped = raw_line.strip()
+        if not in_box:
+            if stripped.startswith("╰") and stripped.endswith("╯"):
+                in_box = True
+            continue
+        if stripped.startswith("╭") and stripped.endswith("╮"):
+            return list(reversed(box_lines))
+        if stripped.startswith("│") and stripped.endswith("│"):
+            box_lines.append(raw_line)
+    return None
+
+
 def _composer_text_from_pane(pane_text: str) -> str:
     recent_lines = _recent_nonblank_pane_lines(
         pane_text,
         limit=COMPOSER_RESTING_REGION_NONBLANK_LINES,
     )
-    for index, raw_line in enumerate(recent_lines):
+    box_lines = _composer_box_lines(recent_lines)
+    if box_lines is not None:
+        return _composer_text_from_box_lines(box_lines)
+
+    for index in range(len(recent_lines) - 1, -1, -1):
+        raw_line = recent_lines[index]
         inner = _strip_composer_box_edges(raw_line)
-        marker_positions = [
-            (inner.find(marker), marker)
-            for marker in COMPOSER_PROMPT_MARKERS
-            if marker in inner
-        ]
-        marker_positions = [(pos, marker) for pos, marker in marker_positions if pos >= 0]
-        if not marker_positions:
+        marker_found = _marker_position(inner)
+        if marker_found is None:
             continue
-        marker_pos, marker = min(marker_positions, key=lambda item: item[0])
+        marker_pos, marker = marker_found
         inline = _usable_composer_text(inner[marker_pos + len(marker):])
         if inline:
             return inline[:160]
         if not raw_line.strip().startswith("│"):
             continue
         for continuation in recent_lines[index + 1:]:
-            if not continuation.strip().startswith("│"):
+            continuation_inner = _strip_composer_box_edges(continuation)
+            if _marker_position(continuation_inner) is not None:
                 break
-            text = _usable_composer_text(_strip_composer_box_edges(continuation))
+            text = _usable_composer_text(continuation_inner)
             if text:
                 return text[:160]
     return ""
+
+
+def _verify_tmux_submission_consumed(
+    injection: _TmuxInjection,
+    *,
+    retries: int = SUBMIT_VERIFY_RETRIES,
+) -> bool:
+    for attempt in range(max(int(retries), 0) + 1):
+        ok, pane_text = _capture_tmux_pane_tail(injection.session_name)
+        if not ok:
+            logger.error(
+                "tmux injection submit verification failed for %s: capture-pane failed",
+                injection.session_name,
+            )
+            return False
+        composer_text = _composer_text_from_pane(pane_text)
+        if not composer_text:
+            return True
+        if attempt >= retries:
+            logger.error(
+                "tmux injection submit verification failed for %s: composer still occupied after %d retries",
+                injection.session_name,
+                retries,
+            )
+            return False
+        logger.warning(
+            "tmux injection submit verification found stranded composer text for %s; retrying submit (%d/%d)",
+            injection.session_name,
+            attempt + 1,
+            retries,
+        )
+        injection.set_phase("submit_retry_sent")
+        if not injection.resend_submit():
+            logger.error(
+                "tmux injection submit retry failed for %s",
+                injection.session_name,
+            )
+            return False
+        time.sleep(SUBMIT_VERIFY_SETTLE_SECS)
+    return False
 
 
 def observe_composer_occupancy(
@@ -501,6 +603,7 @@ def inject_via_tmux(session_name: str, message: str) -> bool:
             time.sleep(0.5)
             if not injection.send_keys("Enter"):
                 return False
+            time.sleep(SUBMIT_VERIFY_SETTLE_SECS)
         else:
             if not injection.send_keys("--", message):
                 return False
@@ -516,6 +619,9 @@ def inject_via_tmux(session_name: str, message: str) -> bool:
             time.sleep(0.1)
             if not injection.send_keys("-H", "1b", "5b", "31", "33", "75"):
                 return False
+            time.sleep(SUBMIT_VERIFY_SETTLE_SECS)
+        if not _verify_tmux_submission_consumed(injection):
+            return False
         injection.set_phase("submitted")
         logger.info("OK: %s (local, sequence=%s)", session_name, sequence)
         return True
