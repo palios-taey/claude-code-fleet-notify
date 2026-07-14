@@ -34,6 +34,7 @@ from notifications.inbox import (
     is_node_idle,
     key_prefix,
     notifications_key,
+    orch_key,
     state_key,
 )
 from notifications.handoff import (
@@ -68,30 +69,18 @@ DAEMON_HEARTBEAT_SUFFIX = "heartbeat"
 DAEMON_DELIVERY_PROGRESS_SUFFIX = "delivery_progress"
 DEFAULT_DAEMON_HEARTBEAT_INTERVAL_SECS = 3.0
 DEFAULT_DELIVERY_PROGRESS_MAX_AGE_SECS = 15.0
-USAGE_LIMIT_IDLE_MARKERS = (
-    "you've hit your session limit",
-    "you have hit your session limit",
-    "you've reached your session limit",
-    "you have reached your session limit",
-    "you've hit your weekly limit",
-    "you have hit your weekly limit",
-    "you've reached your weekly limit",
-    "you have reached your weekly limit",
-    "you've hit your usage limit",
-    "you have hit your usage limit",
-    "you've reached your usage limit",
-    "you have reached your usage limit",
-)
-USAGE_LIMIT_TRANSIENT_EXCLUSIONS = (
-    "not your usage limit",
-)
-USAGE_LIMIT_RESTING_REGION_NONBLANK_LINES = 3
+DEFAULT_RECONCILE_AT_REST_GRACE_SECS = 60
+DEFAULT_FRESH_TOOL_RUNNING_MAX_AGE_SECS = 3600
 COMPOSER_OCCUPANCY_SUFFIX = "composer_occupancy"
 COMPOSER_RESTING_REGION_NONBLANK_LINES = 12
 COMPOSER_PROMPT_MARKERS = ("❯", "›")
 COMPOSER_IGNORED_PROMPT_PREFIXES = (
     "use /skills to list available skills",
     "how is claude doing this session?",
+)
+ACTIVE_TURN_MARKERS = (
+    "esc to interrupt",
+    "escape to interrupt",
 )
 SUBMIT_VERIFY_RETRIES = 2
 SUBMIT_VERIFY_SETTLE_SECS = 0.25
@@ -358,20 +347,6 @@ def _capture_tmux_pane_tail(session_name: str, *, lines: int = 80) -> tuple[bool
     return False, ""
 
 
-def _usage_limit_resting_region(pane_text: str) -> str:
-    nonblank_lines = [line.strip() for line in (pane_text or "").splitlines() if line.strip()]
-    return "\n".join(nonblank_lines[-USAGE_LIMIT_RESTING_REGION_NONBLANK_LINES:])
-
-
-def _pane_shows_usage_limit_resting_state(pane_text: str) -> bool:
-    normalized = " ".join(_usage_limit_resting_region(pane_text).lower().split())
-    if not normalized:
-        return False
-    if any(marker in normalized for marker in USAGE_LIMIT_TRANSIENT_EXCLUSIONS):
-        return False
-    return any(marker in normalized for marker in USAGE_LIMIT_IDLE_MARKERS)
-
-
 def _recent_nonblank_pane_lines(pane_text: str, *, limit: int) -> list[str]:
     nonblank_lines = [line for line in (pane_text or "").splitlines() if line.strip()]
     return nonblank_lines[-limit:]
@@ -473,6 +448,76 @@ def _composer_text_from_pane(pane_text: str) -> str:
     return ""
 
 
+def _pane_shows_active_turn(pane_text: str) -> bool:
+    recent_lines = _recent_nonblank_pane_lines(
+        pane_text,
+        limit=COMPOSER_RESTING_REGION_NONBLANK_LINES,
+    )
+    for line in recent_lines:
+        normalized = " ".join(line.lower().split())
+        if any(marker in normalized for marker in ACTIVE_TURN_MARKERS):
+            return True
+    return False
+
+
+def _pane_shows_resting_composer_box(pane_text: str) -> bool:
+    recent_lines = _recent_nonblank_pane_lines(
+        pane_text,
+        limit=COMPOSER_RESTING_REGION_NONBLANK_LINES,
+    )
+    box_lines = _composer_box_lines(recent_lines)
+    if box_lines is None:
+        return False
+    return any(_marker_position(_strip_composer_box_edges(line)) is not None
+               for line in box_lines)
+
+
+def _float_or_none(value) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _fresh_tool_running(r, node_id: str, *, now: float, max_age_sec: int) -> bool:
+    if not r.exists(state_key(node_id, "tool_running")):
+        return False
+    observed_at = _float_or_none(r.get(state_key(node_id, "tool_running_at")))
+    if observed_at is None:
+        observed_at = _float_or_none(r.get(state_key(node_id, "last_tool_activity")))
+    if observed_at is None:
+        return False
+    return max(0.0, now - observed_at) < max_age_sec
+
+
+def _message_timestamp(raw: object) -> float | None:
+    try:
+        payload = json.loads(raw)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    return _float_or_none(payload.get("timestamp"))
+
+
+def _pending_messages_old_enough(r, node_id: str, *, now: float, grace_sec: int) -> bool:
+    queue_keys = (
+        inbox_key(node_id),
+        notifications_key(node_id),
+        orch_key(node_id),
+    )
+    saw_message = False
+    for key in queue_keys:
+        for raw in r.lrange(key, 0, -1):
+            saw_message = True
+            timestamp = _message_timestamp(raw)
+            if timestamp is None:
+                return False
+            if max(0.0, now - timestamp) <= grace_sec:
+                return False
+    return saw_message
+
+
 def _verify_tmux_submission_consumed(
     injection: _TmuxInjection,
     *,
@@ -545,25 +590,45 @@ def observe_composer_occupancy(
     return True
 
 
-def reconcile_usage_limit_idle(r, node_id: str, session_name: str) -> bool:
-    """Restore idle=1 when Claude Code parks at a usage-limit banner.
-
-    A session-limit abort can return the TUI to a resting prompt without firing
-    Stop, leaving the explicit idle flag absent. This helper repairs only that
-    observed parked state; normal idle-absent sessions remain active and wait
-    for PostToolUse/UserPromptSubmit delivery.
-    """
+def reconcile_idle_at_rest(
+    r,
+    node_id: str,
+    session_name: str,
+    *,
+    now: float | None = None,
+    grace_sec: int = DEFAULT_RECONCILE_AT_REST_GRACE_SECS,
+    tool_running_max_age_sec: int = DEFAULT_FRESH_TOOL_RUNNING_MAX_AGE_SECS,
+) -> bool:
+    """Restore idle=1 when the pane is clearly at rest with old pending mail."""
     if is_node_idle(r, node_id):
         return False
-    if r.exists(state_key(node_id, "tool_running")):
+    current_time = time.time() if now is None else float(now)
+    if _fresh_tool_running(
+        r,
+        node_id,
+        now=current_time,
+        max_age_sec=max(1, int(tool_running_max_age_sec)),
+    ):
         return False
-    if not _pane_shows_usage_limit_resting_state(_tmux_pane_tail(session_name)):
+    if not _pending_messages_old_enough(
+        r,
+        node_id,
+        now=current_time,
+        grace_sec=max(0, int(grace_sec)),
+    ):
+        return False
+    pane_text = _tmux_pane_tail(session_name)
+    if not pane_text:
+        return False
+    if _pane_shows_active_turn(pane_text):
+        return False
+    if not _pane_shows_resting_composer_box(pane_text):
         return False
     r.set(state_key(node_id, "idle"), "1")
-    logger.warning("Reconciled idle=1 for %s after usage-limit banner", node_id)
+    logger.warning("Reconciled idle=1 for %s at resting composer", node_id)
     try:
         from notifications.trace import trace
-        trace(r, "idle_set", node=node_id, src="usage_limit_reconcile")
+        trace(r, "idle_set", node=node_id, src="at_rest_reconcile")
     except Exception:
         pass
     return True
@@ -1016,7 +1081,7 @@ def run_daemon(
                         continue
                     now = time.time()
                     if not is_node_idle(r, node_id):
-                        reconcile_usage_limit_idle(r, node_id, session_name)
+                        reconcile_idle_at_rest(r, node_id, session_name, now=now)
                     if not is_node_idle(r, node_id):
                         continue
 

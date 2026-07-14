@@ -35,7 +35,7 @@ For every tmux-session participant (Claude Code / codex / gemini / grok), notifi
 - The session sees the notification body in its next prompt context without any tmux involvement.
 - This is the **injection-during-tool-use** path. Used while `idle != 1`.
 
-**Path B — Idle (session has stopped, `idle=1` set by Stop/SessionStart or usage-limit reconciliation)**:
+**Path B — Idle (session has stopped, `idle=1` set by Stop/SessionStart or daemon at-rest reconciliation)**:
 - The notification daemon (`notifications/daemon.py`) polls Redis, detects pending notifications for an idle session, and uses `scripts/tmux-send` to inject a pointer prompt into the session's tmux pane.
 - The session sees the pointer (e.g., "[NOTIFY] You have N messages...") and acts on it.
 - This is the **tmux-when-idle** path. Used only while `idle == 1`. The daemon does NOT clear idle; prompt/tool hooks clear it when the CLI becomes active again.
@@ -103,7 +103,7 @@ Tmux is used only when the session is stopped and `idle=1`, and it carries only 
 | `${NOTIFY_KEY_PREFIX:-taey}:SESSION:inbox` | inter-session queue, writers `LPUSH`, readers `RPOP` |
 | `${NOTIFY_KEY_PREFIX:-taey}:SESSION:notifications` | monitor / worker queue, writers `RPUSH`, readers `LPOP` |
 | `${NOTIFY_KEY_PREFIX:-taey}:notify:SESSION:orch` | auxiliary queue, writers `RPUSH`, readers `LPOP` |
-| `${NOTIFY_KEY_PREFIX:-taey}:SESSION:idle` | durable idle flag set by lifecycle hooks, or by daemon repair for a parked Claude Code usage-limit banner |
+| `${NOTIFY_KEY_PREFIX:-taey}:SESSION:idle` | durable idle flag set by lifecycle hooks, or by daemon repair for a parked Claude Code at-rest composer with old pending mail |
 | `${NOTIFY_KEY_PREFIX:-taey}:SESSION:last_activity` | last hook activity timestamp, used for handoff activation observation |
 | `${NOTIFY_KEY_PREFIX:-taey}:SESSION:last_tool_activity` | last tool-hook activity timestamp, used for handoff activation observation |
 | `${NOTIFY_KEY_PREFIX:-taey}:SESSION:tool_running` | transient tool-running flag set by PreToolUse and cleared by PostToolUse |
@@ -115,13 +115,13 @@ Tmux is used only when the session is stopped and `idle=1`, and it carries only 
 
 | Flag | Who sets it | Who clears it |
 |---|---|---|
-| `${NOTIFY_KEY_PREFIX:-taey}:SESSION:idle` | `Stop`, `SessionStart`, and daemon usage-limit reconciliation | `UserPromptSubmit`/`BeforeAgent` and tool-activity hooks |
+| `${NOTIFY_KEY_PREFIX:-taey}:SESSION:idle` | `Stop`, `SessionStart`, and daemon at-rest reconciliation | `UserPromptSubmit`/`BeforeAgent` and tool-activity hooks |
 | `${NOTIFY_KEY_PREFIX:-taey}:SESSION:last_activity` | hook activity | overwritten by later hook activity |
 | `${NOTIFY_KEY_PREFIX:-taey}:SESSION:last_tool_activity` | tool-hook activity | overwritten by later tool-hook activity |
 | `${NOTIFY_KEY_PREFIX:-taey}:SESSION:tool_running` | `PreToolUse`/`BeforeTool` | `PostToolUse`/`AfterTool` |
 | `${NOTIFY_KEY_PREFIX:-taey}:SESSION:tool_running_at` | `PreToolUse`/`BeforeTool` with the same timestamp as `last_tool_activity` | `PostToolUse`/`AfterTool` |
 
-The daemon's usage-limit repair is intentionally narrow: it only restores `idle=1` for a local tmux pane whose current bottom resting region visibly shows a Claude Code session/weekly/usage-limit banner while no tool is marked running. It is not a stale-activity, scrollback, or pane-active injection heuristic; after repair, the same one-flag `idle=1` authorization rule still decides pointer injection. The daemon never clears idle because tmux injection is not proof that the prompt was submitted.
+The daemon's at-rest repair is intentionally narrow: it only restores `idle=1` for a local tmux pane whose current bottom region clearly shows a resting composer box, whose pending mail is older than the reconcile grace, and whose state has no fresh tool-running signal or active-turn marker such as `Esc to interrupt`. It is not a stale-activity or scrollback injection heuristic; ambiguous pane reads fail closed. After repair, the same one-flag `idle=1` authorization rule still decides pointer injection. The daemon never clears idle because tmux injection is not proof that the prompt was submitted.
 
 The daemon heartbeat is not proof that pointer delivery is advancing. It is a
 process-liveness signal emitted from an independent timer thread. Delivery
@@ -197,7 +197,7 @@ taey-ack --peek
 
 ## Anti-patterns
 
-- Never set `idle=1` from ad hoc code paths; valid setters are `Stop`, `SessionStart`, and the daemon's narrow current-pane usage-limit reconciliation.
+- Never set `idle=1` from ad hoc code paths; valid setters are `Stop`, `SessionStart`, and the daemon's narrow current-pane at-rest reconciliation.
 - Never send full message bodies through tmux injection; use Redis plus hook `additionalContext`.
 - Never clear queues with destructive `DELETE` during normal acknowledgement; drain with pops so messages arriving concurrently are not dropped.
 - Do not relay messages through a central human or agent when the sender can target the recipient directly.

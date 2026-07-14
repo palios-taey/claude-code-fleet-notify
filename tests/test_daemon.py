@@ -22,6 +22,20 @@ from notifications.handoff import (
 from tests.fakes import FakeRedis
 
 
+RESTING_COMPOSER_PANE = """
+╭────────────────────────────────────────────────────────────────────╮
+│ ❯                                                                  │
+╰───────────────────────────────── gpt-5.5 · conductor-codex ─╯
+"""
+
+
+def queued_message(*, timestamp: float | None = 1000.0, body: str = "queued") -> str:
+    payload = {"from": "sender", "type": "message", "body": body}
+    if timestamp is not None:
+        payload["timestamp"] = timestamp
+    return json.dumps(payload)
+
+
 class CountingRedis(FakeRedis):
     def __init__(self, heartbeat_key: str):
         super().__init__()
@@ -697,16 +711,12 @@ class DaemonTests(unittest.TestCase):
         self.assertIn("queued", context)
         self.assertEqual(0, r.llen(inbox_key("long-tool")))
 
-    def test_usage_limit_banner_reconciles_parent_idle_before_inject(self):
+    def test_at_rest_composer_reconciles_parent_idle_before_inject(self):
         r = FakeRedis()
         r.set(state_key("gatekeeper", "last_activity"), "1000")
-        r.lpush(inbox_key("gatekeeper"), json.dumps({"from": "sender", "type": "message", "body": "queued"}))
+        r.lpush(inbox_key("gatekeeper"), queued_message(timestamp=1000.0))
 
-        with mock.patch.object(
-            daemon,
-            "_tmux_pane_tail",
-            return_value="You've hit your session limit · resets 2:10am (Africa/Abidjan)",
-        ):
+        with mock.patch.object(daemon, "_tmux_pane_tail", return_value=RESTING_COMPOSER_PANE):
             inject = self.run_daemon_once(r, ["gatekeeper"], now=2500.0)
 
         inject.assert_called_once()
@@ -714,51 +724,24 @@ class DaemonTests(unittest.TestCase):
         self.assertTrue(r.exists(state_key("gatekeeper", "idle")))
         self.assertEqual(1, r.llen(inbox_key("gatekeeper")))
 
-    def test_usage_limit_reconcile_matches_reached_weekly_and_usage_variants(self):
-        banners = (
-            "You've reached your weekly limit · resets 2:10am (Africa/Abidjan)",
-            "You have reached your weekly limit · resets 2:10am (Africa/Abidjan)",
-            "You've reached your usage limit · resets 2:10am (Africa/Abidjan)",
-            "You have reached your usage limit · resets 2:10am (Africa/Abidjan)",
-        )
-        for idx, banner in enumerate(banners):
-            with self.subTest(banner=banner):
-                node_id = f"gatekeeper-{idx}"
-                r = FakeRedis()
-                r.set(state_key(node_id, "last_activity"), "1000")
-                r.lpush(inbox_key(node_id), json.dumps({"from": "sender", "type": "message", "body": "queued"}))
-
-                with mock.patch.object(daemon, "_tmux_pane_tail", return_value=f"Claude Code\n{banner}"):
-                    inject = self.run_daemon_once(r, [node_id], now=2500.0)
-
-                inject.assert_called_once()
-                self.assertEqual(node_id, inject.call_args.args[0])
-                self.assertTrue(r.exists(state_key(node_id, "idle")))
-                self.assertEqual(1, r.llen(inbox_key(node_id)))
-
-    def test_usage_limit_reconcile_ignores_stale_banner_above_visible_resting_region(self):
+    def test_at_rest_composer_reconcile_subsumes_usage_limit_banner(self):
         r = FakeRedis()
         r.set(state_key("gatekeeper", "last_activity"), "1000")
-        r.lpush(inbox_key("gatekeeper"), json.dumps({"from": "sender", "type": "message", "body": "queued"}))
-        pane_tail = "\n".join((
-            "You've hit your session limit · resets 2:10am (Africa/Abidjan)",
-            "$ python long_running_job.py",
-            "processing task batch",
-            "writing output",
-            "Claude Code ready at prompt",
-        ))
+        r.lpush(inbox_key("gatekeeper"), queued_message(timestamp=1000.0))
+        pane_tail = "You've reached your usage limit · resets 2:10am\n" + RESTING_COMPOSER_PANE
 
         with mock.patch.object(daemon, "_tmux_pane_tail", return_value=pane_tail):
             inject = self.run_daemon_once(r, ["gatekeeper"], now=2500.0)
 
-        inject.assert_not_called()
-        self.assertFalse(r.exists(state_key("gatekeeper", "idle")))
+        inject.assert_called_once()
+        self.assertEqual("gatekeeper", inject.call_args.args[0])
+        self.assertTrue(r.exists(state_key("gatekeeper", "idle")))
         self.assertEqual(1, r.llen(inbox_key("gatekeeper")))
 
-    def test_usage_limit_reconcile_does_not_restore_generic_stale_idle_absence(self):
+    def test_at_rest_reconcile_fails_closed_without_box_anchored_composer(self):
         r = FakeRedis()
         r.set(state_key("gatekeeper", "last_activity"), "1000")
-        r.lpush(inbox_key("gatekeeper"), json.dumps({"from": "sender", "type": "message", "body": "queued"}))
+        r.lpush(inbox_key("gatekeeper"), queued_message(timestamp=1000.0))
 
         with mock.patch.object(daemon, "_tmux_pane_tail", return_value="Claude Code ready at prompt"):
             inject = self.run_daemon_once(r, ["gatekeeper"], now=2500.0)
@@ -767,32 +750,66 @@ class DaemonTests(unittest.TestCase):
         self.assertFalse(r.exists(state_key("gatekeeper", "idle")))
         self.assertEqual(1, r.llen(inbox_key("gatekeeper")))
 
-    def test_transient_not_your_usage_limit_does_not_reconcile_idle(self):
+    def test_at_rest_reconcile_blocks_active_turn_marker(self):
         r = FakeRedis()
         r.set(state_key("gatekeeper", "last_activity"), "1000")
-        r.lpush(inbox_key("gatekeeper"), json.dumps({"from": "sender", "type": "message", "body": "queued"}))
+        r.lpush(inbox_key("gatekeeper"), queued_message(timestamp=1000.0))
+        active_pane = RESTING_COMPOSER_PANE + "\n✶ Working… Esc to interrupt\n"
 
-        with mock.patch.object(
-            daemon,
-            "_tmux_pane_tail",
-            return_value="API Error: Server is temporarily limiting requests (not your usage limit)",
-        ):
+        with mock.patch.object(daemon, "_tmux_pane_tail", return_value=active_pane):
             inject = self.run_daemon_once(r, ["gatekeeper"], now=2500.0)
 
         inject.assert_not_called()
         self.assertFalse(r.exists(state_key("gatekeeper", "idle")))
+        self.assertEqual(1, r.llen(inbox_key("gatekeeper")))
 
-    def test_usage_limit_reconcile_respects_tool_running(self):
+    def test_at_rest_reconcile_respects_fresh_tool_running(self):
         r = FakeRedis()
         r.set(state_key("gatekeeper", "last_activity"), "1000")
         r.set(state_key("gatekeeper", "tool_running"), "1")
-        r.lpush(inbox_key("gatekeeper"), json.dumps({"from": "sender", "type": "message", "body": "queued"}))
+        r.set(state_key("gatekeeper", "tool_running_at"), "2490")
+        r.lpush(inbox_key("gatekeeper"), queued_message(timestamp=1000.0))
 
-        with mock.patch.object(
-            daemon,
-            "_tmux_pane_tail",
-            return_value="You've hit your session limit · resets 2:10am (Africa/Abidjan)",
-        ):
+        with mock.patch.object(daemon, "_tmux_pane_tail", return_value=RESTING_COMPOSER_PANE):
+            inject = self.run_daemon_once(r, ["gatekeeper"], now=2500.0)
+
+        inject.assert_not_called()
+        self.assertFalse(r.exists(state_key("gatekeeper", "idle")))
+        self.assertEqual(1, r.llen(inbox_key("gatekeeper")))
+
+    def test_at_rest_reconcile_ignores_stale_tool_running(self):
+        r = FakeRedis()
+        r.set(state_key("gatekeeper", "last_activity"), "4990")
+        r.set(state_key("gatekeeper", "last_tool_activity"), "1000")
+        r.set(state_key("gatekeeper", "tool_running"), "1")
+        r.lpush(inbox_key("gatekeeper"), queued_message(timestamp=1000.0))
+
+        with mock.patch.object(daemon, "_tmux_pane_tail", return_value=RESTING_COMPOSER_PANE):
+            inject = self.run_daemon_once(r, ["gatekeeper"], now=5000.0)
+
+        inject.assert_called_once()
+        self.assertEqual("gatekeeper", inject.call_args.args[0])
+        self.assertTrue(r.exists(state_key("gatekeeper", "idle")))
+        self.assertEqual(1, r.llen(inbox_key("gatekeeper")))
+
+    def test_at_rest_reconcile_obeys_mail_age_grace(self):
+        r = FakeRedis()
+        r.set(state_key("gatekeeper", "last_activity"), "1000")
+        r.lpush(inbox_key("gatekeeper"), queued_message(timestamp=2470.0))
+
+        with mock.patch.object(daemon, "_tmux_pane_tail", return_value=RESTING_COMPOSER_PANE):
+            inject = self.run_daemon_once(r, ["gatekeeper"], now=2500.0)
+
+        inject.assert_not_called()
+        self.assertFalse(r.exists(state_key("gatekeeper", "idle")))
+        self.assertEqual(1, r.llen(inbox_key("gatekeeper")))
+
+    def test_at_rest_reconcile_fails_closed_on_missing_message_timestamp(self):
+        r = FakeRedis()
+        r.set(state_key("gatekeeper", "last_activity"), "1000")
+        r.lpush(inbox_key("gatekeeper"), queued_message(timestamp=None))
+
+        with mock.patch.object(daemon, "_tmux_pane_tail", return_value=RESTING_COMPOSER_PANE):
             inject = self.run_daemon_once(r, ["gatekeeper"], now=2500.0)
 
         inject.assert_not_called()

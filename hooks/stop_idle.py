@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Claude Code Stop hook — set idle=1 + notify supervisor on stop.
 
-This is the ONLY place idle gets set. Prompt/tool activity clears it. The
+Stop is one valid setter for idle=1; SessionStart and the daemon's narrow
+at-rest reconciler can also set it. Prompt/tool activity clears it. The
 notification router delivers via tmux ONLY when idle=1.
 
 Universal Stop+notify primitive (v0.2.0): if this session has a
