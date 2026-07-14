@@ -263,11 +263,13 @@ class DaemonTests(unittest.TestCase):
         }))
         fake_redis_module = SimpleNamespace(Redis=lambda **kwargs: r)
         inject_started = threading.Event()
+        heartbeat_observed_while_blocked = threading.Event()
 
         def blocked_inject(_session_name, _summary):
             heartbeat_count_at_block = r.heartbeat_writes()
             inject_started.set()
-            self.assertTrue(r.wait_for_heartbeat_after(heartbeat_count_at_block, 1.0))
+            if r.wait_for_heartbeat_after(heartbeat_count_at_block, 5.0):
+                heartbeat_observed_while_blocked.set()
             raise KeyboardInterrupt
 
         with mock.patch.dict(sys.modules, {"redis": fake_redis_module}):
@@ -276,6 +278,7 @@ class DaemonTests(unittest.TestCase):
                     daemon.run_daemon("127.0.0.1", 6379, 0.01)
 
         self.assertTrue(inject_started.is_set())
+        self.assertTrue(heartbeat_observed_while_blocked.is_set())
         self.assertGreaterEqual(r.heartbeat_writes(), 2)
 
     def test_delivery_progress_stall_withholds_heartbeat(self):
