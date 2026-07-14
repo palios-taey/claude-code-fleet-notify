@@ -15,16 +15,19 @@ from _shared import (
 
 
 def main() -> None:
-    payload = read_stdin_json()
-    tool_name = payload.get("tool_name", "")
+    try:
+        payload = read_stdin_json()
+        tool_name = payload.get("tool_name", "")
 
-    r, node_id = get_redis_and_node()
-    if r is None:
+        r, node_id = get_redis_and_node()
+        if r is not None and node_id is not None:
+            action_pre_tool(r, node_id, tool_name)
         emit_claude_or_codex("PreToolUse", None)
-        sys.exit(0)
-
-    action_pre_tool(r, node_id, tool_name)
-    emit_claude_or_codex("PreToolUse", None)
+    except Exception:
+        try:
+            emit_claude_or_codex("PreToolUse", None)
+        except Exception:
+            pass
     sys.exit(0)
 
 
