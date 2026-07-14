@@ -91,6 +91,7 @@ COMPOSER_RESTING_REGION_NONBLANK_LINES = 12
 COMPOSER_PROMPT_MARKERS = ("❯", "›")
 COMPOSER_IGNORED_PROMPT_PREFIXES = (
     "use /skills to list available skills",
+    "how is claude doing this session?",
 )
 
 
