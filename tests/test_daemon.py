@@ -192,6 +192,38 @@ class DaemonTests(unittest.TestCase):
         self.assertFalse(occupied)
         self.assertFalse(r.exists(state_key("worker-codex", "composer_occupancy")))
 
+    def test_observe_composer_occupancy_ignores_claude_feedback_survey(self):
+        r = FakeRedis()
+        r.set(state_key("worker-claude", "composer_occupancy"), json.dumps({"occupied": True}))
+        pane = """
+› How is Claude doing this session? 1:Bad 2:Fine 3:Good 0:Dismiss
+
+  Opus 4.1 · /home/mira/job-seeker
+"""
+        with mock.patch.object(daemon, "_tmux_pane_tail", return_value=pane):
+            occupied = daemon.observe_composer_occupancy(
+                r,
+                "worker-claude",
+                "worker-claude",
+                machine="notify-host",
+                now=1234.0,
+            )
+
+        self.assertFalse(occupied)
+        self.assertFalse(r.exists(state_key("worker-claude", "composer_occupancy")))
+
+    def test_composer_text_keeps_real_input_after_claude_feedback_survey(self):
+        pane = """
+› How is Claude doing this session? 1:Bad 2:Fine 3:Good 0:Dismiss
+› Finish the application note before handoff
+
+  Opus 4.1 · /home/mira/job-seeker
+"""
+        self.assertEqual(
+            "Finish the application note before handoff",
+            daemon._composer_text_from_pane(pane),
+        )
+
     def test_run_daemon_writes_heartbeat_each_poll(self):
         r = FakeRedis()
 
