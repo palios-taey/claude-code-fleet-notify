@@ -52,6 +52,28 @@ Composing response chunk 18
 Shift+Tab:mode │ Esc:cancel │ Ctrl+x:shortcuts
 """
 
+ACTIVE_TURN_PANE = """
+Processing notification delivery
+Esc to interrupt
+╭────────────────────────────────────────────────────────────────────╮
+│ ❯                                                                  │
+╰───────────────────────────────── gpt-5.5 · conductor-codex ─╯
+"""
+
+NORMAL_IDLE_PROMPT_WITH_TRANSCRIPT_PANE = """
+❯ Previous submitted prompt that must not count as current draft
+
+› Write tests for @filename
+
+gpt-5.5 xhigh · ~/.peer-worktrees/conductor-codex
+"""
+
+REAL_DRAFT_PANE = """
+╭────────────────────────────────────────────────────────────────────╮
+│ ❯ Do not clobber this unsent draft                                  │
+╰───────────────────────────────── gpt-5.5 · conductor-codex ─╯
+"""
+
 
 def queued_message(*, timestamp: float | None = 1000.0, body: str = "queued") -> str:
     payload = {"from": "sender", "type": "message", "body": body}
@@ -244,6 +266,38 @@ class DaemonTests(unittest.TestCase):
         self.assertEqual([message], state["submitted"])
         self.assertEqual(2, state["submit_keys"])
 
+    def test_inject_via_tmux_ignores_cli_placeholder_after_submit(self):
+        message = "[NOTIFY] You have 1 messages (from conductor; first=COMMAND)."
+        state = {"composer": "", "submitted": [], "submit_keys": 0}
+
+        def fake_run(cmd, **_kwargs):
+            if cmd[:2] == ["tmux", "capture-pane"]:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout="› Write tests for @filename\n",
+                    stderr="",
+                )
+            if cmd[:3] != ["tmux", "send-keys", "-t"]:
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+            keys = cmd[4:]
+            if keys == ["C-u", "C-k"]:
+                state["composer"] = ""
+            elif keys[:1] == ["--"]:
+                state["composer"] = str(keys[1])
+            elif keys in (["Enter"], ["-H", "1b", "5b", "31", "33", "75"]):
+                state["submit_keys"] += 1
+                if state["composer"]:
+                    state["submitted"].append(state["composer"])
+                    state["composer"] = ""
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with mock.patch.object(daemon.subprocess, "run", side_effect=fake_run):
+            ok = daemon.inject_via_tmux("worker-codex", message)
+
+        self.assertTrue(ok)
+        self.assertEqual([message], state["submitted"])
+        self.assertEqual(2, state["submit_keys"])
+
     def test_inject_via_tmux_fails_when_submit_verification_stays_stranded(self):
         message = "still stranded payload"
         state = {"composer": "", "submit_keys": 0}
@@ -290,6 +344,58 @@ class DaemonTests(unittest.TestCase):
         self.assertEqual("idle-session", inject.call_args.args[0])
         self.assertEqual(1, r.llen(inbox_key("idle-session")))
         self.assertTrue(r.exists(state_key("idle-session", "idle")))
+
+    def test_normal_idle_prompt_with_pending_mail_delivers(self):
+        r = FakeRedis()
+        r.set(state_key("idle-session", "idle"), "1")
+        r.lpush(inbox_key("idle-session"), queued_message(body="normal path must deliver"))
+
+        with mock.patch.object(daemon, "_tmux_pane_tail", return_value=NORMAL_IDLE_PROMPT_WITH_TRANSCRIPT_PANE):
+            inject = self.run_daemon_once(
+                r,
+                ["idle-session"],
+                inject_result=True,
+                observe_composer=True,
+            )
+
+        inject.assert_called_once()
+        self.assertEqual("idle-session", inject.call_args.args[0])
+        self.assertEqual(1, r.llen(inbox_key("idle-session")))
+        self.assertTrue(r.exists(state_key("idle-session", "idle")))
+
+    def test_run_daemon_defers_idle_session_that_is_mid_turn(self):
+        r = FakeRedis()
+        r.set(state_key("active-session", "idle"), "1")
+        r.lpush(inbox_key("active-session"), queued_message(body="defer until turn completes"))
+
+        with mock.patch.object(daemon, "_tmux_pane_tail", return_value=ACTIVE_TURN_PANE):
+            inject = self.run_daemon_once(
+                r,
+                ["active-session"],
+                inject_result=True,
+                observe_composer=True,
+            )
+
+        inject.assert_not_called()
+        self.assertEqual(1, r.llen(inbox_key("active-session")))
+        self.assertTrue(r.exists(state_key("active-session", "idle")))
+
+    def test_run_daemon_defers_idle_session_with_real_unsent_draft(self):
+        r = FakeRedis()
+        r.set(state_key("draft-session", "idle"), "1")
+        r.lpush(inbox_key("draft-session"), queued_message(body="do not clobber draft"))
+
+        with mock.patch.object(daemon, "_tmux_pane_tail", return_value=REAL_DRAFT_PANE):
+            inject = self.run_daemon_once(
+                r,
+                ["draft-session"],
+                inject_result=True,
+                observe_composer=True,
+            )
+
+        inject.assert_not_called()
+        self.assertEqual(1, r.llen(inbox_key("draft-session")))
+        self.assertTrue(r.exists(state_key("draft-session", "idle")))
 
     def test_observe_composer_occupancy_records_nonempty_input(self):
         r = FakeRedis()
@@ -363,6 +469,25 @@ class DaemonTests(unittest.TestCase):
 › Use /skills to list available skills
 
   gpt-5.5 xhigh · ~/.peer-worktrees/conductor-codex
+"""
+        with mock.patch.object(daemon, "_tmux_pane_tail", return_value=pane):
+            occupied = daemon.observe_composer_occupancy(
+                r,
+                "worker-codex",
+                "worker-codex",
+                machine="notify-host",
+                now=1234.0,
+            )
+
+        self.assertFalse(occupied)
+        self.assertFalse(r.exists(state_key("worker-codex", "composer_occupancy")))
+
+    def test_observe_composer_occupancy_ignores_cli_starter_placeholder(self):
+        r = FakeRedis()
+        pane = """
+› Write tests for @filename
+
+gpt-5.5 xhigh · ~/.peer-worktrees/conductor-codex
 """
         with mock.patch.object(daemon, "_tmux_pane_tail", return_value=pane):
             occupied = daemon.observe_composer_occupancy(

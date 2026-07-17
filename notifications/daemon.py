@@ -27,7 +27,6 @@ import socket
 
 from notifications.inbox import (
     WAKE_TYPES,
-    flatten_sources,
     format_notification_block,
     has_pending_messages,
     inbox_key,
@@ -79,6 +78,12 @@ COMPOSER_PROMPT_MARKERS = ("❯", "›")
 COMPOSER_IGNORED_PROMPT_PREFIXES = (
     "use /skills to list available skills",
     "how is claude doing this session?",
+    "find and fix a bug in @filename",
+    "write tests for @filename",
+    "explain this codebase",
+    "implement {feature}",
+    "improve documentation in @filename",
+    "summarize recent commits",
 )
 ACTIVE_TURN_MARKERS = (
     "esc to interrupt",
@@ -86,6 +91,10 @@ ACTIVE_TURN_MARKERS = (
 )
 SUBMIT_VERIFY_RETRIES = 2
 SUBMIT_VERIFY_SETTLE_SECS = 0.25
+TURN_STATE_IDLE = "IDLE"
+TURN_STATE_IN_TURN_WORKING = "IN_TURN_WORKING"
+TURN_STATE_IN_TURN_STALLED = "IN_TURN_STALLED"
+TURN_STATE_COMPOSER_OCCUPIED = "COMPOSER_OCCUPIED"
 
 
 class _DaemonShutdown(BaseException):
@@ -95,9 +104,10 @@ class _DaemonShutdown(BaseException):
 
 
 class _TmuxInjection:
-    def __init__(self, session_name: str, sequence: str):
+    def __init__(self, session_name: str, sequence: str, expected_text: str | None = None):
         self.session_name = session_name
         self.sequence = sequence
+        self.expected_text = expected_text or ""
         self.phase = "created"
         self.drained = False
         self._lock = threading.RLock()
@@ -373,6 +383,14 @@ def _usable_composer_text(text: str) -> str:
     return candidate
 
 
+def _composer_text_matches_expected_submission(composer_text: str, expected_text: str) -> bool:
+    composer = " ".join(str(composer_text or "").split())
+    expected = " ".join(str(expected_text or "").split())
+    if not composer or not expected:
+        return False
+    return expected.startswith(composer) or composer.startswith(expected)
+
+
 def _marker_position(inner: str) -> tuple[int, str] | None:
     marker_positions = [
         (inner.find(marker), marker)
@@ -439,7 +457,7 @@ def _composer_text_from_pane(pane_text: str) -> str:
         if inline:
             return inline[:160]
         if not raw_line.strip().startswith("│"):
-            continue
+            return ""
         for continuation in recent_lines[index + 1:]:
             continuation_inner = _strip_composer_box_edges(continuation)
             if _marker_position(continuation_inner) is not None:
@@ -447,6 +465,7 @@ def _composer_text_from_pane(pane_text: str) -> str:
             text = _usable_composer_text(continuation_inner)
             if text:
                 return text[:160]
+        return ""
     return ""
 
 
@@ -490,6 +509,42 @@ def _fresh_tool_running(r, node_id: str, *, now: float, max_age_sec: int) -> boo
     if observed_at is None:
         return False
     return max(0.0, now - observed_at) < max_age_sec
+
+
+def _fresh_turn_progress(r, node_id: str, *, now: float, max_age_sec: int) -> bool:
+    observed_at = _float_or_none(r.get(state_key(node_id, "last_tool_activity")))
+    if observed_at is None:
+        observed_at = _float_or_none(r.get(state_key(node_id, "tool_running_at")))
+    if observed_at is None:
+        return False
+    return max(0.0, now - observed_at) < max_age_sec
+
+
+def _delivery_readiness(
+    r,
+    node_id: str,
+    session_name: str,
+    *,
+    now: float,
+    pane_text: str | None = None,
+    progress_sec: int = DEFAULT_FRESH_TOOL_RUNNING_MAX_AGE_SECS,
+) -> tuple[bool, str]:
+    if pane_text is None:
+        pane_text = _tmux_pane_tail(session_name)
+    if _pane_shows_active_turn(pane_text):
+        if _fresh_turn_progress(
+            r,
+            node_id,
+            now=now,
+            max_age_sec=max(1, int(progress_sec)),
+        ):
+            return False, TURN_STATE_IN_TURN_WORKING
+        return False, TURN_STATE_IN_TURN_STALLED
+    if not is_node_idle(r, node_id):
+        return False, TURN_STATE_IN_TURN_WORKING
+    if _composer_text_from_pane(pane_text):
+        return False, TURN_STATE_COMPOSER_OCCUPIED
+    return True, TURN_STATE_IDLE
 
 
 def _message_timestamp(raw: object) -> float | None:
@@ -550,15 +605,24 @@ def _verify_tmux_submission_consumed(
         composer_text = _composer_text_from_pane(pane_text)
         if not composer_text:
             return True
+        if not _composer_text_matches_expected_submission(
+            composer_text,
+            injection.expected_text,
+        ):
+            logger.info(
+                "tmux injection submit verification for %s ignored non-injected composer text",
+                injection.session_name,
+            )
+            return True
         if attempt >= retries:
             logger.error(
-                "tmux injection submit verification failed for %s: composer still occupied after %d retries",
+                "tmux injection submit verification failed for %s: injected text still occupied after %d retries",
                 injection.session_name,
                 retries,
             )
             return False
         logger.warning(
-            "tmux injection submit verification found stranded composer text for %s; retrying submit (%d/%d)",
+            "tmux injection submit verification found injected text still in composer for %s; retrying submit (%d/%d)",
             injection.session_name,
             attempt + 1,
             retries,
@@ -581,8 +645,10 @@ def observe_composer_occupancy(
     *,
     machine: str,
     now: float | None = None,
+    pane_text: str | None = None,
 ) -> bool:
-    pane_text = _tmux_pane_tail(session_name)
+    if pane_text is None:
+        pane_text = _tmux_pane_tail(session_name)
     if not pane_text:
         return False
     key = state_key(node_id, COMPOSER_OCCUPANCY_SUFFIX)
@@ -676,7 +742,7 @@ def _send_sequence_for_session(session_name: str) -> str:
 def inject_via_tmux(session_name: str, message: str) -> bool:
     """Inject a message into a local Claude Code tmux session."""
     sequence = _send_sequence_for_session(session_name)
-    injection = _TmuxInjection(session_name, sequence)
+    injection = _TmuxInjection(session_name, sequence, message)
     _set_active_injection(injection)
 
     try:
@@ -1082,6 +1148,7 @@ def run_daemon(
                     node_id = session_name
                     _mark_daemon_delivery_progress(r, delivery_progress, machine)
                     now = time.time()
+                    pane_text = _tmux_pane_tail(session_name)
                     try:
                         observe_composer_occupancy(
                             r,
@@ -1089,6 +1156,7 @@ def run_daemon(
                             session_name,
                             machine=machine,
                             now=now,
+                            pane_text=pane_text,
                         )
                     except Exception as exc:
                         logger.error("composer occupancy observation failed for %s: %s",
@@ -1108,7 +1176,19 @@ def run_daemon(
                     now = time.time()
                     if not is_node_idle(r, node_id):
                         reconcile_idle_at_rest(r, node_id, session_name, now=now)
-                    if not is_node_idle(r, node_id):
+                    ready, turn_state = _delivery_readiness(
+                        r,
+                        node_id,
+                        session_name,
+                        now=now,
+                        pane_text=pane_text,
+                    )
+                    if not ready:
+                        logger.info(
+                            "Deferring notify injection for %s: turn_state=%s",
+                            node_id,
+                            turn_state,
+                        )
                         continue
 
                     # Per-session inject backoff. The inbox signature changes when a
