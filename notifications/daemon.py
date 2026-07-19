@@ -557,6 +557,74 @@ def _message_timestamp(raw: object) -> float | None:
     return _float_or_none(payload.get("timestamp"))
 
 
+def _raw_message_text(raw: object) -> str:
+    if isinstance(raw, bytes):
+        return raw.decode("utf-8", errors="replace")
+    return str(raw)
+
+
+def _message_identity(raw: object) -> tuple[str, str]:
+    raw_text = _raw_message_text(raw)
+    try:
+        payload = json.loads(raw_text)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        payload = None
+    if isinstance(payload, dict):
+        message_id = str(
+            payload.get("msg_id")
+            or payload.get("message_hash")
+            or ""
+        ).strip()
+        if message_id:
+            token_source = f"id:{message_id}"
+            return hashlib.sha1(token_source.encode("utf-8")).hexdigest(), message_id
+    raw_hash = hashlib.sha1(raw_text.encode("utf-8", errors="surrogatepass")).hexdigest()
+    return raw_hash, f"raw:{raw_hash[:12]}"
+
+
+def _pending_delivery_message_refs(r, node_id: str) -> list[dict[str, str]]:
+    raw_messages = list(reversed(r.lrange(inbox_key(node_id), -10, -1)))
+    raw_messages.extend(r.lrange(notifications_key(node_id), 0, 9))
+    refs: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for raw in raw_messages:
+        token, message_id = _message_identity(raw)
+        if token in seen:
+            continue
+        seen.add(token)
+        refs.append({"token": token, "message_id": message_id})
+    return refs
+
+
+def _message_fail_count_key(node_id: str, token: str) -> str:
+    return state_key(node_id, f"pointer_inject_message_fail:{token}")
+
+
+def _message_fail_closed_key(node_id: str, token: str) -> str:
+    return state_key(node_id, f"pointer_inject_message_fail_closed:{token}")
+
+
+def _failed_closed_message_tokens(r, node_id: str, message_refs: list[dict[str, str]]) -> set[str]:
+    return {
+        ref["token"]
+        for ref in message_refs
+        if r.exists(_message_fail_closed_key(node_id, ref["token"]))
+    }
+
+
+def _filter_failed_closed_raw_messages(
+    raw_messages: list[object],
+    failed_closed_tokens: set[str] | None,
+) -> list[object]:
+    if not failed_closed_tokens:
+        return raw_messages
+    return [
+        raw
+        for raw in raw_messages
+        if _message_identity(raw)[0] not in failed_closed_tokens
+    ]
+
+
 def _pending_messages_old_enough(r, node_id: str, *, now: float, grace_sec: int) -> bool:
     queue_keys = (
         inbox_key(node_id),
@@ -907,11 +975,18 @@ def _start_daemon_heartbeat_thread(
 
 
 def _record_pointer_inject_result(r, node_id: str, *, ok: bool,
-                                  machine: str, now: float) -> None:
+                                  machine: str, now: float,
+                                  message_refs: list[dict[str, str]] | None = None) -> None:
     count_key = state_key(node_id, "pointer_inject_fail_count")
     notice_key = state_key(node_id, "pointer_inject_failure_notified")
+    message_refs = message_refs or []
     if ok:
         r.delete(count_key, notice_key)
+        for ref in message_refs:
+            r.delete(
+                _message_fail_count_key(node_id, ref["token"]),
+                _message_fail_closed_key(node_id, ref["token"]),
+            )
         return
 
     ttl_secs = _int_env(
@@ -925,33 +1000,84 @@ def _record_pointer_inject_result(r, node_id: str, *, ok: bool,
         "INJECT_FAILURE_ESCALATE_AFTER",
         DEFAULT_INJECT_FAILURE_ESCALATE_AFTER,
     )
-    if count < threshold or r.exists(notice_key):
+    if not message_refs:
+        if count < threshold or r.exists(notice_key):
+            return
+
+        supervisor = _resolve_supervisor(r, node_id)
+        body = (
+            f"{node_id} pointer injection failed {count} consecutive times on {machine}; "
+            "messages remain queued in Redis."
+        )
+        if supervisor and supervisor != node_id:
+            msg = json.dumps({
+                "from": node_id,
+                "type": "inject_failure",
+                "body": body,
+                "priority": "high",
+                "msg_id": f"inject-failure-{node_id}-{int(now)}",
+                "timestamp": now,
+                "failure_count": count,
+                "machine": machine,
+            })
+            r.lpush(inbox_key(str(supervisor)), msg)
+            logger.error("Pointer injection failure escalation: %s -> %s", node_id, supervisor)
+        else:
+            logger.error("Pointer injection failure escalation: %s", body)
+        r.set(notice_key, "1", ex=ttl_secs)
         return
 
     supervisor = _resolve_supervisor(r, node_id)
-    body = (
-        f"{node_id} pointer injection failed {count} consecutive times on {machine}; "
-        "messages remain queued in Redis."
-    )
-    if supervisor and supervisor != node_id:
-        msg = json.dumps({
-            "from": node_id,
-            "type": "inject_failure",
-            "body": body,
-            "priority": "high",
-            "msg_id": f"inject-failure-{node_id}-{int(now)}",
-            "timestamp": now,
-            "failure_count": count,
-            "machine": machine,
-        })
-        r.lpush(inbox_key(str(supervisor)), msg)
-        logger.error("Pointer injection failure escalation: %s -> %s", node_id, supervisor)
-    else:
-        logger.error("Pointer injection failure escalation: %s", body)
-    r.set(notice_key, "1", ex=ttl_secs)
+    for ref in message_refs:
+        token = ref["token"]
+        message_count_key = _message_fail_count_key(node_id, token)
+        message_count = _int_or_zero(r.get(message_count_key)) + 1
+        r.set(message_count_key, str(message_count), ex=ttl_secs)
+        if message_count < threshold:
+            continue
+        closed_key = _message_fail_closed_key(node_id, token)
+        if r.exists(closed_key):
+            continue
+        r.set(
+            closed_key,
+            json.dumps({
+                "message_id": ref["message_id"],
+                "failure_count": message_count,
+                "machine": machine,
+                "closed_at": now,
+            }, separators=(",", ":")),
+            ex=ttl_secs,
+        )
+        body = (
+            f"{node_id} queued message {ref['message_id']} failed pointer injection "
+            f"{message_count} consecutive times on {machine}; delivery failed closed "
+            "for that message and session recovery is required. Message remains queued in Redis."
+        )
+        if supervisor and supervisor != node_id:
+            msg = json.dumps({
+                "from": node_id,
+                "type": "session_recovery",
+                "body": body,
+                "priority": "high",
+                "msg_id": f"session-recovery-{node_id}-{token[:12]}-{int(now)}",
+                "timestamp": now,
+                "failure_count": message_count,
+                "message_id": ref["message_id"],
+                "message_token": token,
+                "machine": machine,
+                "reason": "pointer_inject_message_fail_closed",
+            })
+            r.lpush(inbox_key(str(supervisor)), msg)
+            logger.error("Pointer injection fail-fast escalation: %s -> %s", node_id, supervisor)
+        else:
+            logger.error("Pointer injection fail-fast escalation: %s", body)
 
 
-def build_pointer_summary(r, node_id: str) -> str | None:
+def build_pointer_summary(
+    r,
+    node_id: str,
+    failed_closed_tokens: set[str] | None = None,
+) -> str | None:
     """Peek inbox + notifications, return a short summary pointing to Redis.
 
     Does NOT pop messages. The recipient reads them via the PostToolUse hook
@@ -960,15 +1086,21 @@ def build_pointer_summary(r, node_id: str) -> str | None:
     inbox = inbox_key(node_id)
     notif_key = notifications_key(node_id)
 
-    inbox_raw = r.lrange(inbox, -10, -1)  # tail = oldest first
-    notif_raw = r.lrange(notif_key, 0, 9)
+    inbox_raw = list(reversed(r.lrange(inbox, -10, -1)))
+    notif_raw = list(r.lrange(notif_key, 0, 9))
+    inbox_raw = _filter_failed_closed_raw_messages(inbox_raw, failed_closed_tokens)
+    notif_raw = _filter_failed_closed_raw_messages(notif_raw, failed_closed_tokens)
 
-    total = r.llen(inbox) + r.llen(notif_key)
+    total = (
+        len(inbox_raw) + len(notif_raw)
+        if failed_closed_tokens
+        else r.llen(inbox) + r.llen(notif_key)
+    )
     if total == 0:
         return None
 
     wake_messages = []
-    for raw in reversed(inbox_raw):
+    for raw in inbox_raw:
         try:
             msg = json.loads(raw)
         except Exception:
@@ -1002,7 +1134,7 @@ def build_pointer_summary(r, node_id: str) -> str | None:
         except Exception:
             pass
 
-    for raw in reversed(inbox_raw):
+    for raw in inbox_raw:
         try:
             msg = json.loads(raw)
             senders.add(msg.get('from', 'unknown'))
@@ -1024,7 +1156,11 @@ def build_pointer_summary(r, node_id: str) -> str | None:
     )
 
 
-def build_grok_full_body(r, node_id: str) -> str | None:
+def build_grok_full_body(
+    r,
+    node_id: str,
+    failed_closed_tokens: set[str] | None = None,
+) -> str | None:
     """Build the full-body injection text for grok-cli targets.
 
     Why grok is special (validated 2026-05-26 by x-claude + treasurer
@@ -1053,6 +1189,7 @@ def build_grok_full_body(r, node_id: str) -> str | None:
     # Peek tail-first (oldest first) — same convention as build_pointer_summary.
     raw_msgs = list(reversed(r.lrange(inbox, -10, -1)))
     raw_msgs.extend(r.lrange(notif_key, 0, 9))
+    raw_msgs = _filter_failed_closed_raw_messages(raw_msgs, failed_closed_tokens)
     if not raw_msgs:
         return None
 
@@ -1213,6 +1350,19 @@ def run_daemon(
                             except Exception:
                                 pass
 
+                    message_refs = _pending_delivery_message_refs(r, node_id)
+                    failed_closed_tokens = _failed_closed_message_tokens(r, node_id, message_refs)
+                    active_message_refs = [
+                        ref for ref in message_refs
+                        if ref["token"] not in failed_closed_tokens
+                    ]
+                    if message_refs and not active_message_refs:
+                        logger.error(
+                            "Skipping notify injection for %s: queued messages failed closed pending session recovery",
+                            node_id,
+                        )
+                        continue
+
                     # Grok-cli does NOT honor additionalContext from prompt hooks
                     # the way Claude Code / codex / gemini do. For *-grok targets
                     # we inject FULL message bodies via tmux instead of the
@@ -1223,12 +1373,12 @@ def run_daemon(
                     # with 3-fact chains showing the pointer pattern silently
                     # dropped grok's dispatched bodies.
                     if node_id.endswith("-grok"):
-                        summary = build_grok_full_body(r, node_id)
+                        summary = build_grok_full_body(r, node_id, failed_closed_tokens)
                     else:
                         # POINTER ONLY — peek inbox, build summary, inject into tmux.
                         # Full bodies stay in Redis; recipient reads via hook on
                         # next tool call / prompt submit.
-                        summary = build_pointer_summary(r, node_id)
+                        summary = build_pointer_summary(r, node_id, failed_closed_tokens)
                     if not summary:
                         continue
 
@@ -1285,6 +1435,7 @@ def run_daemon(
                             ok=ok,
                             machine=machine,
                             now=now,
+                            message_refs=active_message_refs,
                         )
                     except Exception:
                         pass

@@ -1082,10 +1082,87 @@ gpt-5.5 xhigh · ~/.peer-worktrees/conductor-codex
 
         notices = r.decoded_list(inbox_key("conductor"))
         self.assertEqual(1, len(notices))
-        self.assertEqual("inject_failure", notices[0]["type"])
+        self.assertEqual("session_recovery", notices[0]["type"])
         self.assertEqual("worker-codex", notices[0]["from"])
         self.assertEqual(3, notices[0]["failure_count"])
-        self.assertEqual("4", r.get(state_key("worker-codex", "pointer_inject_fail_count")))
+        self.assertEqual("3", r.get(state_key("worker-codex", "pointer_inject_fail_count")))
+
+    def test_same_message_fail_fast_escalates_and_suppresses_retry(self):
+        r = FakeRedis()
+        r.set(state_key("worker-codex", "parent"), "conductor")
+        r.set(state_key("worker-codex", "idle"), "1")
+        r.lpush(inbox_key("worker-codex"), json.dumps({
+            "from": "sender",
+            "type": "command",
+            "body": "wedged target payload",
+            "msg_id": "same-message",
+        }))
+
+        with mock.patch.object(daemon, "POINTER_INJECT_BACKOFF_SECS", 1):
+            for now in (1000.0, 1002.0, 1004.0):
+                inject = self.run_daemon_once(
+                    r,
+                    ["worker-codex"],
+                    inject_result=False,
+                    now=now,
+                )
+                inject.assert_called_once()
+
+            fourth = self.run_daemon_once(
+                r,
+                ["worker-codex"],
+                inject_result=False,
+                now=1006.0,
+            )
+
+        fourth.assert_not_called()
+        self.assertEqual(1, r.llen(inbox_key("worker-codex")))
+        notices = r.decoded_list(inbox_key("conductor"))
+        self.assertEqual(1, len(notices))
+        self.assertEqual("session_recovery", notices[0]["type"])
+        self.assertEqual("worker-codex", notices[0]["from"])
+        self.assertEqual("same-message", notices[0]["message_id"])
+        self.assertEqual(3, notices[0]["failure_count"])
+
+    def test_failed_closed_message_does_not_starve_new_message(self):
+        r = FakeRedis()
+        r.set(state_key("worker-codex", "parent"), "conductor")
+        r.set(state_key("worker-codex", "idle"), "1")
+        r.lpush(inbox_key("worker-codex"), json.dumps({
+            "from": "sender",
+            "type": "command",
+            "body": "old wedged payload",
+            "msg_id": "old-message",
+        }))
+
+        with mock.patch.object(daemon, "POINTER_INJECT_BACKOFF_SECS", 1):
+            for now in (1000.0, 1002.0, 1004.0):
+                self.run_daemon_once(
+                    r,
+                    ["worker-codex"],
+                    inject_result=False,
+                    now=now,
+                )
+
+            r.lpush(inbox_key("worker-codex"), json.dumps({
+                "from": "sender",
+                "type": "command",
+                "body": "new payload",
+                "msg_id": "new-message",
+            }))
+            inject = self.run_daemon_once(
+                r,
+                ["worker-codex"],
+                inject_result=True,
+                now=1006.0,
+            )
+
+        inject.assert_called_once()
+        self.assertIn("You have 1 messages", inject.call_args.args[1])
+        self.assertEqual(2, r.llen(inbox_key("worker-codex")))
+        notices = r.decoded_list(inbox_key("conductor"))
+        self.assertEqual(1, len(notices))
+        self.assertEqual("old-message", notices[0]["message_id"])
 
     def test_handoff_injection_success_records_poll_signal(self):
         r = FakeRedis()
