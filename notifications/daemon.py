@@ -542,8 +542,13 @@ def _delivery_readiness(
         return False, TURN_STATE_IN_TURN_STALLED
     if not is_node_idle(r, node_id):
         return False, TURN_STATE_IN_TURN_WORKING
-    if _composer_text_from_pane(pane_text):
-        return False, TURN_STATE_COMPOSER_OCCUPIED
+    # Deliver on idle=1. Do NOT inspect the input box: Claude Code always shows
+    # a dim ghost/autosuggest line when idle, and tmux capture-pane strips color,
+    # so gray suggestion text is indistinguishable from a real draft. Gating on it
+    # deferred essentially every idle session -> the notify outage. Injecting on a
+    # live human draft is a rare, minor interruption (and Jesse-comms has the orch
+    # UI chat for that); dark-outing the fleet is not. Restores months-known-good
+    # behavior: idle + no active turn => deliver.
     return True, TURN_STATE_IDLE
 
 
