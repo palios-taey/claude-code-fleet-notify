@@ -62,135 +62,6 @@ detect_sequence() {
 }
 
 SEQ=$(detect_sequence "$SESSION")
-SUBMIT_VERIFY_RETRIES="${SUBMIT_VERIFY_RETRIES:-2}"
-SUBMIT_VERIFY_SETTLE_SECS="${SUBMIT_VERIFY_SETTLE_SECS:-0.25}"
-
-composer_text_from_pane() {
-    python3 -c '
-import sys
-
-pane = sys.stdin.read()
-markers = ("❯", "›")
-ignored_prefixes = (
-    "use /skills to list available skills",
-    "how is claude doing this session?",
-)
-
-def strip_box_edges(line):
-    text = line.strip()
-    if text.startswith("│"):
-        text = text[1:]
-    if text.endswith("│"):
-        text = text[:-1]
-    return text.strip()
-
-def usable(text):
-    candidate = " ".join(str(text or "").split())
-    if not candidate:
-        return ""
-    lowered = candidate.lower()
-    if any(lowered.startswith(prefix) for prefix in ignored_prefixes):
-        return ""
-    return candidate
-
-def marker_position(inner):
-    positions = [(inner.find(marker), marker) for marker in markers if marker in inner]
-    positions = [(pos, marker) for pos, marker in positions if pos >= 0]
-    if not positions:
-        return None
-    return min(positions, key=lambda item: item[0])
-
-def text_from_box_lines(box_lines):
-    for index, raw_line in enumerate(box_lines):
-        inner = strip_box_edges(raw_line)
-        found = marker_position(inner)
-        if found is None:
-            continue
-        marker_pos, marker = found
-        inline = usable(inner[marker_pos + len(marker):])
-        if inline:
-            print(inline[:160])
-            raise SystemExit(0)
-        for continuation in box_lines[index + 1:]:
-            text = usable(strip_box_edges(continuation))
-            if text:
-                print(text[:160])
-                raise SystemExit(0)
-        raise SystemExit(0)
-
-recent = [line for line in pane.splitlines() if line.strip()][-12:]
-box_lines = []
-in_box = False
-for raw_line in reversed(recent):
-    stripped = raw_line.strip()
-    if not in_box:
-        if stripped.startswith("╰") and stripped.endswith("╯"):
-            in_box = True
-        continue
-    if stripped.startswith("╭") and stripped.endswith("╮"):
-        text_from_box_lines(list(reversed(box_lines)))
-        raise SystemExit(0)
-    if stripped.startswith("│") and stripped.endswith("│"):
-        box_lines.append(raw_line)
-
-for index in range(len(recent) - 1, -1, -1):
-    raw_line = recent[index]
-    inner = strip_box_edges(raw_line)
-    found = marker_position(inner)
-    if found is None:
-        continue
-    marker_pos, marker = found
-    inline = usable(inner[marker_pos + len(marker):])
-    if inline:
-        print(inline[:160])
-        raise SystemExit(0)
-    if not raw_line.strip().startswith("│"):
-        continue
-    for continuation in recent[index + 1:]:
-        continuation_inner = strip_box_edges(continuation)
-        if marker_position(continuation_inner) is not None:
-            break
-        text = usable(continuation_inner)
-        if text:
-            print(text[:160])
-            raise SystemExit(0)
-'
-}
-
-resend_submit() {
-    if [ "$SEQ" = "grok" ]; then
-        tmux send-keys -t "$SESSION" Enter
-    else
-        tmux send-keys -t "$SESSION" Enter
-        sleep 0.1
-        tmux send-keys -t "$SESSION" -H 1b 5b 31 33 75
-    fi
-}
-
-verify_submission_consumed() {
-    local attempt=0
-    local pane=""
-    local composer=""
-    while [ "$attempt" -le "$SUBMIT_VERIFY_RETRIES" ]; do
-        if ! pane="$(tmux capture-pane -p -t "$SESSION" -S -80)"; then
-            echo "ERROR: $SESSION submit verification failed: capture-pane failed" >&2
-            return 1
-        fi
-        composer="$(printf '%s' "$pane" | composer_text_from_pane)"
-        if [ -z "$composer" ]; then
-            return 0
-        fi
-        if [ "$attempt" -ge "$SUBMIT_VERIFY_RETRIES" ]; then
-            echo "ERROR: $SESSION submit verification failed: composer still occupied after $SUBMIT_VERIFY_RETRIES retries" >&2
-            return 1
-        fi
-        echo "WARN: $SESSION submit verification found stranded composer text; retrying submit ($((attempt + 1))/$SUBMIT_VERIFY_RETRIES)" >&2
-        resend_submit
-        sleep "$SUBMIT_VERIFY_SETTLE_SECS"
-        attempt=$((attempt + 1))
-    done
-    return 1
-}
 
 # Local send
 if [ "$HOST" = "local" ] || [ "$HOST" = "localhost" ] || [ "$HOST" = "$(hostname -s)" ]; then
@@ -213,7 +84,6 @@ if [ "$HOST" = "local" ] || [ "$HOST" = "localhost" ] || [ "$HOST" = "$(hostname
         tmux paste-buffer -t "$SESSION" -p -d
         sleep 0.5
         tmux send-keys -t "$SESSION" Enter
-        sleep "$SUBMIT_VERIFY_SETTLE_SECS"
     else
         # Claude Code / codex (Ink TUI / Kitty protocol): embedded \n is
         # newline-in-input not submit, so direct send-keys is fine.
@@ -224,170 +94,36 @@ if [ "$HOST" = "local" ] || [ "$HOST" = "localhost" ] || [ "$HOST" = "$(hostname
         tmux send-keys -t "$SESSION" Enter
         sleep 0.1
         tmux send-keys -t "$SESSION" -H 1b 5b 31 33 75
-        sleep "$SUBMIT_VERIFY_SETTLE_SECS"
     fi
-    verify_submission_consumed
     echo "OK: $SESSION (local, sequence=$SEQ)"
     exit 0
 fi
 
 # Remote send via SSH — same per-CLI logic.
 B64=$(printf '%s' "$MSG" | base64 -w0)
-SESSION_B64=$(printf '%s' "$SESSION" | base64 -w0)
-ssh "$HOST" "SESSION_B64='${SESSION_B64}' SEQ='${SEQ}' MSG_B64='${B64}' SUBMIT_VERIFY_RETRIES='${SUBMIT_VERIFY_RETRIES}' SUBMIT_VERIFY_SETTLE_SECS='${SUBMIT_VERIFY_SETTLE_SECS}' bash -s" <<'REMOTE_TMUX_SEND'
-set -euo pipefail
+ssh "$HOST" "
+SESSION='${SESSION}'
+SEQ='${SEQ}'
+MSG=\$(printf '%s' '${B64}' | base64 -d)
 
-SESSION=$(printf '%s' "$SESSION_B64" | base64 -d)
-MSG=$(printf '%s' "$MSG_B64" | base64 -d)
-
-composer_text_from_pane() {
-    python3 -c '
-import sys
-
-pane = sys.stdin.read()
-markers = ("❯", "›")
-ignored_prefixes = (
-    "use /skills to list available skills",
-    "how is claude doing this session?",
-)
-
-def strip_box_edges(line):
-    text = line.strip()
-    if text.startswith("│"):
-        text = text[1:]
-    if text.endswith("│"):
-        text = text[:-1]
-    return text.strip()
-
-def usable(text):
-    candidate = " ".join(str(text or "").split())
-    if not candidate:
-        return ""
-    lowered = candidate.lower()
-    if any(lowered.startswith(prefix) for prefix in ignored_prefixes):
-        return ""
-    return candidate
-
-def marker_position(inner):
-    positions = [(inner.find(marker), marker) for marker in markers if marker in inner]
-    positions = [(pos, marker) for pos, marker in positions if pos >= 0]
-    if not positions:
-        return None
-    return min(positions, key=lambda item: item[0])
-
-def text_from_box_lines(box_lines):
-    for index, raw_line in enumerate(box_lines):
-        inner = strip_box_edges(raw_line)
-        found = marker_position(inner)
-        if found is None:
-            continue
-        marker_pos, marker = found
-        inline = usable(inner[marker_pos + len(marker):])
-        if inline:
-            print(inline[:160])
-            raise SystemExit(0)
-        for continuation in box_lines[index + 1:]:
-            text = usable(strip_box_edges(continuation))
-            if text:
-                print(text[:160])
-                raise SystemExit(0)
-        raise SystemExit(0)
-
-recent = [line for line in pane.splitlines() if line.strip()][-12:]
-box_lines = []
-in_box = False
-for raw_line in reversed(recent):
-    stripped = raw_line.strip()
-    if not in_box:
-        if stripped.startswith("╰") and stripped.endswith("╯"):
-            in_box = True
-        continue
-    if stripped.startswith("╭") and stripped.endswith("╮"):
-        text_from_box_lines(list(reversed(box_lines)))
-        raise SystemExit(0)
-    if stripped.startswith("│") and stripped.endswith("│"):
-        box_lines.append(raw_line)
-
-for index in range(len(recent) - 1, -1, -1):
-    raw_line = recent[index]
-    inner = strip_box_edges(raw_line)
-    found = marker_position(inner)
-    if found is None:
-        continue
-    marker_pos, marker = found
-    inline = usable(inner[marker_pos + len(marker):])
-    if inline:
-        print(inline[:160])
-        raise SystemExit(0)
-    if not raw_line.strip().startswith("│"):
-        continue
-    for continuation in recent[index + 1:]:
-        continuation_inner = strip_box_edges(continuation)
-        if marker_position(continuation_inner) is not None:
-            break
-        text = usable(continuation_inner)
-        if text:
-            print(text[:160])
-            raise SystemExit(0)
-'
-}
-
-resend_submit() {
-    if [ "$SEQ" = "grok" ]; then
-        tmux send-keys -t "$SESSION" Enter
-    else
-        tmux send-keys -t "$SESSION" Enter
-        sleep 0.1
-        tmux send-keys -t "$SESSION" -H 1b 5b 31 33 75
-    fi
-}
-
-verify_submission_consumed() {
-    local attempt=0
-    local pane=""
-    local composer=""
-    while [ "$attempt" -le "$SUBMIT_VERIFY_RETRIES" ]; do
-        if ! pane="$(tmux capture-pane -p -t "$SESSION" -S -80)"; then
-            echo "ERROR: $SESSION submit verification failed: capture-pane failed" >&2
-            return 1
-        fi
-        composer="$(printf '%s' "$pane" | composer_text_from_pane)"
-        if [ -z "$composer" ]; then
-            return 0
-        fi
-        if [ "$attempt" -ge "$SUBMIT_VERIFY_RETRIES" ]; then
-            echo "ERROR: $SESSION submit verification failed: composer still occupied after $SUBMIT_VERIFY_RETRIES retries" >&2
-            return 1
-        fi
-        echo "WARN: $SESSION submit verification found stranded composer text; retrying submit ($((attempt + 1))/$SUBMIT_VERIFY_RETRIES)" >&2
-        resend_submit
-        sleep "$SUBMIT_VERIFY_SETTLE_SECS"
-        attempt=$((attempt + 1))
-    done
-    return 1
-}
-
-tmux send-keys -t "$SESSION" C-u C-k
+tmux send-keys -t \"\$SESSION\" C-u C-k
 sleep 0.1
 
-if [ "$SEQ" = 'grok' ]; then
+if [ \"\$SEQ\" = 'grok' ]; then
     # Bracketed paste — see local-send branch above for full reasoning.
-    printf '%s' "$MSG" | tmux load-buffer -
-    tmux paste-buffer -t "$SESSION" -p -d
+    printf '%s' \"\$MSG\" | tmux load-buffer -
+    tmux paste-buffer -t \"\$SESSION\" -p -d
     sleep 0.5
-    tmux send-keys -t "$SESSION" Enter
-    sleep "$SUBMIT_VERIFY_SETTLE_SECS"
+    tmux send-keys -t \"\$SESSION\" Enter
 else
-    tmux send-keys -t "$SESSION" -- "$MSG"
+    tmux send-keys -t \"\$SESSION\" -- \"\$MSG\"
     sleep 0.5
-    tmux send-keys -t "$SESSION" Escape
+    tmux send-keys -t \"\$SESSION\" Escape
     sleep 0.2
-    tmux send-keys -t "$SESSION" Enter
+    tmux send-keys -t \"\$SESSION\" Enter
     sleep 0.1
-    tmux send-keys -t "$SESSION" -H 1b 5b 31 33 75
-    sleep "$SUBMIT_VERIFY_SETTLE_SECS"
+    tmux send-keys -t \"\$SESSION\" -H 1b 5b 31 33 75
 fi
-verify_submission_consumed
-REMOTE_TMUX_SEND
+"
 
 echo "OK: $SESSION (sequence=$SEQ)"
