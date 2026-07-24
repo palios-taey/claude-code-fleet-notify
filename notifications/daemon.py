@@ -3,15 +3,14 @@
 
 The daemon is the stopped-session delivery path. It periodically discovers tmux
 sessions, checks whether a session is safe to inject into, and submits a Redis
-pointer with the same tmux choreography as ``scripts/tmux-send``. Messages remain
-queued until the recipient hook drains them after a real prompt/tool event.
+pointer via ``scripts/tmux-send``. Messages remain queued until the recipient hook
+drains them after a real prompt/tool event.
 """
 from __future__ import annotations
 
 import argparse
 import logging
 import os
-import signal
 import subprocess
 import sys
 import threading
@@ -27,13 +26,13 @@ import socket
 
 from notifications.inbox import (
     WAKE_TYPES,
+    flatten_sources,
     format_notification_block,
     has_pending_messages,
     inbox_key,
     is_node_idle,
     key_prefix,
     notifications_key,
-    orch_key,
     state_key,
 )
 from notifications.handoff import (
@@ -68,173 +67,24 @@ DAEMON_HEARTBEAT_SUFFIX = "heartbeat"
 DAEMON_DELIVERY_PROGRESS_SUFFIX = "delivery_progress"
 DEFAULT_DAEMON_HEARTBEAT_INTERVAL_SECS = 3.0
 DEFAULT_DELIVERY_PROGRESS_MAX_AGE_SECS = 15.0
-DEFAULT_RECONCILE_AT_REST_GRACE_SECS = 60
-DEFAULT_FRESH_TOOL_RUNNING_MAX_AGE_SECS = 3600
-COMPOSER_OCCUPANCY_SUFFIX = "composer_occupancy"
-AT_REST_PANE_FINGERPRINT_SUFFIX = "at_rest_pane_fingerprint"
-DEFAULT_AT_REST_PANE_FINGERPRINT_TTL_SECS = 120
-COMPOSER_RESTING_REGION_NONBLANK_LINES = 12
-COMPOSER_PROMPT_MARKERS = ("❯", "›")
-COMPOSER_IGNORED_PROMPT_PREFIXES = (
-    "use /skills to list available skills",
-    "how is claude doing this session?",
-    "find and fix a bug in @filename",
-    "write tests for @filename",
-    "explain this codebase",
-    "implement {feature}",
-    "improve documentation in @filename",
-    "summarize recent commits",
+USAGE_LIMIT_IDLE_MARKERS = (
+    "you've hit your session limit",
+    "you have hit your session limit",
+    "you've reached your session limit",
+    "you have reached your session limit",
+    "you've hit your weekly limit",
+    "you have hit your weekly limit",
+    "you've reached your weekly limit",
+    "you have reached your weekly limit",
+    "you've hit your usage limit",
+    "you have hit your usage limit",
+    "you've reached your usage limit",
+    "you have reached your usage limit",
 )
-ACTIVE_TURN_MARKERS = (
-    "esc to interrupt",
-    "escape to interrupt",
+USAGE_LIMIT_TRANSIENT_EXCLUSIONS = (
+    "not your usage limit",
 )
-SUBMIT_VERIFY_RETRIES = 2
-SUBMIT_VERIFY_SETTLE_SECS = 0.25
-TURN_STATE_IDLE = "IDLE"
-TURN_STATE_IN_TURN_WORKING = "IN_TURN_WORKING"
-TURN_STATE_IN_TURN_STALLED = "IN_TURN_STALLED"
-TURN_STATE_COMPOSER_OCCUPIED = "COMPOSER_OCCUPIED"
-
-
-class _DaemonShutdown(BaseException):
-    def __init__(self, signum: int):
-        super().__init__(f"daemon shutdown signal {signum}")
-        self.signum = signum
-
-
-class _TmuxInjection:
-    def __init__(self, session_name: str, sequence: str, expected_text: str | None = None):
-        self.session_name = session_name
-        self.sequence = sequence
-        self.expected_text = expected_text or ""
-        self.phase = "created"
-        self.drained = False
-        self._lock = threading.RLock()
-
-    def set_phase(self, phase: str) -> None:
-        with self._lock:
-            if not self.drained:
-                self.phase = phase
-
-    def send_keys(self, *keys: str) -> bool:
-        return _run_tmux_command(["tmux", "send-keys", "-t", self.session_name, *keys])
-
-    def load_buffer(self, message: str) -> bool:
-        return _run_tmux_command(["tmux", "load-buffer", "-"], input_text=message)
-
-    def paste_buffer(self) -> bool:
-        return _run_tmux_command(["tmux", "paste-buffer", "-t", self.session_name, "-p", "-d"])
-
-    def resend_submit(self) -> bool:
-        if self.sequence == "grok":
-            return self.send_keys("Enter")
-        if not self.send_keys("Enter"):
-            return False
-        time.sleep(0.1)
-        return self.send_keys("-H", "1b", "5b", "31", "33", "75")
-
-    def drain(self) -> bool:
-        with self._lock:
-            if self.drained:
-                return True
-            phase = self.phase
-            self.drained = True
-            if phase == "submitted":
-                return True
-            if phase in {"created", "cleared"}:
-                return self.send_keys("C-u", "C-k")
-            if self.sequence == "grok":
-                return self.send_keys("Enter")
-            commands: list[tuple[str, ...]]
-            if phase == "text_sent":
-                commands = (
-                    ("Escape",),
-                    ("Enter",),
-                    ("-H", "1b", "5b", "31", "33", "75"),
-                )
-            elif phase == "escape_sent":
-                commands = (
-                    ("Enter",),
-                    ("-H", "1b", "5b", "31", "33", "75"),
-                )
-            elif phase == "legacy_enter_sent":
-                commands = (("-H", "1b", "5b", "31", "33", "75"),)
-            else:
-                commands = (("C-u", "C-k"),)
-            ok = True
-            for keys in commands:
-                ok = self.send_keys(*keys) and ok
-            return ok
-
-
-_SHUTDOWN_REQUESTED = threading.Event()
-_ACTIVE_INJECTION_LOCK = threading.RLock()
-_ACTIVE_INJECTION: _TmuxInjection | None = None
-
-
-def _run_tmux_command(
-    cmd: list[str],
-    *,
-    input_text: str | None = None,
-    timeout: float = 20,
-) -> bool:
-    result = subprocess.run(
-        cmd,
-        input=input_text,
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-    )
-    if result.returncode != 0:
-        logger.error(
-            "tmux command failed: %s",
-            (result.stderr or result.stdout or " ".join(cmd)).strip(),
-        )
-        return False
-    return True
-
-
-def _set_active_injection(injection: _TmuxInjection | None) -> None:
-    global _ACTIVE_INJECTION
-    with _ACTIVE_INJECTION_LOCK:
-        _ACTIVE_INJECTION = injection
-
-
-def _drain_active_injection() -> bool:
-    with _ACTIVE_INJECTION_LOCK:
-        injection = _ACTIVE_INJECTION
-    if injection is None:
-        return True
-    return injection.drain()
-
-
-def _handle_shutdown_signal(signum: int, _frame) -> None:
-    _SHUTDOWN_REQUESTED.set()
-    try:
-        drained = _drain_active_injection()
-    except Exception as exc:
-        drained = False
-        logger.error("active injection drain failed during signal %s: %s", signum, exc)
-    logger.info("Received signal %s; active injection drained=%s", signum, drained)
-    raise _DaemonShutdown(signum)
-
-
-def _install_shutdown_signal_handlers() -> dict[int, object]:
-    if threading.current_thread() is not threading.main_thread():
-        return {}
-    previous: dict[int, object] = {}
-    for signum in (signal.SIGTERM, signal.SIGINT):
-        previous[signum] = signal.getsignal(signum)
-        signal.signal(signum, _handle_shutdown_signal)
-    return previous
-
-
-def _restore_shutdown_signal_handlers(previous: dict[int, object]) -> None:
-    if threading.current_thread() is not threading.main_thread():
-        return
-    for signum, handler in previous.items():
-        signal.signal(signum, handler)
+USAGE_LIMIT_RESTING_REGION_NONBLANK_LINES = 3
 
 
 class _HandoffValidationJob:
@@ -340,11 +190,6 @@ def get_local_tmux_sessions() -> list[str]:
 
 
 def _tmux_pane_tail(session_name: str, *, lines: int = 80) -> str:
-    ok, text = _capture_tmux_pane_tail(session_name, lines=lines)
-    return text if ok else ""
-
-
-def _capture_tmux_pane_tail(session_name: str, *, lines: int = 80) -> tuple[bool, str]:
     try:
         result = subprocess.run(
             ["tmux", "capture-pane", "-p", "-t", session_name, "-S", f"-{lines}"],
@@ -353,447 +198,45 @@ def _capture_tmux_pane_tail(session_name: str, *, lines: int = 80) -> tuple[bool
             timeout=5,
         )
         if result.returncode == 0:
-            return True, result.stdout or ""
+            return result.stdout or ""
     except Exception as exc:
         logger.debug("tmux pane capture failed for %s: %s", session_name, exc)
-    return False, ""
-
-
-def _recent_nonblank_pane_lines(pane_text: str, *, limit: int) -> list[str]:
-    nonblank_lines = [line for line in (pane_text or "").splitlines() if line.strip()]
-    return nonblank_lines[-limit:]
-
-
-def _strip_composer_box_edges(line: str) -> str:
-    text = line.strip()
-    if text.startswith("│"):
-        text = text[1:]
-    if text.endswith("│"):
-        text = text[:-1]
-    return text.strip()
-
-
-def _usable_composer_text(text: str) -> str:
-    candidate = " ".join(str(text or "").split())
-    if not candidate:
-        return ""
-    lowered = candidate.lower()
-    if any(lowered.startswith(prefix) for prefix in COMPOSER_IGNORED_PROMPT_PREFIXES):
-        return ""
-    return candidate
-
-
-def _composer_text_matches_expected_submission(composer_text: str, expected_text: str) -> bool:
-    composer = " ".join(str(composer_text or "").split())
-    expected = " ".join(str(expected_text or "").split())
-    if not composer or not expected:
-        return False
-    return expected.startswith(composer) or composer.startswith(expected)
-
-
-def _marker_position(inner: str) -> tuple[int, str] | None:
-    marker_positions = [
-        (inner.find(marker), marker)
-        for marker in COMPOSER_PROMPT_MARKERS
-        if marker in inner
-    ]
-    marker_positions = [(pos, marker) for pos, marker in marker_positions if pos >= 0]
-    if not marker_positions:
-        return None
-    return min(marker_positions, key=lambda item: item[0])
-
-
-def _composer_text_from_box_lines(box_lines: list[str]) -> str:
-    for index, raw_line in enumerate(box_lines):
-        inner = _strip_composer_box_edges(raw_line)
-        marker_found = _marker_position(inner)
-        if marker_found is None:
-            continue
-        marker_pos, marker = marker_found
-        inline = _usable_composer_text(inner[marker_pos + len(marker):])
-        if inline:
-            return inline[:160]
-        for continuation in box_lines[index + 1:]:
-            text = _usable_composer_text(_strip_composer_box_edges(continuation))
-            if text:
-                return text[:160]
-        return ""
     return ""
 
 
-def _composer_box_lines(recent_lines: list[str]) -> list[str] | None:
-    box_lines: list[str] = []
-    in_box = False
-    for raw_line in reversed(recent_lines):
-        stripped = raw_line.strip()
-        if not in_box:
-            if stripped.startswith("╰") and stripped.endswith("╯"):
-                in_box = True
-            continue
-        if stripped.startswith("╭") and stripped.endswith("╮"):
-            return list(reversed(box_lines))
-        if stripped.startswith("│") and stripped.endswith("│"):
-            box_lines.append(raw_line)
-    return None
+def _usage_limit_resting_region(pane_text: str) -> str:
+    nonblank_lines = [line.strip() for line in (pane_text or "").splitlines() if line.strip()]
+    return "\n".join(nonblank_lines[-USAGE_LIMIT_RESTING_REGION_NONBLANK_LINES:])
 
 
-def _composer_text_from_pane(pane_text: str) -> str:
-    recent_lines = _recent_nonblank_pane_lines(
-        pane_text,
-        limit=COMPOSER_RESTING_REGION_NONBLANK_LINES,
-    )
-    box_lines = _composer_box_lines(recent_lines)
-    if box_lines is not None:
-        return _composer_text_from_box_lines(box_lines)
-
-    for index in range(len(recent_lines) - 1, -1, -1):
-        raw_line = recent_lines[index]
-        inner = _strip_composer_box_edges(raw_line)
-        marker_found = _marker_position(inner)
-        if marker_found is None:
-            continue
-        marker_pos, marker = marker_found
-        inline = _usable_composer_text(inner[marker_pos + len(marker):])
-        if inline:
-            return inline[:160]
-        if not raw_line.strip().startswith("│"):
-            return ""
-        for continuation in recent_lines[index + 1:]:
-            continuation_inner = _strip_composer_box_edges(continuation)
-            if _marker_position(continuation_inner) is not None:
-                break
-            text = _usable_composer_text(continuation_inner)
-            if text:
-                return text[:160]
-        return ""
-    return ""
-
-
-def _pane_shows_active_turn(pane_text: str) -> bool:
-    recent_lines = _recent_nonblank_pane_lines(
-        pane_text,
-        limit=COMPOSER_RESTING_REGION_NONBLANK_LINES,
-    )
-    for line in recent_lines:
-        normalized = " ".join(line.lower().split())
-        if any(marker in normalized for marker in ACTIVE_TURN_MARKERS):
-            return True
-    return False
-
-
-def _pane_shows_resting_composer_box(pane_text: str) -> bool:
-    recent_lines = _recent_nonblank_pane_lines(
-        pane_text,
-        limit=COMPOSER_RESTING_REGION_NONBLANK_LINES,
-    )
-    box_lines = _composer_box_lines(recent_lines)
-    if box_lines is None:
+def _pane_shows_usage_limit_resting_state(pane_text: str) -> bool:
+    normalized = " ".join(_usage_limit_resting_region(pane_text).lower().split())
+    if not normalized:
         return False
-    return any(_marker_position(_strip_composer_box_edges(line)) is not None
-               for line in box_lines)
-
-
-def _float_or_none(value) -> float | None:
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def _fresh_tool_running(r, node_id: str, *, now: float, max_age_sec: int) -> bool:
-    if not r.exists(state_key(node_id, "tool_running")):
+    if any(marker in normalized for marker in USAGE_LIMIT_TRANSIENT_EXCLUSIONS):
         return False
-    observed_at = _float_or_none(r.get(state_key(node_id, "tool_running_at")))
-    if observed_at is None:
-        observed_at = _float_or_none(r.get(state_key(node_id, "last_tool_activity")))
-    if observed_at is None:
-        return False
-    return max(0.0, now - observed_at) < max_age_sec
+    return any(marker in normalized for marker in USAGE_LIMIT_IDLE_MARKERS)
 
 
-def _fresh_turn_progress(r, node_id: str, *, now: float, max_age_sec: int) -> bool:
-    observed_at = _float_or_none(r.get(state_key(node_id, "last_tool_activity")))
-    if observed_at is None:
-        observed_at = _float_or_none(r.get(state_key(node_id, "tool_running_at")))
-    if observed_at is None:
-        return False
-    return max(0.0, now - observed_at) < max_age_sec
+def reconcile_usage_limit_idle(r, node_id: str, session_name: str) -> bool:
+    """Restore idle=1 when Claude Code parks at a usage-limit banner.
 
-
-def _delivery_readiness(
-    r,
-    node_id: str,
-    session_name: str,
-    *,
-    now: float,
-    pane_text: str | None = None,
-    progress_sec: int = DEFAULT_FRESH_TOOL_RUNNING_MAX_AGE_SECS,
-) -> tuple[bool, str]:
-    if pane_text is None:
-        pane_text = _tmux_pane_tail(session_name)
-    if _pane_shows_active_turn(pane_text):
-        if _fresh_turn_progress(
-            r,
-            node_id,
-            now=now,
-            max_age_sec=max(1, int(progress_sec)),
-        ):
-            return False, TURN_STATE_IN_TURN_WORKING
-        return False, TURN_STATE_IN_TURN_STALLED
-    if not is_node_idle(r, node_id):
-        return False, TURN_STATE_IN_TURN_WORKING
-    # Deliver on idle=1. Do NOT inspect the input box: Claude Code always shows
-    # a dim ghost/autosuggest line when idle, and tmux capture-pane strips color,
-    # so gray suggestion text is indistinguishable from a real draft. Gating on it
-    # deferred essentially every idle session -> the notify outage. Injecting on a
-    # live human draft is a rare, minor interruption (and Jesse-comms has the orch
-    # UI chat for that); dark-outing the fleet is not. Restores months-known-good
-    # behavior: idle + no active turn => deliver.
-    return True, TURN_STATE_IDLE
-
-
-def _message_timestamp(raw: object) -> float | None:
-    try:
-        payload = json.loads(raw)
-    except (TypeError, ValueError, json.JSONDecodeError):
-        return None
-    if not isinstance(payload, dict):
-        return None
-    return _float_or_none(payload.get("timestamp"))
-
-
-def _raw_message_text(raw: object) -> str:
-    if isinstance(raw, bytes):
-        return raw.decode("utf-8", errors="replace")
-    return str(raw)
-
-
-def _message_identity(raw: object) -> tuple[str, str]:
-    raw_text = _raw_message_text(raw)
-    try:
-        payload = json.loads(raw_text)
-    except (TypeError, ValueError, json.JSONDecodeError):
-        payload = None
-    if isinstance(payload, dict):
-        message_id = str(
-            payload.get("msg_id")
-            or payload.get("message_hash")
-            or ""
-        ).strip()
-        if message_id:
-            token_source = f"id:{message_id}"
-            return hashlib.sha1(token_source.encode("utf-8")).hexdigest(), message_id
-    raw_hash = hashlib.sha1(raw_text.encode("utf-8", errors="surrogatepass")).hexdigest()
-    return raw_hash, f"raw:{raw_hash[:12]}"
-
-
-def _pending_delivery_message_refs(r, node_id: str) -> list[dict[str, str]]:
-    raw_messages = list(reversed(r.lrange(inbox_key(node_id), -10, -1)))
-    raw_messages.extend(r.lrange(notifications_key(node_id), 0, 9))
-    refs: list[dict[str, str]] = []
-    seen: set[str] = set()
-    for raw in raw_messages:
-        token, message_id = _message_identity(raw)
-        if token in seen:
-            continue
-        seen.add(token)
-        refs.append({"token": token, "message_id": message_id})
-    return refs
-
-
-def _message_fail_count_key(node_id: str, token: str) -> str:
-    return state_key(node_id, f"pointer_inject_message_fail:{token}")
-
-
-def _message_fail_closed_key(node_id: str, token: str) -> str:
-    return state_key(node_id, f"pointer_inject_message_fail_closed:{token}")
-
-
-def _failed_closed_message_tokens(r, node_id: str, message_refs: list[dict[str, str]]) -> set[str]:
-    return {
-        ref["token"]
-        for ref in message_refs
-        if r.exists(_message_fail_closed_key(node_id, ref["token"]))
-    }
-
-
-def _filter_failed_closed_raw_messages(
-    raw_messages: list[object],
-    failed_closed_tokens: set[str] | None,
-) -> list[object]:
-    if not failed_closed_tokens:
-        return raw_messages
-    return [
-        raw
-        for raw in raw_messages
-        if _message_identity(raw)[0] not in failed_closed_tokens
-    ]
-
-
-def _pending_messages_old_enough(r, node_id: str, *, now: float, grace_sec: int) -> bool:
-    queue_keys = (
-        inbox_key(node_id),
-        notifications_key(node_id),
-        orch_key(node_id),
-    )
-    saw_message = False
-    for key in queue_keys:
-        for raw in r.lrange(key, 0, -1):
-            saw_message = True
-            timestamp = _message_timestamp(raw)
-            if timestamp is None:
-                continue
-            if max(0.0, now - timestamp) <= grace_sec:
-                return False
-    return saw_message
-
-
-def _pane_fingerprint(pane_text: str) -> str:
-    return hashlib.sha1(
-        str(pane_text or "").encode("utf-8", errors="surrogatepass")
-    ).hexdigest()
-
-
-def _pane_content_stable(r, node_id: str, pane_text: str, *, ttl_sec: int) -> bool:
-    key = state_key(node_id, AT_REST_PANE_FINGERPRINT_SUFFIX)
-    fingerprint = _pane_fingerprint(pane_text)
-    previous = r.get(key)
-    r.set(key, fingerprint, ex=max(1, int(ttl_sec)))
-    return previous == fingerprint
-
-
-def _verify_tmux_submission_consumed(
-    injection: _TmuxInjection,
-    *,
-    retries: int = SUBMIT_VERIFY_RETRIES,
-) -> bool:
-    for attempt in range(max(int(retries), 0) + 1):
-        ok, pane_text = _capture_tmux_pane_tail(injection.session_name)
-        if not ok:
-            logger.error(
-                "tmux injection submit verification failed for %s: capture-pane failed",
-                injection.session_name,
-            )
-            return False
-        composer_text = _composer_text_from_pane(pane_text)
-        if not composer_text:
-            return True
-        if not _composer_text_matches_expected_submission(
-            composer_text,
-            injection.expected_text,
-        ):
-            logger.info(
-                "tmux injection submit verification for %s ignored non-injected composer text",
-                injection.session_name,
-            )
-            return True
-        if attempt >= retries:
-            logger.error(
-                "tmux injection submit verification failed for %s: injected text still occupied after %d retries",
-                injection.session_name,
-                retries,
-            )
-            return False
-        logger.warning(
-            "tmux injection submit verification found injected text still in composer for %s; retrying submit (%d/%d)",
-            injection.session_name,
-            attempt + 1,
-            retries,
-        )
-        injection.set_phase("submit_retry_sent")
-        if not injection.resend_submit():
-            logger.error(
-                "tmux injection submit retry failed for %s",
-                injection.session_name,
-            )
-            return False
-        time.sleep(SUBMIT_VERIFY_SETTLE_SECS)
-    return False
-
-
-def observe_composer_occupancy(
-    r,
-    node_id: str,
-    session_name: str,
-    *,
-    machine: str,
-    now: float | None = None,
-    pane_text: str | None = None,
-) -> bool:
-    if pane_text is None:
-        pane_text = _tmux_pane_tail(session_name)
-    if not pane_text:
-        return False
-    key = state_key(node_id, COMPOSER_OCCUPANCY_SUFFIX)
-    composer_text = _composer_text_from_pane(pane_text)
-    if not composer_text:
-        r.delete(key)
-        return False
-    observed_at = time.time() if now is None else float(now)
-    r.set(
-        key,
-        json.dumps(
-            {
-                "occupied": True,
-                "observed_at": observed_at,
-                "machine": machine,
-            },
-            separators=(",", ":"),
-            ensure_ascii=False,
-        ),
-    )
-    return True
-
-
-def reconcile_idle_at_rest(
-    r,
-    node_id: str,
-    session_name: str,
-    *,
-    now: float | None = None,
-    grace_sec: int = DEFAULT_RECONCILE_AT_REST_GRACE_SECS,
-    tool_running_max_age_sec: int = DEFAULT_FRESH_TOOL_RUNNING_MAX_AGE_SECS,
-) -> bool:
-    """Restore idle=1 when the pane is clearly at rest with old pending mail."""
+    A session-limit abort can return the TUI to a resting prompt without firing
+    Stop, leaving the explicit idle flag absent. This helper repairs only that
+    observed parked state; normal idle-absent sessions remain active and wait
+    for PostToolUse/UserPromptSubmit delivery.
+    """
     if is_node_idle(r, node_id):
         return False
-    current_time = time.time() if now is None else float(now)
-    if _fresh_tool_running(
-        r,
-        node_id,
-        now=current_time,
-        max_age_sec=max(1, int(tool_running_max_age_sec)),
-    ):
+    if r.exists(state_key(node_id, "tool_running")):
         return False
-    if not _pending_messages_old_enough(
-        r,
-        node_id,
-        now=current_time,
-        grace_sec=max(0, int(grace_sec)),
-    ):
-        return False
-    pane_text = _tmux_pane_tail(session_name)
-    if not pane_text:
-        return False
-    if _pane_shows_active_turn(pane_text):
-        return False
-    if not _pane_shows_resting_composer_box(pane_text):
-        return False
-    if not _pane_content_stable(
-        r,
-        node_id,
-        pane_text,
-        ttl_sec=max(
-            DEFAULT_AT_REST_PANE_FINGERPRINT_TTL_SECS,
-            max(0, int(grace_sec)) * 2,
-        ),
-    ):
+    if not _pane_shows_usage_limit_resting_state(_tmux_pane_tail(session_name)):
         return False
     r.set(state_key(node_id, "idle"), "1")
-    logger.warning("Reconciled idle=1 for %s at resting composer", node_id)
+    logger.warning("Reconciled idle=1 for %s after usage-limit banner", node_id)
     try:
         from notifications.trace import trace
-        trace(r, "idle_set", node=node_id, src="at_rest_reconcile")
+        trace(r, "idle_set", node=node_id, src="usage_limit_reconcile")
     except Exception:
         pass
     return True
@@ -805,69 +248,30 @@ def _clip_message(message: str) -> str:
     return message[: MAX_MESSAGE_LENGTH - 28].rstrip() + "\n...[notification block truncated]"
 
 
-def _send_sequence_for_session(session_name: str) -> str:
-    override = os.environ.get("SEND_SEQUENCE", "").strip()
-    if override:
-        return override
-    return "grok" if session_name.endswith("-grok") else "claude"
-
-
 def inject_via_tmux(session_name: str, message: str) -> bool:
     """Inject a message into a local Claude Code tmux session."""
-    sequence = _send_sequence_for_session(session_name)
-    injection = _TmuxInjection(session_name, sequence, message)
-    _set_active_injection(injection)
+    tmux_send = Path(__file__).resolve().parent.parent / "scripts" / "tmux-send"
+
+    if tmux_send.exists():
+        cmd = ["bash", str(tmux_send), "local", session_name, message]
+    else:
+        # Fallback for stripped-down environments.
+        cmd = ["tmux", "send-keys", "-t", session_name, "--", message, "Enter"]
 
     try:
-        if not injection.send_keys("C-u", "C-k"):
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+        if result.returncode != 0:
+            logger.error(
+                "tmux injection failed for %s: %s",
+                session_name,
+                (result.stderr or result.stdout).strip(),
+            )
             return False
-        injection.set_phase("cleared")
-        time.sleep(0.1)
-
-        if sequence == "grok":
-            if not injection.load_buffer(message):
-                return False
-            if not injection.paste_buffer():
-                return False
-            injection.set_phase("text_sent")
-            time.sleep(0.5)
-            if not injection.send_keys("Enter"):
-                return False
-            time.sleep(SUBMIT_VERIFY_SETTLE_SECS)
-        else:
-            if not injection.send_keys("--", message):
-                return False
-            injection.set_phase("text_sent")
-            time.sleep(0.5)
-            if not injection.send_keys("Escape"):
-                return False
-            injection.set_phase("escape_sent")
-            time.sleep(0.2)
-            if not injection.send_keys("Enter"):
-                return False
-            injection.set_phase("legacy_enter_sent")
-            time.sleep(0.1)
-            if not injection.send_keys("-H", "1b", "5b", "31", "33", "75"):
-                return False
-            time.sleep(SUBMIT_VERIFY_SETTLE_SECS)
-        if not _verify_tmux_submission_consumed(injection):
-            return False
-        injection.set_phase("submitted")
-        logger.info("OK: %s (local, sequence=%s)", session_name, sequence)
         return True
-    except _DaemonShutdown:
-        raise
     except Exception as exc:
         logger.error("tmux injection exception for %s: %s", session_name, exc)
-        try:
-            injection.drain()
-        except Exception:
-            pass
         return False
-    finally:
-        with _ACTIVE_INJECTION_LOCK:
-            if _ACTIVE_INJECTION is injection:
-                _set_active_injection(None)
+
 
 def _resolve_supervisor(r, node_id: str) -> str | None:
     from notifications.targets import resolve_supervisor
@@ -980,18 +384,11 @@ def _start_daemon_heartbeat_thread(
 
 
 def _record_pointer_inject_result(r, node_id: str, *, ok: bool,
-                                  machine: str, now: float,
-                                  message_refs: list[dict[str, str]] | None = None) -> None:
+                                  machine: str, now: float) -> None:
     count_key = state_key(node_id, "pointer_inject_fail_count")
     notice_key = state_key(node_id, "pointer_inject_failure_notified")
-    message_refs = message_refs or []
     if ok:
         r.delete(count_key, notice_key)
-        for ref in message_refs:
-            r.delete(
-                _message_fail_count_key(node_id, ref["token"]),
-                _message_fail_closed_key(node_id, ref["token"]),
-            )
         return
 
     ttl_secs = _int_env(
@@ -1005,84 +402,33 @@ def _record_pointer_inject_result(r, node_id: str, *, ok: bool,
         "INJECT_FAILURE_ESCALATE_AFTER",
         DEFAULT_INJECT_FAILURE_ESCALATE_AFTER,
     )
-    if not message_refs:
-        if count < threshold or r.exists(notice_key):
-            return
-
-        supervisor = _resolve_supervisor(r, node_id)
-        body = (
-            f"{node_id} pointer injection failed {count} consecutive times on {machine}; "
-            "messages remain queued in Redis."
-        )
-        if supervisor and supervisor != node_id:
-            msg = json.dumps({
-                "from": node_id,
-                "type": "inject_failure",
-                "body": body,
-                "priority": "high",
-                "msg_id": f"inject-failure-{node_id}-{int(now)}",
-                "timestamp": now,
-                "failure_count": count,
-                "machine": machine,
-            })
-            r.lpush(inbox_key(str(supervisor)), msg)
-            logger.error("Pointer injection failure escalation: %s -> %s", node_id, supervisor)
-        else:
-            logger.error("Pointer injection failure escalation: %s", body)
-        r.set(notice_key, "1", ex=ttl_secs)
+    if count < threshold or r.exists(notice_key):
         return
 
     supervisor = _resolve_supervisor(r, node_id)
-    for ref in message_refs:
-        token = ref["token"]
-        message_count_key = _message_fail_count_key(node_id, token)
-        message_count = _int_or_zero(r.get(message_count_key)) + 1
-        r.set(message_count_key, str(message_count), ex=ttl_secs)
-        if message_count < threshold:
-            continue
-        closed_key = _message_fail_closed_key(node_id, token)
-        if r.exists(closed_key):
-            continue
-        r.set(
-            closed_key,
-            json.dumps({
-                "message_id": ref["message_id"],
-                "failure_count": message_count,
-                "machine": machine,
-                "closed_at": now,
-            }, separators=(",", ":")),
-            ex=ttl_secs,
-        )
-        body = (
-            f"{node_id} queued message {ref['message_id']} failed pointer injection "
-            f"{message_count} consecutive times on {machine}; delivery failed closed "
-            "for that message and session recovery is required. Message remains queued in Redis."
-        )
-        if supervisor and supervisor != node_id:
-            msg = json.dumps({
-                "from": node_id,
-                "type": "session_recovery",
-                "body": body,
-                "priority": "high",
-                "msg_id": f"session-recovery-{node_id}-{token[:12]}-{int(now)}",
-                "timestamp": now,
-                "failure_count": message_count,
-                "message_id": ref["message_id"],
-                "message_token": token,
-                "machine": machine,
-                "reason": "pointer_inject_message_fail_closed",
-            })
-            r.lpush(inbox_key(str(supervisor)), msg)
-            logger.error("Pointer injection fail-fast escalation: %s -> %s", node_id, supervisor)
-        else:
-            logger.error("Pointer injection fail-fast escalation: %s", body)
+    body = (
+        f"{node_id} pointer injection failed {count} consecutive times on {machine}; "
+        "messages remain queued in Redis."
+    )
+    if supervisor and supervisor != node_id:
+        msg = json.dumps({
+            "from": node_id,
+            "type": "inject_failure",
+            "body": body,
+            "priority": "high",
+            "msg_id": f"inject-failure-{node_id}-{int(now)}",
+            "timestamp": now,
+            "failure_count": count,
+            "machine": machine,
+        })
+        r.lpush(inbox_key(str(supervisor)), msg)
+        logger.error("Pointer injection failure escalation: %s -> %s", node_id, supervisor)
+    else:
+        logger.error("Pointer injection failure escalation: %s", body)
+    r.set(notice_key, "1", ex=ttl_secs)
 
 
-def build_pointer_summary(
-    r,
-    node_id: str,
-    failed_closed_tokens: set[str] | None = None,
-) -> str | None:
+def build_pointer_summary(r, node_id: str) -> str | None:
     """Peek inbox + notifications, return a short summary pointing to Redis.
 
     Does NOT pop messages. The recipient reads them via the PostToolUse hook
@@ -1091,21 +437,15 @@ def build_pointer_summary(
     inbox = inbox_key(node_id)
     notif_key = notifications_key(node_id)
 
-    inbox_raw = list(reversed(r.lrange(inbox, -10, -1)))
-    notif_raw = list(r.lrange(notif_key, 0, 9))
-    inbox_raw = _filter_failed_closed_raw_messages(inbox_raw, failed_closed_tokens)
-    notif_raw = _filter_failed_closed_raw_messages(notif_raw, failed_closed_tokens)
+    inbox_raw = r.lrange(inbox, -10, -1)  # tail = oldest first
+    notif_raw = r.lrange(notif_key, 0, 9)
 
-    total = (
-        len(inbox_raw) + len(notif_raw)
-        if failed_closed_tokens
-        else r.llen(inbox) + r.llen(notif_key)
-    )
+    total = r.llen(inbox) + r.llen(notif_key)
     if total == 0:
         return None
 
     wake_messages = []
-    for raw in inbox_raw:
+    for raw in reversed(inbox_raw):
         try:
             msg = json.loads(raw)
         except Exception:
@@ -1139,7 +479,7 @@ def build_pointer_summary(
         except Exception:
             pass
 
-    for raw in inbox_raw:
+    for raw in reversed(inbox_raw):
         try:
             msg = json.loads(raw)
             senders.add(msg.get('from', 'unknown'))
@@ -1161,11 +501,7 @@ def build_pointer_summary(
     )
 
 
-def build_grok_full_body(
-    r,
-    node_id: str,
-    failed_closed_tokens: set[str] | None = None,
-) -> str | None:
+def build_grok_full_body(r, node_id: str) -> str | None:
     """Build the full-body injection text for grok-cli targets.
 
     Why grok is special (validated 2026-05-26 by x-claude + treasurer
@@ -1194,7 +530,6 @@ def build_grok_full_body(
     # Peek tail-first (oldest first) — same convention as build_pointer_summary.
     raw_msgs = list(reversed(r.lrange(inbox, -10, -1)))
     raw_msgs.extend(r.lrange(notif_key, 0, 9))
-    raw_msgs = _filter_failed_closed_raw_messages(raw_msgs, failed_closed_tokens)
     if not raw_msgs:
         return None
 
@@ -1234,8 +569,6 @@ def run_daemon(
     """Main loop — one process handles all local tmux sessions."""
     import redis as redis_lib
 
-    _SHUTDOWN_REQUESTED.clear()
-    previous_signal_handlers = _install_shutdown_signal_handlers()
     r = _connect_redis(redis_lib, redis_host, redis_port)
 
     try:
@@ -1270,7 +603,7 @@ def run_daemon(
         ),
     )
     try:
-        while not _SHUTDOWN_REQUESTED.is_set():
+        while True:
             try:
                 local_sessions = get_local_tmux_sessions()
                 local_session_set = set(local_sessions)
@@ -1289,20 +622,6 @@ def run_daemon(
                 for session_name in local_sessions:
                     node_id = session_name
                     _mark_daemon_delivery_progress(r, delivery_progress, machine)
-                    now = time.time()
-                    pane_text = _tmux_pane_tail(session_name)
-                    try:
-                        observe_composer_occupancy(
-                            r,
-                            node_id,
-                            session_name,
-                            machine=machine,
-                            now=now,
-                            pane_text=pane_text,
-                        )
-                    except Exception as exc:
-                        logger.error("composer occupancy observation failed for %s: %s",
-                                     node_id, exc)
                     try:
                         mark_session_machine(
                             r,
@@ -1317,27 +636,17 @@ def run_daemon(
                         continue
                     now = time.time()
                     if not is_node_idle(r, node_id):
-                        reconcile_idle_at_rest(r, node_id, session_name, now=now)
-                    ready, turn_state = _delivery_readiness(
-                        r,
-                        node_id,
-                        session_name,
-                        now=now,
-                        pane_text=pane_text,
-                    )
-                    if not ready:
-                        logger.info(
-                            "Deferring notify injection for %s: turn_state=%s",
-                            node_id,
-                            turn_state,
-                        )
+                        reconcile_usage_limit_idle(r, node_id, session_name)
+                    if not is_node_idle(r, node_id):
                         continue
 
-                    # Per-session inject backoff. The inbox signature changes when a
-                    # new message arrives (inject promptly) but stays identical for a
-                    # wedged/non-submitting session (idle never clears) — in which
-                    # case re-inject at most once per POINTER_INJECT_BACKOFF_SECS
-                    # instead of every poll. Prevents the keystroke hammer.
+                    # Inject ONCE per inbox state — never repeat-send (Jesse 2026-07-24:
+                    # "no repeat sends. It needs to work the first time. If they are at
+                    # usage limit, they will get it when the limit lifts."). The inbox
+                    # signature changes when a new message arrives (inject promptly) but
+                    # stays identical for a session that has not drained (usage-limited /
+                    # wedged) — in which case we NEVER re-inject that same inbox. The one
+                    # injection sits in the pane; the recipient reads it when they resume.
                     try:
                         inbox_sig = hashlib.sha1(
                             b"\n".join(s.encode() for s in r.lrange(inbox_key(node_id), 0, -1))
@@ -1345,28 +654,9 @@ def run_daemon(
                     except Exception:
                         inbox_sig = None
                     if inbox_sig is not None:
-                        bo_raw = r.get(state_key(node_id, "pointer_inject_backoff"))
-                        if bo_raw:
-                            try:
-                                bo = json.loads(bo_raw)
-                                if (bo.get("sig") == inbox_sig
-                                        and (now - float(bo.get("ts", 0))) < POINTER_INJECT_BACKOFF_SECS):
-                                    continue  # same undrained inbox, injected recently -> back off
-                            except Exception:
-                                pass
-
-                    message_refs = _pending_delivery_message_refs(r, node_id)
-                    failed_closed_tokens = _failed_closed_message_tokens(r, node_id, message_refs)
-                    active_message_refs = [
-                        ref for ref in message_refs
-                        if ref["token"] not in failed_closed_tokens
-                    ]
-                    if message_refs and not active_message_refs:
-                        logger.error(
-                            "Skipping notify injection for %s: queued messages failed closed pending session recovery",
-                            node_id,
-                        )
-                        continue
+                        already_injected = r.get(state_key(node_id, "pointer_inject_backoff"))
+                        if already_injected == inbox_sig:
+                            continue  # this exact inbox was already injected once — never re-send
 
                     # Grok-cli does NOT honor additionalContext from prompt hooks
                     # the way Claude Code / codex / gemini do. For *-grok targets
@@ -1378,12 +668,12 @@ def run_daemon(
                     # with 3-fact chains showing the pointer pattern silently
                     # dropped grok's dispatched bodies.
                     if node_id.endswith("-grok"):
-                        summary = build_grok_full_body(r, node_id, failed_closed_tokens)
+                        summary = build_grok_full_body(r, node_id)
                     else:
                         # POINTER ONLY — peek inbox, build summary, inject into tmux.
                         # Full bodies stay in Redis; recipient reads via hook on
                         # next tool call / prompt submit.
-                        summary = build_pointer_summary(r, node_id, failed_closed_tokens)
+                        summary = build_pointer_summary(r, node_id)
                     if not summary:
                         continue
 
@@ -1404,17 +694,16 @@ def run_daemon(
                     _mark_daemon_delivery_progress(r, delivery_progress, machine)
                     ok = inject_via_tmux(session_name, summary)
                     _mark_daemon_delivery_progress(r, delivery_progress, machine)
-                    # Stamp the backoff on every attempt (ok or not): whether the
-                    # inject lands or fails, do not re-inject this same inbox for
-                    # POINTER_INJECT_BACKOFF_SECS. A new message changes inbox_sig and
-                    # injects promptly; a successful submit clears idle (no re-inject).
-                    if inbox_sig is not None:
+                    # Record this exact inbox as injected-once, ONLY on success. A
+                    # successful inject is never re-sent (Jesse: no repeat sends) — the
+                    # one pointer sits in the pane and the recipient reads it when they
+                    # resume (e.g. usage limit lifts). A FAILED inject (tmux error) is
+                    # NOT recorded, so it retries on the next poll until it lands once —
+                    # a retry-until-first-delivery is not a repeat send. Record persists
+                    # (no TTL); a new message changes inbox_sig and injects promptly.
+                    if ok and inbox_sig is not None:
                         try:
-                            r.set(
-                                state_key(node_id, "pointer_inject_backoff"),
-                                json.dumps({"sig": inbox_sig, "ts": now}),
-                                ex=POINTER_INJECT_BACKOFF_SECS * 4,
-                            )
+                            r.set(state_key(node_id, "pointer_inject_backoff"), inbox_sig)
                         except Exception:
                             pass
                     try:
@@ -1440,7 +729,6 @@ def run_daemon(
                             ok=ok,
                             machine=machine,
                             now=now,
-                            message_refs=active_message_refs,
                         )
                     except Exception:
                         pass
@@ -1482,9 +770,6 @@ def run_daemon(
                 except Exception:
                     pass
                 time.sleep(poll_interval)
-            except _DaemonShutdown:
-                logger.info("Daemon stopped")
-                break
             except KeyboardInterrupt:
                 logger.info("Daemon stopped")
                 break
@@ -1498,7 +783,6 @@ def run_daemon(
             handoff_validation_job,
             wait_sec=HANDOFF_VALIDATION_SHUTDOWN_GRACE_SECS,
         )
-        _restore_shutdown_signal_handlers(previous_signal_handlers)
 
 
 def main() -> None:

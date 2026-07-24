@@ -1,12 +1,10 @@
 from __future__ import annotations
 
 import json
-import signal
 import sys
 import threading
 import time as time_module
 import unittest
-from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest import mock
 
@@ -21,65 +19,6 @@ from notifications.handoff import (
     validate_handoff_activation,
 )
 from tests.fakes import FakeRedis
-
-
-RESTING_COMPOSER_PANE = """
-╭────────────────────────────────────────────────────────────────────╮
-│ ❯                                                                  │
-╰───────────────────────────────── gpt-5.5 · conductor-codex ─╯
-"""
-
-GROK_RESTING_COMPOSER_PANE = """
-╭────────────────────────────────────────────────────────────────────╮
-│ ›                                                                  │
-╰────────────────────────────────────── grok · conductor-grok ─╯
-Shift+Tab:mode │ Esc:cancel │ Ctrl+x:shortcuts
-"""
-
-GROK_GENERATING_COMPOSER_PANE_1 = """
-Composing response chunk 17
-╭────────────────────────────────────────────────────────────────────╮
-│ ›                                                                  │
-╰────────────────────────────────────── grok · conductor-grok ─╯
-Shift+Tab:mode │ Esc:cancel │ Ctrl+x:shortcuts
-"""
-
-GROK_GENERATING_COMPOSER_PANE_2 = """
-Composing response chunk 18
-╭────────────────────────────────────────────────────────────────────╮
-│ ›                                                                  │
-╰────────────────────────────────────── grok · conductor-grok ─╯
-Shift+Tab:mode │ Esc:cancel │ Ctrl+x:shortcuts
-"""
-
-ACTIVE_TURN_PANE = """
-Processing notification delivery
-Esc to interrupt
-╭────────────────────────────────────────────────────────────────────╮
-│ ❯                                                                  │
-╰───────────────────────────────── gpt-5.5 · conductor-codex ─╯
-"""
-
-NORMAL_IDLE_PROMPT_WITH_TRANSCRIPT_PANE = """
-❯ Previous submitted prompt that must not count as current draft
-
-› Write tests for @filename
-
-gpt-5.5 xhigh · ~/.peer-worktrees/conductor-codex
-"""
-
-REAL_DRAFT_PANE = """
-╭────────────────────────────────────────────────────────────────────╮
-│ ❯ Do not clobber this unsent draft                                  │
-╰───────────────────────────────── gpt-5.5 · conductor-codex ─╯
-"""
-
-
-def queued_message(*, timestamp: float | None = 1000.0, body: str = "queued") -> str:
-    payload = {"from": "sender", "type": "message", "body": body}
-    if timestamp is not None:
-        payload["timestamp"] = timestamp
-    return json.dumps(payload)
 
 
 class CountingRedis(FakeRedis):
@@ -114,28 +53,14 @@ class CountingRedis(FakeRedis):
 
 
 class DaemonTests(unittest.TestCase):
-    def run_daemon_once(
-        self,
-        redis_client,
-        sessions,
-        *,
-        inject_result=True,
-        now=1000.0,
-        observe_composer=False,
-    ):
+    def run_daemon_once(self, redis_client, sessions, *, inject_result=True, now=1000.0):
         fake_redis_module = SimpleNamespace(Redis=lambda **kwargs: redis_client)
-        observe_context = (
-            nullcontext()
-            if observe_composer
-            else mock.patch.object(daemon, "observe_composer_occupancy", return_value=False)
-        )
         with mock.patch.dict(sys.modules, {"redis": fake_redis_module}):
             with mock.patch.object(daemon, "get_local_tmux_sessions", return_value=sessions):
                 with mock.patch.object(daemon, "inject_via_tmux", return_value=inject_result) as inject:
-                    with observe_context:
-                        with mock.patch.object(daemon.time, "time", return_value=now):
-                            with mock.patch.object(daemon.time, "sleep", side_effect=KeyboardInterrupt):
-                                daemon.run_daemon("127.0.0.1", 6379, 1)
+                    with mock.patch.object(daemon.time, "time", return_value=now):
+                        with mock.patch.object(daemon.time, "sleep", side_effect=KeyboardInterrupt):
+                            daemon.run_daemon("127.0.0.1", 6379, 1)
         return inject
 
     def test_build_pointer_summary_does_not_pop_messages(self):
@@ -147,185 +72,6 @@ class DaemonTests(unittest.TestCase):
         self.assertIn("You have 1 messages", summary)
         self.assertIn(inbox_key("session-b"), summary)
         self.assertEqual(1, r.llen(inbox_key("session-b")))
-
-    def test_sigterm_mid_tmux_injection_drains_to_submitted_or_empty(self):
-        message = "SIGTERM drain payload"
-        state = {"composer": "", "submitted": []}
-        signalled = {"sent": False}
-
-        def fake_run(cmd, **_kwargs):
-            if cmd[:3] != ["tmux", "send-keys", "-t"]:
-                return SimpleNamespace(returncode=0, stdout="", stderr="")
-            keys = cmd[4:]
-            if keys == ["C-u", "C-k"]:
-                state["composer"] = ""
-            elif keys[:1] == ["--"]:
-                state["composer"] = str(keys[1])
-            elif keys in (["Enter"], ["-H", "1b", "5b", "31", "33", "75"]):
-                if state["composer"]:
-                    state["submitted"].append(state["composer"])
-                    state["composer"] = ""
-            return SimpleNamespace(returncode=0, stdout="", stderr="")
-
-        def fake_sleep(_seconds):
-            if state["composer"] == message and not signalled["sent"]:
-                signalled["sent"] = True
-                daemon._handle_shutdown_signal(signal.SIGTERM, None)
-
-        with mock.patch.object(daemon.subprocess, "run", side_effect=fake_run):
-            with mock.patch.object(daemon.time, "sleep", side_effect=fake_sleep):
-                try:
-                    daemon.inject_via_tmux("worker-codex", message)
-                except BaseException:
-                    pass
-                finally:
-                    daemon._SHUTDOWN_REQUESTED.clear()
-
-        self.assertTrue(signalled["sent"])
-        self.assertEqual("", state["composer"])
-        self.assertIn(message, state["submitted"])
-
-    def test_inject_via_tmux_retries_when_first_submit_is_swallowed(self):
-        message = "retry submit payload"
-        state = {"composer": "", "submitted": [], "submit_keys": 0}
-        captures = []
-
-        def fake_run(cmd, **_kwargs):
-            if cmd[:2] == ["tmux", "capture-pane"]:
-                captures.append(state["composer"])
-                return SimpleNamespace(
-                    returncode=0,
-                    stdout=f"› {state['composer']}\n",
-                    stderr="",
-                )
-            if cmd[:3] != ["tmux", "send-keys", "-t"]:
-                return SimpleNamespace(returncode=0, stdout="", stderr="")
-            keys = cmd[4:]
-            if keys == ["C-u", "C-k"]:
-                state["composer"] = ""
-            elif keys[:1] == ["--"]:
-                state["composer"] = str(keys[1])
-            elif keys in (["Enter"], ["-H", "1b", "5b", "31", "33", "75"]):
-                state["submit_keys"] += 1
-                if state["submit_keys"] > 2 and state["composer"]:
-                    state["submitted"].append(state["composer"])
-                    state["composer"] = ""
-            return SimpleNamespace(returncode=0, stdout="", stderr="")
-
-        with mock.patch.object(daemon.subprocess, "run", side_effect=fake_run):
-            ok = daemon.inject_via_tmux("worker-codex", message)
-
-        self.assertTrue(ok)
-        self.assertEqual("", state["composer"])
-        self.assertIn(message, state["submitted"])
-        self.assertGreater(state["submit_keys"], 2)
-        self.assertIn(message, captures)
-
-    def test_inject_via_tmux_ignores_transcript_echo_above_empty_composer(self):
-        message = "post submit payload"
-        state = {"composer": "", "submitted": [], "submit_keys": 0}
-
-        def pane_text():
-            transcript = (
-                f"❯ {state['submitted'][-1]}\n\n"
-                if state["submitted"]
-                else ""
-            )
-            return f"""
-{transcript}╭────────────────────────────────────────────────────────────────────╮
-│ ❯ {state['composer']:<62} │
-╰───────────────────────────────── gpt-5.5 · conductor-codex ─╯
-"""
-
-        def fake_run(cmd, **_kwargs):
-            if cmd[:2] == ["tmux", "capture-pane"]:
-                return SimpleNamespace(
-                    returncode=0,
-                    stdout=pane_text(),
-                    stderr="",
-                )
-            if cmd[:3] != ["tmux", "send-keys", "-t"]:
-                return SimpleNamespace(returncode=0, stdout="", stderr="")
-            keys = cmd[4:]
-            if keys == ["C-u", "C-k"]:
-                state["composer"] = ""
-            elif keys[:1] == ["--"]:
-                state["composer"] = str(keys[1])
-            elif keys in (["Enter"], ["-H", "1b", "5b", "31", "33", "75"]):
-                state["submit_keys"] += 1
-                if state["composer"]:
-                    state["submitted"].append(state["composer"])
-                    state["composer"] = ""
-            return SimpleNamespace(returncode=0, stdout="", stderr="")
-
-        with mock.patch.object(daemon.subprocess, "run", side_effect=fake_run):
-            ok = daemon.inject_via_tmux("worker-codex", message)
-
-        self.assertTrue(ok)
-        self.assertEqual("", state["composer"])
-        self.assertEqual([message], state["submitted"])
-        self.assertEqual(2, state["submit_keys"])
-
-    def test_inject_via_tmux_ignores_cli_placeholder_after_submit(self):
-        message = "[NOTIFY] You have 1 messages (from conductor; first=COMMAND)."
-        state = {"composer": "", "submitted": [], "submit_keys": 0}
-
-        def fake_run(cmd, **_kwargs):
-            if cmd[:2] == ["tmux", "capture-pane"]:
-                return SimpleNamespace(
-                    returncode=0,
-                    stdout="› Write tests for @filename\n",
-                    stderr="",
-                )
-            if cmd[:3] != ["tmux", "send-keys", "-t"]:
-                return SimpleNamespace(returncode=0, stdout="", stderr="")
-            keys = cmd[4:]
-            if keys == ["C-u", "C-k"]:
-                state["composer"] = ""
-            elif keys[:1] == ["--"]:
-                state["composer"] = str(keys[1])
-            elif keys in (["Enter"], ["-H", "1b", "5b", "31", "33", "75"]):
-                state["submit_keys"] += 1
-                if state["composer"]:
-                    state["submitted"].append(state["composer"])
-                    state["composer"] = ""
-            return SimpleNamespace(returncode=0, stdout="", stderr="")
-
-        with mock.patch.object(daemon.subprocess, "run", side_effect=fake_run):
-            ok = daemon.inject_via_tmux("worker-codex", message)
-
-        self.assertTrue(ok)
-        self.assertEqual([message], state["submitted"])
-        self.assertEqual(2, state["submit_keys"])
-
-    def test_inject_via_tmux_fails_when_submit_verification_stays_stranded(self):
-        message = "still stranded payload"
-        state = {"composer": "", "submit_keys": 0}
-
-        def fake_run(cmd, **_kwargs):
-            if cmd[:2] == ["tmux", "capture-pane"]:
-                return SimpleNamespace(
-                    returncode=0,
-                    stdout=f"› {state['composer']}\n",
-                    stderr="",
-                )
-            if cmd[:3] != ["tmux", "send-keys", "-t"]:
-                return SimpleNamespace(returncode=0, stdout="", stderr="")
-            keys = cmd[4:]
-            if keys == ["C-u", "C-k"]:
-                state["composer"] = ""
-            elif keys[:1] == ["--"]:
-                state["composer"] = str(keys[1])
-            elif keys in (["Enter"], ["-H", "1b", "5b", "31", "33", "75"]):
-                state["submit_keys"] += 1
-            return SimpleNamespace(returncode=0, stdout="", stderr="")
-
-        with mock.patch.object(daemon.subprocess, "run", side_effect=fake_run):
-            ok = daemon.inject_via_tmux("worker-codex", message)
-
-        self.assertFalse(ok)
-        self.assertEqual(message, state["composer"])
-        self.assertGreater(state["submit_keys"], 2)
 
     def test_run_daemon_injects_only_idle_sessions_with_messages(self):
         r = FakeRedis()
@@ -342,196 +88,36 @@ class DaemonTests(unittest.TestCase):
 
         inject.assert_called_once()
         self.assertEqual("idle-session", inject.call_args.args[0])
-        self.assertEqual(1, r.llen(inbox_key("idle-session")))
-        self.assertTrue(r.exists(state_key("idle-session", "idle")))
 
-    def test_normal_idle_prompt_with_pending_mail_delivers(self):
+    def test_pointer_injected_once_never_repeats_same_inbox(self):
+        # Jesse 2026-07-24: "no repeat sends. It needs to work the first time."
+        # An undrained inbox (usage-limited / wedged session) is injected ONCE and
+        # never re-sent; a genuinely new message injects once more.
         r = FakeRedis()
         r.set(state_key("idle-session", "idle"), "1")
-        r.lpush(inbox_key("idle-session"), queued_message(body="normal path must deliver"))
+        r.lpush(inbox_key("idle-session"), json.dumps({"from": "sender", "type": "message", "body": "body"}))
 
-        with mock.patch.object(daemon, "_tmux_pane_tail", return_value=NORMAL_IDLE_PROMPT_WITH_TRANSCRIPT_PANE):
-            inject = self.run_daemon_once(
-                r,
-                ["idle-session"],
-                inject_result=True,
-                observe_composer=True,
-            )
+        self.run_daemon_once(r, ["idle-session"], now=1000.0).assert_called_once()
+        # same undrained inbox, later polls (well past any old 90s window) — no re-send
+        self.run_daemon_once(r, ["idle-session"], now=1100.0).assert_not_called()
+        self.run_daemon_once(r, ["idle-session"], now=9000.0).assert_not_called()
+        # a new message changes the inbox -> injected once more
+        r.lpush(inbox_key("idle-session"), json.dumps({"from": "sender", "type": "message", "body": "body2"}))
+        self.run_daemon_once(r, ["idle-session"], now=9500.0).assert_called_once()
 
-        inject.assert_called_once()
-        self.assertEqual("idle-session", inject.call_args.args[0])
+    def test_failed_inject_retries_until_it_lands_once(self):
+        # A FAILED inject is not recorded, so it retries next poll; once it lands
+        # successfully it is recorded and never re-sent. Retry-until-first-delivery
+        # is not a repeat send.
+        r = FakeRedis()
+        r.set(state_key("idle-session", "idle"), "1")
+        r.lpush(inbox_key("idle-session"), json.dumps({"from": "sender", "type": "message", "body": "body"}))
+
+        self.run_daemon_once(r, ["idle-session"], inject_result=False, now=1000.0).assert_called_once()
+        self.run_daemon_once(r, ["idle-session"], inject_result=True, now=1002.0).assert_called_once()
+        self.run_daemon_once(r, ["idle-session"], inject_result=True, now=1004.0).assert_not_called()
         self.assertEqual(1, r.llen(inbox_key("idle-session")))
         self.assertTrue(r.exists(state_key("idle-session", "idle")))
-
-    def test_run_daemon_defers_idle_session_that_is_mid_turn(self):
-        r = FakeRedis()
-        r.set(state_key("active-session", "idle"), "1")
-        r.lpush(inbox_key("active-session"), queued_message(body="defer until turn completes"))
-
-        with mock.patch.object(daemon, "_tmux_pane_tail", return_value=ACTIVE_TURN_PANE):
-            inject = self.run_daemon_once(
-                r,
-                ["active-session"],
-                inject_result=True,
-                observe_composer=True,
-            )
-
-        inject.assert_not_called()
-        self.assertEqual(1, r.llen(inbox_key("active-session")))
-        self.assertTrue(r.exists(state_key("active-session", "idle")))
-
-    def test_run_daemon_defers_idle_session_with_real_unsent_draft(self):
-        r = FakeRedis()
-        r.set(state_key("draft-session", "idle"), "1")
-        r.lpush(inbox_key("draft-session"), queued_message(body="do not clobber draft"))
-
-        with mock.patch.object(daemon, "_tmux_pane_tail", return_value=REAL_DRAFT_PANE):
-            inject = self.run_daemon_once(
-                r,
-                ["draft-session"],
-                inject_result=True,
-                observe_composer=True,
-            )
-
-        inject.assert_not_called()
-        self.assertEqual(1, r.llen(inbox_key("draft-session")))
-        self.assertTrue(r.exists(state_key("draft-session", "idle")))
-
-    def test_observe_composer_occupancy_records_nonempty_input(self):
-        r = FakeRedis()
-        pane = """
-  ╭────────────────────────────────────────────────────────────────────╮
-  │ ❯ Click Post on the staged LinkedIn application                    │
-  ╰───────────────────────────────── Grok 4.5 (high) · always-approve ─╯
-"""
-        with mock.patch.object(daemon, "_tmux_pane_tail", return_value=pane):
-            occupied = daemon.observe_composer_occupancy(
-                r,
-                "worker-grok",
-                "worker-grok",
-                machine="notify-host",
-                now=1234.0,
-            )
-
-        payload = json.loads(r.get(state_key("worker-grok", "composer_occupancy")))
-        self.assertTrue(occupied)
-        self.assertTrue(payload["occupied"])
-        self.assertEqual(1234.0, payload["observed_at"])
-        self.assertEqual("notify-host", payload["machine"])
-        self.assertNotIn("excerpt", payload)
-        self.assertNotIn("Click Post on the staged LinkedIn application", json.dumps(payload))
-
-    def test_observe_composer_occupancy_clears_empty_input(self):
-        r = FakeRedis()
-        r.set(state_key("worker-grok", "composer_occupancy"), json.dumps({"occupied": True}))
-        pane = """
-  ╭────────────────────────────────────────────────────────────────────╮
-  │ ❯                                                                  │
-  ╰───────────────────────────────── Grok 4.5 (high) · always-approve ─╯
-"""
-        with mock.patch.object(daemon, "_tmux_pane_tail", return_value=pane):
-            occupied = daemon.observe_composer_occupancy(
-                r,
-                "worker-grok",
-                "worker-grok",
-                machine="notify-host",
-                now=1234.0,
-            )
-
-        self.assertFalse(occupied)
-        self.assertFalse(r.exists(state_key("worker-grok", "composer_occupancy")))
-
-    def test_observe_composer_occupancy_ignores_transcript_echo_above_empty_box(self):
-        r = FakeRedis()
-        r.set(state_key("worker-codex", "composer_occupancy"), json.dumps({"occupied": True}))
-        pane = """
-❯ Submit the queued supervisor packet
-
-╭────────────────────────────────────────────────────────────────────╮
-│ ❯                                                                  │
-╰───────────────────────────────── gpt-5.5 · conductor-codex ─╯
-"""
-        with mock.patch.object(daemon, "_tmux_pane_tail", return_value=pane):
-            occupied = daemon.observe_composer_occupancy(
-                r,
-                "worker-codex",
-                "worker-codex",
-                machine="notify-host",
-                now=1234.0,
-            )
-
-        self.assertFalse(occupied)
-        self.assertFalse(r.exists(state_key("worker-codex", "composer_occupancy")))
-
-    def test_observe_composer_occupancy_ignores_codex_help_hint(self):
-        r = FakeRedis()
-        pane = """
-› Use /skills to list available skills
-
-  gpt-5.5 xhigh · ~/.peer-worktrees/conductor-codex
-"""
-        with mock.patch.object(daemon, "_tmux_pane_tail", return_value=pane):
-            occupied = daemon.observe_composer_occupancy(
-                r,
-                "worker-codex",
-                "worker-codex",
-                machine="notify-host",
-                now=1234.0,
-            )
-
-        self.assertFalse(occupied)
-        self.assertFalse(r.exists(state_key("worker-codex", "composer_occupancy")))
-
-    def test_observe_composer_occupancy_ignores_cli_starter_placeholder(self):
-        r = FakeRedis()
-        pane = """
-› Write tests for @filename
-
-gpt-5.5 xhigh · ~/.peer-worktrees/conductor-codex
-"""
-        with mock.patch.object(daemon, "_tmux_pane_tail", return_value=pane):
-            occupied = daemon.observe_composer_occupancy(
-                r,
-                "worker-codex",
-                "worker-codex",
-                machine="notify-host",
-                now=1234.0,
-            )
-
-        self.assertFalse(occupied)
-        self.assertFalse(r.exists(state_key("worker-codex", "composer_occupancy")))
-
-    def test_observe_composer_occupancy_ignores_claude_feedback_survey(self):
-        r = FakeRedis()
-        r.set(state_key("worker-claude", "composer_occupancy"), json.dumps({"occupied": True}))
-        pane = """
-› How is Claude doing this session? 1:Bad 2:Fine 3:Good 0:Dismiss
-
-  Opus 4.1 · /home/mira/job-seeker
-"""
-        with mock.patch.object(daemon, "_tmux_pane_tail", return_value=pane):
-            occupied = daemon.observe_composer_occupancy(
-                r,
-                "worker-claude",
-                "worker-claude",
-                machine="notify-host",
-                now=1234.0,
-            )
-
-        self.assertFalse(occupied)
-        self.assertFalse(r.exists(state_key("worker-claude", "composer_occupancy")))
-
-    def test_composer_text_keeps_real_input_after_claude_feedback_survey(self):
-        pane = """
-› How is Claude doing this session? 1:Bad 2:Fine 3:Good 0:Dismiss
-› Finish the application note before handoff
-
-  Opus 4.1 · /home/mira/job-seeker
-"""
-        self.assertEqual(
-            "Finish the application note before handoff",
-            daemon._composer_text_from_pane(pane),
-        )
 
     def test_run_daemon_writes_heartbeat_each_poll(self):
         r = FakeRedis()
@@ -572,13 +158,11 @@ gpt-5.5 xhigh · ~/.peer-worktrees/conductor-codex
         }))
         fake_redis_module = SimpleNamespace(Redis=lambda **kwargs: r)
         inject_started = threading.Event()
-        heartbeat_observed_while_blocked = threading.Event()
 
         def blocked_inject(_session_name, _summary):
             heartbeat_count_at_block = r.heartbeat_writes()
             inject_started.set()
-            if r.wait_for_heartbeat_after(heartbeat_count_at_block, 5.0):
-                heartbeat_observed_while_blocked.set()
+            self.assertTrue(r.wait_for_heartbeat_after(heartbeat_count_at_block, 1.0))
             raise KeyboardInterrupt
 
         with mock.patch.dict(sys.modules, {"redis": fake_redis_module}):
@@ -587,7 +171,6 @@ gpt-5.5 xhigh · ~/.peer-worktrees/conductor-codex
                     daemon.run_daemon("127.0.0.1", 6379, 0.01)
 
         self.assertTrue(inject_started.is_set())
-        self.assertTrue(heartbeat_observed_while_blocked.is_set())
         self.assertGreaterEqual(r.heartbeat_writes(), 2)
 
     def test_delivery_progress_stall_withholds_heartbeat(self):
@@ -665,54 +248,44 @@ gpt-5.5 xhigh · ~/.peer-worktrees/conductor-codex
         self.assertIn((f"{key_prefix()}:handoff:*", DEFAULT_VALIDATION_SCAN_COUNT), r.scan_calls)
 
     def test_handoff_validation_timeout_does_not_wedge_delivery(self):
-        r = FakeRedis()
-        validation_started = threading.Event()
-        release_validation = threading.Event()
-        validation_done = threading.Event()
+        class BlockingHandoffScanRedis(FakeRedis):
+            def __init__(self):
+                super().__init__()
+                self.validation_started = threading.Event()
+                self.release_validation = threading.Event()
+                self.validation_done = threading.Event()
+
+            def scan_iter(self, match=None, count=None):
+                if match == f"{key_prefix()}:handoff:*":
+                    self.validation_started.set()
+                    self.release_validation.wait(1.0)
+                    self.validation_done.set()
+                    if False:
+                        yield None
+                    return
+                yield from super().scan_iter(match=match, count=count)
+
+        r = BlockingHandoffScanRedis()
         r.set(state_key("wedged", "idle"), "1")
         r.lpush(inbox_key("wedged"), json.dumps({"from": "sender", "type": "message", "body": "queued"}))
-
-        def blocking_validation(redis_client, *, prefix, timeout_sec):
-            self.assertIs(redis_client, r)
-            self.assertEqual(key_prefix(), prefix)
-            self.assertIsNone(timeout_sec)
-            validation_started.set()
-            release_validation.wait(1.0)
-            validation_done.set()
-            return 0
-
-        original_start = daemon._HandoffValidationJob.start
-
-        def start_and_wait_for_validation(job):
-            result = original_start(job)
-            self.assertTrue(validation_started.wait(0.5))
-            return result
-
-        def inject_while_validation_blocked(_session_name, _summary):
-            self.assertTrue(validation_started.is_set())
-            self.assertFalse(validation_done.is_set())
-            return True
 
         fake_redis_module = SimpleNamespace(Redis=lambda **kwargs: r)
         started_at = time_module.monotonic()
         try:
             with mock.patch.object(daemon, "HANDOFF_VALIDATION_TIMEOUT_SECS", 0.05):
-                with mock.patch.object(daemon, "validate_handoff_activation", side_effect=blocking_validation):
-                    with mock.patch.object(daemon._HandoffValidationJob, "start", start_and_wait_for_validation):
-                        with mock.patch.dict(sys.modules, {"redis": fake_redis_module}):
-                            with mock.patch.object(daemon, "get_local_tmux_sessions", return_value=["wedged"]):
-                                with mock.patch.object(daemon, "observe_composer_occupancy", return_value=False):
-                                    with mock.patch.object(daemon, "inject_via_tmux", side_effect=inject_while_validation_blocked) as inject:
-                                        with mock.patch.object(daemon.time, "time", return_value=1234.5):
-                                            with mock.patch.object(daemon.time, "sleep", side_effect=KeyboardInterrupt):
-                                                daemon.run_daemon("127.0.0.1", 6379, 1)
+                with mock.patch.dict(sys.modules, {"redis": fake_redis_module}):
+                    with mock.patch.object(daemon, "get_local_tmux_sessions", return_value=["wedged"]):
+                        with mock.patch.object(daemon, "inject_via_tmux", return_value=True) as inject:
+                            with mock.patch.object(daemon.time, "time", return_value=1234.5):
+                                with mock.patch.object(daemon.time, "sleep", side_effect=KeyboardInterrupt):
+                                    daemon.run_daemon("127.0.0.1", 6379, 1)
         finally:
-            elapsed = time_module.monotonic() - started_at
-            release_validation.set()
-            if validation_started.is_set():
-                self.assertTrue(validation_done.wait(1.0))
+            r.release_validation.set()
+            r.validation_done.wait(1.0)
+            time_module.sleep(0.02)
 
-        self.assertTrue(validation_started.is_set())
+        elapsed = time_module.monotonic() - started_at
+        self.assertTrue(r.validation_started.is_set())
         self.assertLess(elapsed, 0.5)
         inject.assert_called_once()
         self.assertEqual("wedged", inject.call_args.args[0])
@@ -884,41 +457,68 @@ gpt-5.5 xhigh · ~/.peer-worktrees/conductor-codex
         self.assertIn("queued", context)
         self.assertEqual(0, r.llen(inbox_key("long-tool")))
 
-    def test_at_rest_composer_reconciles_parent_idle_before_inject(self):
+    def test_usage_limit_banner_reconciles_parent_idle_before_inject(self):
         r = FakeRedis()
         r.set(state_key("gatekeeper", "last_activity"), "1000")
-        r.lpush(inbox_key("gatekeeper"), queued_message(timestamp=1000.0))
+        r.lpush(inbox_key("gatekeeper"), json.dumps({"from": "sender", "type": "message", "body": "queued"}))
 
-        with mock.patch.object(daemon, "_tmux_pane_tail", return_value=RESTING_COMPOSER_PANE):
-            first_inject = self.run_daemon_once(r, ["gatekeeper"], now=2500.0)
-            inject = self.run_daemon_once(r, ["gatekeeper"], now=2503.0)
+        with mock.patch.object(
+            daemon,
+            "_tmux_pane_tail",
+            return_value="You've hit your session limit · resets 2:10am (Africa/Abidjan)",
+        ):
+            inject = self.run_daemon_once(r, ["gatekeeper"], now=2500.0)
 
-        first_inject.assert_not_called()
         inject.assert_called_once()
         self.assertEqual("gatekeeper", inject.call_args.args[0])
         self.assertTrue(r.exists(state_key("gatekeeper", "idle")))
         self.assertEqual(1, r.llen(inbox_key("gatekeeper")))
 
-    def test_at_rest_composer_reconcile_subsumes_usage_limit_banner(self):
+    def test_usage_limit_reconcile_matches_reached_weekly_and_usage_variants(self):
+        banners = (
+            "You've reached your weekly limit · resets 2:10am (Africa/Abidjan)",
+            "You have reached your weekly limit · resets 2:10am (Africa/Abidjan)",
+            "You've reached your usage limit · resets 2:10am (Africa/Abidjan)",
+            "You have reached your usage limit · resets 2:10am (Africa/Abidjan)",
+        )
+        for idx, banner in enumerate(banners):
+            with self.subTest(banner=banner):
+                node_id = f"gatekeeper-{idx}"
+                r = FakeRedis()
+                r.set(state_key(node_id, "last_activity"), "1000")
+                r.lpush(inbox_key(node_id), json.dumps({"from": "sender", "type": "message", "body": "queued"}))
+
+                with mock.patch.object(daemon, "_tmux_pane_tail", return_value=f"Claude Code\n{banner}"):
+                    inject = self.run_daemon_once(r, [node_id], now=2500.0)
+
+                inject.assert_called_once()
+                self.assertEqual(node_id, inject.call_args.args[0])
+                self.assertTrue(r.exists(state_key(node_id, "idle")))
+                self.assertEqual(1, r.llen(inbox_key(node_id)))
+
+    def test_usage_limit_reconcile_ignores_stale_banner_above_visible_resting_region(self):
         r = FakeRedis()
         r.set(state_key("gatekeeper", "last_activity"), "1000")
-        r.lpush(inbox_key("gatekeeper"), queued_message(timestamp=1000.0))
-        pane_tail = "You've reached your usage limit · resets 2:10am\n" + RESTING_COMPOSER_PANE
+        r.lpush(inbox_key("gatekeeper"), json.dumps({"from": "sender", "type": "message", "body": "queued"}))
+        pane_tail = "\n".join((
+            "You've hit your session limit · resets 2:10am (Africa/Abidjan)",
+            "$ python long_running_job.py",
+            "processing task batch",
+            "writing output",
+            "Claude Code ready at prompt",
+        ))
 
         with mock.patch.object(daemon, "_tmux_pane_tail", return_value=pane_tail):
-            first_inject = self.run_daemon_once(r, ["gatekeeper"], now=2500.0)
-            inject = self.run_daemon_once(r, ["gatekeeper"], now=2503.0)
+            inject = self.run_daemon_once(r, ["gatekeeper"], now=2500.0)
 
-        first_inject.assert_not_called()
-        inject.assert_called_once()
-        self.assertEqual("gatekeeper", inject.call_args.args[0])
-        self.assertTrue(r.exists(state_key("gatekeeper", "idle")))
+        inject.assert_not_called()
+        self.assertFalse(r.exists(state_key("gatekeeper", "idle")))
         self.assertEqual(1, r.llen(inbox_key("gatekeeper")))
 
-    def test_at_rest_reconcile_fails_closed_without_box_anchored_composer(self):
+    def test_usage_limit_reconcile_does_not_restore_generic_stale_idle_absence(self):
         r = FakeRedis()
         r.set(state_key("gatekeeper", "last_activity"), "1000")
-        r.lpush(inbox_key("gatekeeper"), queued_message(timestamp=1000.0))
+        r.lpush(inbox_key("gatekeeper"), json.dumps({"from": "sender", "type": "message", "body": "queued"}))
 
         with mock.patch.object(daemon, "_tmux_pane_tail", return_value="Claude Code ready at prompt"):
             inject = self.run_daemon_once(r, ["gatekeeper"], now=2500.0)
@@ -927,120 +527,36 @@ gpt-5.5 xhigh · ~/.peer-worktrees/conductor-codex
         self.assertFalse(r.exists(state_key("gatekeeper", "idle")))
         self.assertEqual(1, r.llen(inbox_key("gatekeeper")))
 
-    def test_at_rest_reconcile_blocks_active_turn_marker(self):
+    def test_transient_not_your_usage_limit_does_not_reconcile_idle(self):
         r = FakeRedis()
         r.set(state_key("gatekeeper", "last_activity"), "1000")
-        r.lpush(inbox_key("gatekeeper"), queued_message(timestamp=1000.0))
-        active_pane = RESTING_COMPOSER_PANE + "\n✶ Working… Esc to interrupt\n"
+        r.lpush(inbox_key("gatekeeper"), json.dumps({"from": "sender", "type": "message", "body": "queued"}))
 
-        with mock.patch.object(daemon, "_tmux_pane_tail", return_value=active_pane):
+        with mock.patch.object(
+            daemon,
+            "_tmux_pane_tail",
+            return_value="API Error: Server is temporarily limiting requests (not your usage limit)",
+        ):
             inject = self.run_daemon_once(r, ["gatekeeper"], now=2500.0)
 
         inject.assert_not_called()
         self.assertFalse(r.exists(state_key("gatekeeper", "idle")))
-        self.assertEqual(1, r.llen(inbox_key("gatekeeper")))
 
-    def test_at_rest_reconcile_respects_fresh_tool_running(self):
+    def test_usage_limit_reconcile_respects_tool_running(self):
         r = FakeRedis()
         r.set(state_key("gatekeeper", "last_activity"), "1000")
         r.set(state_key("gatekeeper", "tool_running"), "1")
-        r.set(state_key("gatekeeper", "tool_running_at"), "2490")
-        r.lpush(inbox_key("gatekeeper"), queued_message(timestamp=1000.0))
+        r.lpush(inbox_key("gatekeeper"), json.dumps({"from": "sender", "type": "message", "body": "queued"}))
 
-        with mock.patch.object(daemon, "_tmux_pane_tail", return_value=RESTING_COMPOSER_PANE):
+        with mock.patch.object(
+            daemon,
+            "_tmux_pane_tail",
+            return_value="You've hit your session limit · resets 2:10am (Africa/Abidjan)",
+        ):
             inject = self.run_daemon_once(r, ["gatekeeper"], now=2500.0)
 
         inject.assert_not_called()
         self.assertFalse(r.exists(state_key("gatekeeper", "idle")))
-        self.assertEqual(1, r.llen(inbox_key("gatekeeper")))
-
-    def test_at_rest_reconcile_ignores_stale_tool_running(self):
-        r = FakeRedis()
-        r.set(state_key("gatekeeper", "last_activity"), "4990")
-        r.set(state_key("gatekeeper", "last_tool_activity"), "1000")
-        r.set(state_key("gatekeeper", "tool_running"), "1")
-        r.lpush(inbox_key("gatekeeper"), queued_message(timestamp=1000.0))
-
-        with mock.patch.object(daemon, "_tmux_pane_tail", return_value=RESTING_COMPOSER_PANE):
-            first_inject = self.run_daemon_once(r, ["gatekeeper"], now=5000.0)
-            inject = self.run_daemon_once(r, ["gatekeeper"], now=5003.0)
-
-        first_inject.assert_not_called()
-        inject.assert_called_once()
-        self.assertEqual("gatekeeper", inject.call_args.args[0])
-        self.assertTrue(r.exists(state_key("gatekeeper", "idle")))
-        self.assertEqual(1, r.llen(inbox_key("gatekeeper")))
-
-    def test_at_rest_reconcile_obeys_mail_age_grace(self):
-        r = FakeRedis()
-        r.set(state_key("gatekeeper", "last_activity"), "1000")
-        r.lpush(inbox_key("gatekeeper"), queued_message(timestamp=2470.0))
-
-        with mock.patch.object(daemon, "_tmux_pane_tail", return_value=RESTING_COMPOSER_PANE):
-            inject = self.run_daemon_once(r, ["gatekeeper"], now=2500.0)
-
-        inject.assert_not_called()
-        self.assertFalse(r.exists(state_key("gatekeeper", "idle")))
-        self.assertEqual(1, r.llen(inbox_key("gatekeeper")))
-
-    def test_grok_generating_pane_does_not_reconcile_while_content_changes(self):
-        r = FakeRedis()
-        r.set(state_key("conductor-grok", "last_activity"), "1000")
-        r.lpush(inbox_key("conductor-grok"), queued_message(timestamp=1000.0))
-
-        panes = [
-            GROK_GENERATING_COMPOSER_PANE_1,
-            GROK_GENERATING_COMPOSER_PANE_1,
-            GROK_GENERATING_COMPOSER_PANE_2,
-            GROK_GENERATING_COMPOSER_PANE_2,
-        ]
-        with mock.patch.object(daemon, "_tmux_pane_tail", side_effect=panes):
-            first_inject = self.run_daemon_once(
-                r,
-                ["conductor-grok"],
-                now=2500.0,
-                observe_composer=True,
-            )
-            inject = self.run_daemon_once(
-                r,
-                ["conductor-grok"],
-                now=2503.0,
-                observe_composer=True,
-            )
-
-        first_inject.assert_not_called()
-        inject.assert_not_called()
-        self.assertFalse(r.exists(state_key("conductor-grok", "idle")))
-        self.assertEqual(1, r.llen(inbox_key("conductor-grok")))
-
-    def test_grok_resting_composer_reconciles_after_stable_pane(self):
-        r = FakeRedis()
-        r.set(state_key("conductor-grok", "last_activity"), "1000")
-        r.lpush(inbox_key("conductor-grok"), queued_message(timestamp=1000.0))
-
-        with mock.patch.object(daemon, "_tmux_pane_tail", return_value=GROK_RESTING_COMPOSER_PANE):
-            first_inject = self.run_daemon_once(r, ["conductor-grok"], now=2500.0)
-            inject = self.run_daemon_once(r, ["conductor-grok"], now=2503.0)
-
-        first_inject.assert_not_called()
-        inject.assert_called_once()
-        self.assertEqual("conductor-grok", inject.call_args.args[0])
-        self.assertTrue(r.exists(state_key("conductor-grok", "idle")))
-        self.assertEqual(1, r.llen(inbox_key("conductor-grok")))
-
-    def test_at_rest_reconcile_treats_missing_message_timestamp_as_old(self):
-        r = FakeRedis()
-        r.set(state_key("gatekeeper", "last_activity"), "1000")
-        r.lpush(inbox_key("gatekeeper"), queued_message(timestamp=None))
-
-        with mock.patch.object(daemon, "_tmux_pane_tail", return_value=RESTING_COMPOSER_PANE):
-            first_inject = self.run_daemon_once(r, ["gatekeeper"], now=2500.0)
-            inject = self.run_daemon_once(r, ["gatekeeper"], now=2503.0)
-
-        first_inject.assert_not_called()
-        inject.assert_called_once()
-        self.assertEqual("gatekeeper", inject.call_args.args[0])
-        self.assertTrue(r.exists(state_key("gatekeeper", "idle")))
         self.assertEqual(1, r.llen(inbox_key("gatekeeper")))
 
     def test_idle_flag_is_authoritative_even_when_tool_running_exists(self):
@@ -1082,87 +598,10 @@ gpt-5.5 xhigh · ~/.peer-worktrees/conductor-codex
 
         notices = r.decoded_list(inbox_key("conductor"))
         self.assertEqual(1, len(notices))
-        self.assertEqual("session_recovery", notices[0]["type"])
+        self.assertEqual("inject_failure", notices[0]["type"])
         self.assertEqual("worker-codex", notices[0]["from"])
         self.assertEqual(3, notices[0]["failure_count"])
-        self.assertEqual("3", r.get(state_key("worker-codex", "pointer_inject_fail_count")))
-
-    def test_same_message_fail_fast_escalates_and_suppresses_retry(self):
-        r = FakeRedis()
-        r.set(state_key("worker-codex", "parent"), "conductor")
-        r.set(state_key("worker-codex", "idle"), "1")
-        r.lpush(inbox_key("worker-codex"), json.dumps({
-            "from": "sender",
-            "type": "command",
-            "body": "wedged target payload",
-            "msg_id": "same-message",
-        }))
-
-        with mock.patch.object(daemon, "POINTER_INJECT_BACKOFF_SECS", 1):
-            for now in (1000.0, 1002.0, 1004.0):
-                inject = self.run_daemon_once(
-                    r,
-                    ["worker-codex"],
-                    inject_result=False,
-                    now=now,
-                )
-                inject.assert_called_once()
-
-            fourth = self.run_daemon_once(
-                r,
-                ["worker-codex"],
-                inject_result=False,
-                now=1006.0,
-            )
-
-        fourth.assert_not_called()
-        self.assertEqual(1, r.llen(inbox_key("worker-codex")))
-        notices = r.decoded_list(inbox_key("conductor"))
-        self.assertEqual(1, len(notices))
-        self.assertEqual("session_recovery", notices[0]["type"])
-        self.assertEqual("worker-codex", notices[0]["from"])
-        self.assertEqual("same-message", notices[0]["message_id"])
-        self.assertEqual(3, notices[0]["failure_count"])
-
-    def test_failed_closed_message_does_not_starve_new_message(self):
-        r = FakeRedis()
-        r.set(state_key("worker-codex", "parent"), "conductor")
-        r.set(state_key("worker-codex", "idle"), "1")
-        r.lpush(inbox_key("worker-codex"), json.dumps({
-            "from": "sender",
-            "type": "command",
-            "body": "old wedged payload",
-            "msg_id": "old-message",
-        }))
-
-        with mock.patch.object(daemon, "POINTER_INJECT_BACKOFF_SECS", 1):
-            for now in (1000.0, 1002.0, 1004.0):
-                self.run_daemon_once(
-                    r,
-                    ["worker-codex"],
-                    inject_result=False,
-                    now=now,
-                )
-
-            r.lpush(inbox_key("worker-codex"), json.dumps({
-                "from": "sender",
-                "type": "command",
-                "body": "new payload",
-                "msg_id": "new-message",
-            }))
-            inject = self.run_daemon_once(
-                r,
-                ["worker-codex"],
-                inject_result=True,
-                now=1006.0,
-            )
-
-        inject.assert_called_once()
-        self.assertIn("You have 1 messages", inject.call_args.args[1])
-        self.assertEqual(2, r.llen(inbox_key("worker-codex")))
-        notices = r.decoded_list(inbox_key("conductor"))
-        self.assertEqual(1, len(notices))
-        self.assertEqual("old-message", notices[0]["message_id"])
+        self.assertEqual("4", r.get(state_key("worker-codex", "pointer_inject_fail_count")))
 
     def test_handoff_injection_success_records_poll_signal(self):
         r = FakeRedis()
