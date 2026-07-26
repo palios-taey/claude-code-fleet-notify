@@ -119,6 +119,23 @@ class DaemonTests(unittest.TestCase):
         self.assertEqual(1, r.llen(inbox_key("idle-session")))
         self.assertTrue(r.exists(state_key("idle-session", "idle")))
 
+    def test_going_active_reinjects_pending_mail_on_next_stop(self):
+        # Inject once per stop-with-pending-mail: if a session gets the pointer but
+        # goes active WITHOUT draining (mid-turn) and stops again with the same mail
+        # still pending, it gets one fresh pointer on the next stop — the record is
+        # cleared while active so it is never permanently blocked (bug fixed 2026-07-24).
+        r = FakeRedis()
+        r.set(state_key("s", "idle"), "1")
+        r.lpush(inbox_key("s"), json.dumps({"from": "sender", "type": "message", "body": "body"}))
+
+        self.run_daemon_once(r, ["s"], now=1000.0).assert_called_once()   # first stop: inject
+        self.run_daemon_once(r, ["s"], now=1002.0).assert_not_called()    # still idle, same inbox: no repeat
+        # session goes active (idle cleared) without draining, then stops again
+        r.delete(state_key("s", "idle"))
+        self.run_daemon_once(r, ["s"], now=1004.0).assert_not_called()    # active: not injected, record cleared
+        r.set(state_key("s", "idle"), "1")
+        self.run_daemon_once(r, ["s"], now=1006.0).assert_called_once()   # next stop: one fresh pointer
+
     def test_run_daemon_writes_heartbeat_each_poll(self):
         r = FakeRedis()
 

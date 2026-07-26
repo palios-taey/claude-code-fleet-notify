@@ -638,6 +638,14 @@ def run_daemon(
                     if not is_node_idle(r, node_id):
                         reconcile_usage_limit_idle(r, node_id, session_name)
                     if not is_node_idle(r, node_id):
+                        # If a session received a pointer, went active without draining,
+                        # and stops again with the same pending mail, it must get one
+                        # fresh pointer; without clearing the no-TTL inject-once record,
+                        # that inbox is permanently blocked.
+                        try:
+                            r.delete(state_key(node_id, "pointer_inject_backoff"))
+                        except Exception:
+                            pass
                         continue
 
                     # Inject ONCE per inbox state — never repeat-send (Jesse 2026-07-24:
