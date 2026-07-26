@@ -782,11 +782,10 @@ def _peer_idle_allowed_for_task(node_id: str, supervisor: str, task_id: Optional
 
 
 def _stop_event_dedup_key(r, node_id: str, task_id: Optional[str]) -> str:
-    from notifications.inbox import key_prefix, state_key
+    from notifications.inbox import key_prefix
 
-    stop_stamp = r.get(state_key(node_id, "last_activity")) or "unknown-stop"
     task_bucket = task_id or "no-task"
-    return f"{key_prefix()}:peer-idle-notified:{node_id}:{task_bucket}:{stop_stamp}"
+    return f"{key_prefix()}:peer-idle-notified:{node_id}:{task_bucket}"
 
 
 def _no_task_peer_idle_marker_key(node_id: str, supervisor: str) -> str:
@@ -981,8 +980,8 @@ def _notify_supervisor_of_stop(r, node_id: str, supervisor: str) -> None:
     so the supervisor sees the result inline without context-switching to
     the worker pane.
 
-    Task and outcome handoff dedup is keyed per stop event. Bare no-task
-    ``peer_idle`` is deduped per idle transition: already-idle re-stops
+    Task and outcome handoff dedup is keyed per reported node+task state. Bare
+    no-task ``peer_idle`` is deduped per idle transition: already-idle re-stops
     suppress until activity clears the marker.
 
     Persistence rule (Gaia, Phase A consultation 2026-05-26): clear
