@@ -1,5 +1,5 @@
 #!/bin/bash
-# tmux-send: Send text + submit to a hookable REPL CLI tmux session.
+# tmux-send: Send text + submit to a hookable REPL or line-reader tmux session.
 # Usage: tmux-send <host> <session> "message text"
 #        tmux-send <session> <message>  (local shorthand)
 #
@@ -25,9 +25,15 @@
 #                              input-ready mode (hint line shows
 #                              "Enter:send"). Verified live 2026-05-26.
 #
-# Detection: session-name suffix. Anything ending in -grok uses the
-# grok sequence; everything else uses the Claude Code / codex sequence.
-# Override via SEND_SEQUENCE env: SEND_SEQUENCE=grok or =claude.
+# Taey durable seats (plain terminal line reader):
+#   Escape and CSI-u are input bytes, not UI controls. Sequence:
+#     1. Ctrl-U              — clear any prior terminal input
+#     2. Paste one pointer line
+#     3. legacy Enter        — terminate the line
+#
+# Detection: exact canonical Taey seat identities use plain; anything
+# ending in -grok uses grok; everything else uses Claude Code / codex.
+# Override via SEND_SEQUENCE env: plain, grok, or claude.
 #
 # See: github.com/anthropics/claude-code/issues/15553
 
@@ -56,6 +62,7 @@ detect_sequence() {
         return
     fi
     case "$sess" in
+        taey|taey-council-[1-7]) echo "plain" ;;
         *-grok) echo "grok" ;;
         *)      echo "claude" ;;
     esac
@@ -65,14 +72,22 @@ SEQ=$(detect_sequence "$SESSION")
 
 # Local send
 if [ "$HOST" = "local" ] || [ "$HOST" = "localhost" ] || [ "$HOST" = "$(hostname -s)" ]; then
-    # Pre-clear the input box for both sequences. Without this, a re-poll
-    # injection on a stuck session accumulates text (verified live
-    # 2026-05-26: x-claude-grok had three concatenated NOTIFY messages
-    # because the daemon kept re-injecting without clearing).
-    tmux send-keys -t "$SESSION" C-u C-k
-    sleep 0.1
-
-    if [ "$SEQ" = "grok" ]; then
+    if [ "$SEQ" = "plain" ]; then
+        # Ctrl-K is a TUI editing command but a literal vertical-tab byte
+        # to Python's terminal line reader, so plain seats use Ctrl-U only.
+        tmux send-keys -t "$SESSION" C-u
+        sleep 0.1
+        if [[ "$MSG" == *$'\n'* ]]; then
+            echo "ERROR: plain Taey delivery accepts exactly one pointer line" >&2
+            exit 1
+        fi
+        printf '%s' "$MSG" | tmux load-buffer -
+        tmux paste-buffer -t "$SESSION" -d
+        sleep 0.1
+        tmux send-keys -t "$SESSION" Enter
+    elif [ "$SEQ" = "grok" ]; then
+        tmux send-keys -t "$SESSION" C-u C-k
+        sleep 0.1
         # Grok modal TUI: Enter = SUBMIT. Embedded \n in $MSG sent via
         # send-keys would fragment a multi-line dispatch into multiple
         # partial submits (verified live 2026-05-31: 7-attack-vector audit
@@ -85,6 +100,8 @@ if [ "$HOST" = "local" ] || [ "$HOST" = "localhost" ] || [ "$HOST" = "$(hostname
         sleep 0.5
         tmux send-keys -t "$SESSION" Enter
     else
+        tmux send-keys -t "$SESSION" C-u C-k
+        sleep 0.1
         # Claude Code / codex (Ink TUI / Kitty protocol): embedded \n is
         # newline-in-input not submit, so direct send-keys is fine.
         tmux send-keys -t "$SESSION" -- "$MSG"
@@ -106,16 +123,30 @@ SESSION='${SESSION}'
 SEQ='${SEQ}'
 MSG=\$(printf '%s' '${B64}' | base64 -d)
 
-tmux send-keys -t \"\$SESSION\" C-u C-k
-sleep 0.1
-
-if [ \"\$SEQ\" = 'grok' ]; then
+if [ \"\$SEQ\" = 'plain' ]; then
+    tmux send-keys -t \"\$SESSION\" C-u
+    sleep 0.1
+    case \"\$MSG\" in
+        *\$'\\n'*)
+            echo 'ERROR: plain Taey delivery accepts exactly one pointer line' >&2
+            exit 1
+            ;;
+    esac
+    printf '%s' \"\$MSG\" | tmux load-buffer -
+    tmux paste-buffer -t \"\$SESSION\" -d
+    sleep 0.1
+    tmux send-keys -t \"\$SESSION\" Enter
+elif [ \"\$SEQ\" = 'grok' ]; then
+    tmux send-keys -t \"\$SESSION\" C-u C-k
+    sleep 0.1
     # Bracketed paste — see local-send branch above for full reasoning.
     printf '%s' \"\$MSG\" | tmux load-buffer -
     tmux paste-buffer -t \"\$SESSION\" -p -d
     sleep 0.5
     tmux send-keys -t \"\$SESSION\" Enter
 else
+    tmux send-keys -t \"\$SESSION\" C-u C-k
+    sleep 0.1
     tmux send-keys -t \"\$SESSION\" -- \"\$MSG\"
     sleep 0.5
     tmux send-keys -t \"\$SESSION\" Escape

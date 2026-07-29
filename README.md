@@ -9,7 +9,7 @@ Turn scattered AI terminals into a supervised tmux fleet: dispatch work to Claud
 
 Latest release: see [Releases](https://github.com/palios-taey/claude-code-fleet-notify/releases) (the README never hardcodes a version — it goes stale).
 
-`claude-code-fleet-notify` gives each terminal-native, hookable CLI session a Redis inbox, four lifecycle hooks, and one local daemon. Active sessions receive full messages through hook `additionalContext`; stopped sessions are woken by a tmux-injected pointer prompt, while full message bodies remain in Redis.
+`claude-code-fleet-notify` gives each terminal-native, hookable CLI session a Redis inbox, four lifecycle hooks, and one local daemon. Active sessions receive full messages through hook `additionalContext`; stopped sessions are woken by a tmux-injected pointer prompt, while full message bodies remain in Redis. The canonical `taey` and `taey-council-1` through `taey-council-7` sessions are an explicit line-reader adapter: their durable runtime claims Redis mail itself, and `tmux-send` submits only the pointer with legacy Enter rather than TUI escape sequences.
 
 ## Set it up with Claude Code (AI-native)
 
@@ -33,6 +33,8 @@ Out of scope (will fail silently or partially — adopters: don't):
 - **IDE-embedded agents** (Cursor, Continue, GitHub Copilot Workspace, etc.) — extension-host IPC sits below the tmux/process boundary our hooks observe, so critical task state transitions are missed.
 - **Many-to-many distributed graph topologies** — the supervisor↔worker abstraction here is point-to-point with optional multi-level via explicit `parent` override. Fanout/aggregate workflows need a different layer.
 - **Non-hookable REPLs** — if a CLI has no equivalent of Stop / UserPromptSubmit / Pre+PostToolUse (or comparable lifecycle events), the universal Stop+notify primitive has nothing to attach to and the daemon's pointer injection won't have a UserPromptSubmit hook on the receiving side to drain the inbox.
+
+The named Taey line-reader adapter is the narrow exception to the generic non-hookable-REPL exclusion. It owns durable claim, processing, retry, outcome, and acknowledgement semantics in `taey-presence`; fleet-notify remains only its Redis delivery and pointer-wake transport.
 
 > **Integration verification status**: Claude Code (field-verified, the original target). xAI grok (field-verified with dedicated `~/.grok/hooks/cf-notify.json`, including boot-time `SessionStart` idle marking). OpenAI codex (integration-tested via the per-CLI hook variants; field-verified on the Mira fleet via per-parent peers). Google gemini (integration-tested via the per-CLI hook variants; field-verified via the same per-parent peers, with the known BeforeTool/AfterTool event-name mapping).
 

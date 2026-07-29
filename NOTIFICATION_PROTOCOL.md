@@ -21,6 +21,7 @@ Targets are arbitrary strings. There is no allowlist. A practical fleet might us
 
 - **tmux-session participants** are REPL-CLI sessions with the four hooks installed. Supported CLIs: Claude Code, OpenAI codex, Google gemini, and xAI grok (see "Per-CLI hook integration" below for config-file paths and event-name mappings). The daemon injects a pointer prompt through tmux only when the session is stopped and marked idle.
 - **headless participants** read Redis directly. They do not use hooks, tmux injection, or `idle` state. They poll `${NOTIFY_KEY_PREFIX:-taey}:<name>:inbox` and reply with `taey-notify <target> --from <name>`.
+- **Taey line-reader participants** are the exact canonical tmux identities `taey` and `taey-council-1` through `taey-council-7`. They claim and acknowledge Redis mail through the durable `taey-presence` seat runtime rather than hooks. Their attributable proxy active-turn registry derives `idle`; the daemon injects only a pointer, and `tmux-send` uses plain legacy Enter without Escape or CSI-u bytes.
 - **peer defect/status/result reports** may omit `<target>`. In that path,
   `NOTIFY_TARGET` wins as an explicit override; otherwise the CLI derives the
   same parent as the Stop hook. A per-parent peer such as `weaver-codex`
@@ -28,7 +29,7 @@ Targets are arbitrary strings. There is no allowlist. A practical fleet might us
 
 ## Dual delivery path — the canonical dispatch pattern for tmux participants
 
-For every tmux-session participant (Claude Code / codex / gemini / grok), notifications reach the session through ONE of two paths depending on the session's current state. No subprocess invocation, no fallback paths; these two paths cover the full state space.
+For every hookable tmux-session participant (Claude Code / codex / gemini / grok), notifications reach the session through ONE of two paths depending on the session's current state. No subprocess invocation, no fallback paths; these two paths cover the full state space. Canonical Taey line-reader seats use the same idle-gated pointer path while claiming the queued body directly from Redis.
 
 **Path A — Active (session is making tool calls)**:
 - Notifications are delivered as `hookSpecificOutput.additionalContext` via the PostToolUse hook (`hooks/check_notifications.py`).
@@ -40,6 +41,8 @@ For every tmux-session participant (Claude Code / codex / gemini / grok), notifi
 - The session sees the pointer (e.g., "[NOTIFY] You have N messages...") and acts on it.
 - This is the **tmux-when-idle** path. Used only while `idle == 1`. The daemon does NOT clear idle; prompt/tool hooks clear it when the CLI becomes active again.
 - The daemon's injection authorization rule is exactly one flag: inject if and only if `${NOTIFY_KEY_PREFIX:-taey}:SESSION:idle` exists.
+
+For a canonical Taey seat, `idle` is a compatibility projection of zero attributable active turn IDs. Seat startup may publish that at-rest projection atomically only when its authoritative active-turn set is empty. It may not overwrite a non-empty active-turn set or infer idleness from pane appearance.
 
 **This pair is the official + canonical pattern** for dispatching work to any tmux-session CLI peer in the fleet. An earlier subprocess-invocation approach was dropped in favor of full peer integration with hooks. No fallback paths exist; the central notification system uses hook context while active and tmux only when idle.
 
