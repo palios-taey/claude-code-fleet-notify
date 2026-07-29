@@ -70,6 +70,11 @@ detect_sequence() {
 
 SEQ=$(detect_sequence "$SESSION")
 
+if [ "$SEQ" = "plain" ] && [[ "$MSG" == *$'\n'* ]]; then
+    echo "ERROR: plain Taey delivery accepts exactly one pointer line" >&2
+    exit 1
+fi
+
 # Local send
 if [ "$HOST" = "local" ] || [ "$HOST" = "localhost" ] || [ "$HOST" = "$(hostname -s)" ]; then
     if [ "$SEQ" = "plain" ]; then
@@ -77,10 +82,6 @@ if [ "$HOST" = "local" ] || [ "$HOST" = "localhost" ] || [ "$HOST" = "$(hostname
         # to Python's terminal line reader, so plain seats use Ctrl-U only.
         tmux send-keys -t "$SESSION" C-u
         sleep 0.1
-        if [[ "$MSG" == *$'\n'* ]]; then
-            echo "ERROR: plain Taey delivery accepts exactly one pointer line" >&2
-            exit 1
-        fi
         printf '%s' "$MSG" | tmux load-buffer -
         tmux paste-buffer -t "$SESSION" -d
         sleep 0.1
@@ -126,12 +127,6 @@ MSG=\$(printf '%s' '${B64}' | base64 -d)
 if [ \"\$SEQ\" = 'plain' ]; then
     tmux send-keys -t \"\$SESSION\" C-u
     sleep 0.1
-    case \"\$MSG\" in
-        *\$'\\n'*)
-            echo 'ERROR: plain Taey delivery accepts exactly one pointer line' >&2
-            exit 1
-            ;;
-    esac
     printf '%s' \"\$MSG\" | tmux load-buffer -
     tmux paste-buffer -t \"\$SESSION\" -d
     sleep 0.1
