@@ -133,6 +133,33 @@ class StopHookTests(HookTestCase):
         self.assertEqual("task-59", msg["task_id"])
         self.assertEqual("unknown", msg["outcome"])
 
+    def test_task_peer_idle_dedup_ignores_activity_stamp_churn(self):
+        r = FakeRedis()
+        r.set(state_key("worker-codex", "last_activity"), "1000.0")
+        r.set(state_key("worker-codex", "current_task"), json.dumps({
+            "task_id": "task-59",
+            "description": "diagnose lifecycle",
+            "supervisor": "conductor",
+            "started_at": "1000",
+        }))
+
+        with mock.patch.object(shared, "fetch_stop_decision", return_value={
+            "wake_type": shared.WAKE_ALLOW_STOP,
+            "block": False,
+            "reason": None,
+        }):
+            with mock.patch.object(shared, "peer_idle_allowed", return_value=(True, "in_progress", {"status": "in_progress"})):
+                shared._notify_supervisor_of_stop(r, "worker-codex", "conductor")
+                r.set(state_key("worker-codex", "last_activity"), "1001.0")
+                shared._notify_supervisor_of_stop(r, "worker-codex", "conductor")
+
+        self.assertEqual(1, r.llen(inbox_key("conductor")))
+        dedup_key = shared._stop_event_dedup_key(r, "worker-codex", "task-59")
+        self.assertEqual("1", r.get(dedup_key))
+        self.assertEqual(60, r.expiry[dedup_key])
+        self.assertNotIn(f"{dedup_key}:1000.0", r.store)
+        self.assertNotIn(f"{dedup_key}:1001.0", r.store)
+
     def test_allow_stop_with_no_current_task_notifies_supervisor(self):
         r = FakeRedis()
         r.set(state_key("worker-codex", "last_activity"), "1000.0")
