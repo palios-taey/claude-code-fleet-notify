@@ -149,6 +149,25 @@ but advancing fan-out from a genuinely stalled delivery loop.
 - `priority: "high"` prefixes displayed messages with `URGENT `.
 - Never use `!!` or `!!!` as a priority marker; bash history expansion can break shell workflows.
 
+## Sender identity
+
+Every message carries a `from` node id. `taey-notify` resolves it in this precedence:
+
+1. `--from <id>` — explicit per-call flag, always wins.
+2. `TAEY_NODE_ID` environment variable.
+3. tmux session name (`tmux display-message -p '#S'`).
+4. hostname — last-resort fallback.
+
+**Export `TAEY_NODE_ID=<role>` in every seat's environment.** Provenance should be
+*declared*, not inferred. The session-name fallback is correct only when the tmux
+session is named after the seat's role; a seat running in a differently-named session
+silently stamps the wrong sender — a cannot-lie provenance defect that still routes
+and delivers correctly, so it is easy to miss. `TAEY_NODE_ID` is the durable per-seat
+fix; `--from` overrides a single call. Because the `from` label drives inbox
+provenance (and a seat's `idle`/`inbox`/`current_task` keys resolve on the same node
+id), a seat whose resolved id does not match its role is mis-seated — fix the id, and
+confirm the seat is in the session it should be.
+
 ## Hook install model
 
 Default behavior installs Claude Code hooks (which also enables Grok by inheritance — see "Per-CLI hook integration" above):
@@ -204,3 +223,4 @@ taey-ack --peek
 - Never send full message bodies through tmux injection; use Redis plus hook `additionalContext`.
 - Never clear queues with destructive `DELETE` during normal acknowledgement; drain with pops so messages arriving concurrently are not dropped.
 - Do not relay messages through a central human or agent when the sender can target the recipient directly.
+- Do not rely on the tmux session name for sender identity when a seat may run in a differently-named session; export `TAEY_NODE_ID` so `from` is declared, not guessed.
