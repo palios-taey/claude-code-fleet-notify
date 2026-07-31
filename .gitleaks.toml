@@ -1,0 +1,6 @@
+# gitleaks config for claude-code-fleet-notify
+
+title = "claude-code-fleet-notify secret scan"
+
+[extend]
+useDefault = true

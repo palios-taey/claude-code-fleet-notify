@@ -1,0 +1,16 @@
+[Unit]
+Description=The Conductor Notification Router (fleet wake-daemon)
+After=network.target
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/claude-code-fleet-notify/notify-router.env
+WorkingDirectory=%h
+ExecStart=/bin/bash -lc 'set -euo pipefail; : "${NOTIFY_REPO_ROOT:?set NOTIFY_REPO_ROOT in notify-router.env}"; : "${NOTIFY_PYTHON:?set NOTIFY_PYTHON in notify-router.env}"; : "${REDIS_HOST:?set REDIS_HOST in notify-router.env}"; : "${REDIS_PORT:?set REDIS_PORT in notify-router.env}"; : "${NOTIFY_KEY_PREFIX:?set NOTIFY_KEY_PREFIX in notify-router.env}"; cd "$NOTIFY_REPO_ROOT"; exec "$NOTIFY_PYTHON" -u "$NOTIFY_REPO_ROOT/notifications/daemon.py" --redis-host "$REDIS_HOST" --redis-port "$REDIS_PORT"'
+Restart=always
+RestartSec=3
+TimeoutStopSec=75
+MemorySwapMax=0
+
+[Install]
+WantedBy=default.target
