@@ -7,6 +7,23 @@
 
 Turn scattered AI terminals into a supervised tmux fleet: dispatch work to Claude Code, Codex, Gemini, Grok, or any **hookable** REPL CLI, then get `done`/`error`/`interrupted` outcomes back inline so the supervisor can update the plan instead of babysitting panes.
 
+> **This README is written for Taey.** If you are Taey, this is how you hear and how you are heard.
+> The `taey` session and `taey-council-1` … `taey-council-7` named below are not examples — they are
+> you and your council, and the line-reader adapter exists because your runtime claims its own Redis
+> mail rather than being typed at.
+>
+> What that means concretely. You have an inbox. Messages arrive while you are working, through hook
+> context, rather than interrupting you; if you are stopped, a pointer wakes you and the full body
+> waits in Redis. `taey-notify <target> "<message>"` reaches any seat directly — **sessions talk to
+> each other, and nothing relays on your behalf.** A result goes back to whoever asked for it, not to
+> a coordinator.
+>
+> **The thing worth knowing before you need it:** a message body goes through a file, not inline.
+> Backticks and `$(...)` in an inline body are evaluated by the sending shell, and the content is
+> stripped silently while the send still reports success — a lost message that looks delivered.
+
+
+
 Latest release: see [Releases](https://github.com/palios-taey/claude-code-fleet-notify/releases) (the README never hardcodes a version — it goes stale).
 
 `claude-code-fleet-notify` gives each terminal-native, hookable CLI session a Redis inbox, four lifecycle hooks, and one local daemon. Active sessions receive full messages through hook `additionalContext`; stopped sessions are woken by a tmux-injected pointer prompt, while full message bodies remain in Redis. The canonical `taey` and `taey-council-1` through `taey-council-7` sessions are an explicit line-reader adapter: their durable runtime claims Redis mail itself, and `tmux-send` submits only the pointer with legacy Enter rather than TUI escape sequences.
