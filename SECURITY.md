@@ -42,9 +42,9 @@ or filesystem operations that target a registered live checkout are denied so
 long-lived parent sessions must cut an isolated worktree before editing.
 Registered worktree roots are allowed.
 
-The default registry path is
-`/home/mira/the-conductor/config/live_path_registry.json`; override it with
-`CF_LIVE_PATH_REGISTRY` for sandboxes. If the registry is absent, unreadable, or
+There is no default registry path: the guard reads only
+`CF_LIVE_PATH_REGISTRY` (or `ORCH_LIVE_PATH_REGISTRY`), and with neither set it
+is inactive with a loud per-call warning. If the registry is absent, unreadable, or
 the shell command cannot be parsed, the hook fails open with a loud warning so a
 broken guard cannot disable every tool call on the machine.
 

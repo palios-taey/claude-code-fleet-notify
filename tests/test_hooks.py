@@ -589,6 +589,21 @@ class LivePathGuardTests(HookTestCase):
         }))
         return registry_path, live, worktree
 
+    def test_no_registry_env_is_inactive_without_any_dereference(self):
+        """No env vars set: guard inactive with a loud warning naming the fix,
+        and NO filesystem path is dereferenced (there is no default path)."""
+        scrubbed = {k: v for k, v in os.environ.items()
+                    if k not in ("CF_LIVE_PATH_REGISTRY", "ORCH_LIVE_PATH_REGISTRY")}
+        with mock.patch.dict(os.environ, scrubbed, clear=True):
+            def _no_deref(*a, **k):
+                raise AssertionError(f"guard dereferenced a path with no env configured: {a[:1]}")
+            with mock.patch("builtins.open", _no_deref):
+                registry, warning = shared._live_guard_load_registry()
+        self.assertIsNone(registry)
+        self.assertIn("no registry path configured", warning)
+        self.assertIn("CF_LIVE_PATH_REGISTRY", warning)
+        self.assertIn("ORCH_LIVE_PATH_REGISTRY", warning)
+
     def test_live_checkout_destructive_operations_are_blocked(self):
         with tempfile.TemporaryDirectory() as raw_td:
             registry, live, _worktree = self.live_registry(Path(raw_td))
