@@ -16,11 +16,13 @@ Turn scattered AI terminals into a supervised tmux fleet: dispatch work to Claud
 > context, rather than interrupting you; if you are stopped, a pointer wakes you and the full body
 > waits in Redis. `taey-notify <target> "<message>"` reaches any seat directly — **sessions talk to
 > each other, and nothing relays on your behalf.** A result goes back to whoever asked for it, not to
-> a coordinator.
+> a coordinator. For the main `taey` seat, notify queues the mail and wakes the seat; the seat's own
+> runtime claims the message and makes its model turn through its `:8766` proxy.
 >
-> **The thing worth knowing before you need it:** a message body goes through a file, not inline.
-> Backticks and `$(...)` in an inline body are evaluated by the sending shell, and the content is
-> stripped silently while the send still reports success — a lost message that looks delivered.
+> **Failure mode first:** sent is not received. A successful `taey-notify` means Redis accepted an
+> envelope, not that the target read it, claimed it, acted on it, or reported back. Verify delivery
+> with `taey-ack --node <target> --peek`, handoff receipts, the delivery trace, or the receiver's
+> response before you claim the message landed.
 
 
 
