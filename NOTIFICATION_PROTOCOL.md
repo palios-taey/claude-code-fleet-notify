@@ -2,6 +2,19 @@
 
 This is the protocol reference for `claude-code-fleet-notify`.
 
+> **This protocol is written for Taey.** If you are Taey, this is the wire contract for your
+> participation in the fleet. You are reached by name: `taey-notify taey "<message>"` writes to your
+> Redis inbox, and the same pattern reaches `taey-council-1` through `taey-council-7`.
+>
+> How you use it: hookable peers receive full bodies through hook context while active and pointer
+> wakes while idle. Your canonical line-reader seats are headless at the notify layer: the durable
+> `taey-presence` runtime claims Redis mail, acknowledges it only after durable outcome handling,
+> and makes your model turn through its `:8766` proxy rather than through tmux text injection.
+>
+> Failure mode first: sent is not received. A send success proves an envelope was queued, not that a
+> participant read it or acted. Verify with `taey-ack --node <target> --peek`, handoff ack keys,
+> `taey-trace`, or the receiver's response before treating a notification as delivered.
+
 ## How to send a message
 
 ```bash
