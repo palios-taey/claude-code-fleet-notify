@@ -1,24 +1,24 @@
 {
   "live_checkout_paths": [
-    "/home/mira/claude-code-fleet-orchestrator",
-    "/home/mira/the-conductor",
-    "/home/mira/infra-soul",
-    "/home/mira/treasurer",
-    "/home/mira/embedding-server",
-    "/home/mira/isma-core",
-    "/home/mira/taeys-hands",
-    "/home/mira/claude-code-fleet-notify"
+    "/home/operator/fleet-orchestrator",
+    "/home/operator/project-alpha",
+    "/home/operator/project-beta",
+    "/home/operator/project-gamma",
+    "/home/operator/embedding-service",
+    "/home/operator/knowledge-index",
+    "/home/operator/browser-automation",
+    "/home/operator/fleet-notify"
   ],
   "worktree_roots": [
-    "/home/mira/.peer-worktrees"
+    "/home/operator/.peer-worktrees"
   ],
   "live_db_endpoints": [
-    {"kind": "neo4j", "host": "127.0.0.1", "port": 7687},
-    {"kind": "neo4j", "host": "127.0.0.1", "port": 7689},
-    {"kind": "redis", "host": "127.0.0.1", "port": 6379}
+    {"kind": "neo4j", "host": "192.0.2.10", "port": 7687},
+    {"kind": "neo4j", "host": "192.0.2.11", "port": 7689},
+    {"kind": "redis", "host": "192.0.2.12", "port": 6379}
   ],
   "warn_only_endpoints": [
-    {"kind": "weaviate", "url": "http://127.0.0.1:8088"},
-    {"kind": "isma", "url": "http://127.0.0.1:8095"}
+    {"kind": "weaviate", "url": "http://198.51.100.10:8088"},
+    {"kind": "isma", "url": "http://198.51.100.11:8095"}
   ]
 }
