@@ -10,3 +10,11 @@ CLAUDE.md
 .env.*.local
 *.pyc
 hooks/__pycache__/
+
+# Retired path components are history-only, not current public surface.
+archive/
+archived/
+deprecated/
+superseded/
+obsolete/
+legacy/
