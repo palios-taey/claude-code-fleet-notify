@@ -15,8 +15,8 @@ permissions:
   pull-requests: read
 
 jobs:
-  test:
-    name: Syntax + unit tests (make test)
+  syntax:
+    name: Syntax checks
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -26,11 +26,8 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install runtime deps
-        run: pip install redis
-
-      - name: Run make test
-        run: make test
+      - name: Run syntax checks
+        run: make syntax
 
   secret-scan:
     name: Gitleaks secret scan

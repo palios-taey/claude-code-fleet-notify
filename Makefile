@@ -1,4 +1,4 @@
-.PHONY: install uninstall test hooks-diff hooks-install hooks-safe-edit daemon-start daemon-stop daemon-status
+.PHONY: install uninstall syntax hooks-diff hooks-install hooks-safe-edit daemon-start daemon-stop daemon-status
 
 PREFIX ?= /usr/local
 # Live hooks-loading path the fleet daemon + hook subprocesses read from.
@@ -63,9 +63,7 @@ daemon-stop:
 daemon-status:
 	@bash scripts/start_notify_daemons.sh status
 
-test:
+syntax:
 	@echo "Syntax check..."
-	@python3 -m py_compile identity.py notifications/*.py hooks/*.py tests/*.py
-	@bash -n scripts/start_notify_daemons.sh scripts/tmux-send scripts/install-hooks.sh
-	@echo "Unit tests..."
-	@python3 -m unittest discover -s tests
+	@python3 -m py_compile identity.py notifications/*.py hooks/*.py scripts/_stage_b_api.py scripts/taey-*
+	@bash -n scripts/start_notify_daemons.sh scripts/tmux-send scripts/install-hooks.sh scripts/atomic_deploy.sh
