@@ -737,6 +737,18 @@ def _fetch_wake_packet(node_id: str) -> str:
         )
         if payload.get("ok") and payload.get("enabled") and payload.get("packet"):
             return str(payload["packet"])
+        if payload.get("enabled") and payload.get("ok") is False:
+            error = str(payload.get("error") or "wake packet assembly failed")
+            operation = str(payload.get("operation") or "wake_packet_assembly")
+            next_step = str(payload.get("next_step") or "")
+            lines = [
+                "# Wake State Packet Unavailable",
+                f"- operation: {operation[:120]}",
+                f"- error: {error[:320]}",
+            ]
+            if next_step:
+                lines.append(f"- next_step: {next_step[:320]}")
+            return "\n".join(lines)
     except Exception as e:
         log_debug(node_id, f"wake-packet fetch skipped: {e}")
     return ""
@@ -782,13 +794,22 @@ def _resolve_blocked_on(task_id: Optional[str]) -> Optional[str]:
     return str(blocked_on)
 
 
-def _peer_idle_allowed_for_task(node_id: str, supervisor: str, task_id: Optional[str]) -> bool:
+def _peer_idle_decision_for_task(
+    node_id: str,
+    supervisor: str,
+    task_id: Optional[str],
+) -> tuple[bool, str, Optional[dict[str, Any]]]:
     try:
-        allowed, reason, _ = peer_idle_allowed(task_id, node_id, supervisor)
+        allowed, reason, task = peer_idle_allowed(task_id, node_id, supervisor)
     except Exception as exc:
-        allowed, reason = False, f"task_liveness_error:{exc}"
+        allowed, reason, task = False, f"task_liveness_error:{exc}", None
     if not allowed:
         log_debug(node_id, f"suppressed PEER_IDLE for {node_id}: {reason}")
+    return allowed, reason, task
+
+
+def _peer_idle_allowed_for_task(node_id: str, supervisor: str, task_id: Optional[str]) -> bool:
+    allowed, _, _ = _peer_idle_decision_for_task(node_id, supervisor, task_id)
     return allowed
 
 
@@ -1046,7 +1067,22 @@ def _notify_supervisor_of_stop(r, node_id: str, supervisor: str) -> None:
         except Exception:
             observed_outcome_struct = None
 
-        active_task = bool(observed_task_id and _peer_idle_allowed_for_task(node_id, supervisor, observed_task_id))
+        peer_idle_allowed_now = False
+        peer_idle_reason = "missing_task_id"
+        if observed_task_id:
+            peer_idle_allowed_now, peer_idle_reason, _ = _peer_idle_decision_for_task(
+                node_id,
+                supervisor,
+                observed_task_id,
+            )
+            if peer_idle_reason == "task_await_blocked_on":
+                log_debug(
+                    node_id,
+                    f"suppressed PEER_IDLE for {node_id}: structured AWAIT blocked_on on {observed_task_id}",
+                )
+                return
+
+        active_task = bool(observed_task_id and peer_idle_allowed_now)
         reported_task = observed_task if active_task else None
         reported_task_id = observed_task_id if active_task else None
         stale_task_reason = None
