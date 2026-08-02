@@ -9,6 +9,7 @@ Delivery is handled automatically by:
 
 Usage:
     taey-notify <target-node> "message"
+    taey-notify <target-node> --body-file /path/to/message.txt
     taey-notify "DEFECT: scoped issue" --type defect
     taey-notify <target-node> "ESCALATION: something broke" --type escalation
     taey-notify <target-node> "cycle done" --type heartbeat --priority low
@@ -52,6 +53,16 @@ def detect_from_node():
 
 
 def resolve_target_and_message(args, from_node, redis_client):
+    if args.body_file is not None:
+        if args.message is not None:
+            print("ERROR: pass either a positional message or --body-file, not both", file=sys.stderr)
+            sys.exit(2)
+        try:
+            with open(args.body_file, encoding="utf-8") as handle:
+                return args.target_or_message, handle.read()
+        except OSError as exc:
+            print(f"ERROR: cannot read --body-file {args.body_file}: {exc}", file=sys.stderr)
+            sys.exit(2)
     if args.message is not None:
         return args.target_or_message, args.message
     if args.type not in DEFAULT_TARGET_TYPES:
@@ -88,6 +99,8 @@ def main():
     parser.add_argument('target_or_message',
                         help='Target node ID, or message body for peer report types')
     parser.add_argument('message', nargs='?', help='Message body')
+    parser.add_argument('--body-file', default=None,
+                        help='Read the message body from a UTF-8 file instead of argv')
     parser.add_argument('--type', '-t', default='message',
                         choices=['message', 'escalation', 'heartbeat', 'notification',
                                  'response_ready', 'command', 'defect', 'task',
