@@ -19,10 +19,10 @@ Turn scattered AI terminals into a supervised tmux fleet: dispatch work to Claud
 > a coordinator. For the main `taey` seat, notify queues the mail and wakes the seat; the seat's own
 > runtime claims the message and makes its model turn through its `:8766` proxy.
 >
-> **Failure mode first:** sent is not received. A successful `taey-notify` means Redis accepted an
-> envelope, not that the target read it, claimed it, acted on it, or reported back. Verify delivery
-> with `taey-ack --node <target> --peek`, handoff receipts, the delivery trace, or the receiver's
-> response before you claim the message landed.
+> **Failure mode first:** sent is not received. A successful `taey-notify` means the target passed
+> the reader-readiness pre-check and Redis accepted an envelope, not that the target finished the
+> work. Verify delivery with `taey-ack --node <target> --peek`, handoff receipts, the delivery trace,
+> or the receiver's response before you claim the message landed.
 
 
 
@@ -191,7 +191,7 @@ is healthy; sustained delivery-progress staleness is the delivery-stall signal.
 Smoke the Redis round trip:
 
 ```bash
-taey-notify session-b "README stranger round-trip" --from session-a
+taey-notify session-b "README stranger round-trip" --from session-a --allow-unregistered-target
 taey-ack --node session-b --peek
 taey-ack --node session-b
 ```
@@ -204,6 +204,14 @@ cc-fleet-notify session-b "same command through the alias"
 taey-notify session-b "production deploy failed" --type escalation
 taey-notify session-b "cycle done" --type heartbeat --priority low
 ```
+
+Normal sends fail loud unless the target passes the three-check reader-readiness
+gate: reader signal exists through tmux or first-class headless/line-reader
+identity; queued mail is zero or visibly draining; and the reader is active,
+explicitly idle with an empty queue, or a headless reader with fresh activity or
+recent drain evidence. Use `--allow-unregistered-target` (alias
+`--allow-readerless-target`) only when you are intentionally pre-provisioning a
+Redis inbox for a later direct reader.
 
 Peer defect/status/result reports may omit the target. In that report path,
 `NOTIFY_TARGET` remains an explicit override; otherwise the sender's parent is

@@ -28,7 +28,17 @@ Or direct Redis, when the CLI is unavailable:
 redis-cli -h 127.0.0.1 LPUSH "${NOTIFY_KEY_PREFIX:-taey}:<session-B>:inbox" '{"from":"<session-A>","type":"message","body":"text","msg_id":"unique-id"}'
 ```
 
-Targets are arbitrary strings. There is no allowlist. A practical fleet might use names such as `<session-A>`, `<session-B>`, `docs-agent`, or `build-worker`.
+Targets are named reader seats. A practical fleet might use names such as `<session-A>`, `<session-B>`, `docs-agent`, or `build-worker`.
+
+The CLI does not treat every string as reachable. A normal send must pass the
+three-check reader-readiness gate before Redis is mutated: the target has a
+reader signal through tmux or first-class headless/line-reader presence; queued
+mail is zero or visibly draining; and the reader is active, explicitly idle with
+an empty queue, or a headless reader with fresh activity or recent drain
+evidence. If the local tmux probe itself is unavailable, known targets
+degrade to warn-and-send rather than blocking the notify channel. A failed check
+exits nonzero and prints the currently eligible targets.
+Use `--allow-unregistered-target` (alias `--allow-readerless-target`) only for intentional pre-provisioning sends.
 
 ## Participant types
 

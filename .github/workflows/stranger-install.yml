@@ -61,7 +61,9 @@ jobs:
 
       - name: README Notify round-trip smoke
         run: |
-          taey-notify stranger-target "README stranger round-trip" --from stranger-sender
+          ! taey-notify stranger-target "readerless send should fail" --from stranger-sender 2>"$RUNNER_TEMP/dead-address.txt"
+          grep -F "failed notify readiness" "$RUNNER_TEMP/dead-address.txt"
+          taey-notify stranger-target "README stranger round-trip" --from stranger-sender --allow-unregistered-target
           taey-ack --node stranger-target --peek | tee "$RUNNER_TEMP/roundtrip.txt"
           grep -F "README stranger round-trip" "$RUNNER_TEMP/roundtrip.txt"
           taey-ack --node stranger-target | tee "$RUNNER_TEMP/drain.txt"
