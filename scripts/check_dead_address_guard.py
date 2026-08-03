@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import time
 import os
+import subprocess
 import sys
 from fnmatch import fnmatch
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 
@@ -35,6 +37,9 @@ class FakeRedis:
             raise value
         return int(value)
 
+    def exists(self, key: str) -> int:
+        return int(key in self._values or key in self._lengths)
+
     def xrevrange(self, key: str, start: str, end: str, count: int = 2000):
         del start, end, count
         if key != "taey:notify_trace":
@@ -58,6 +63,14 @@ def main() -> int:
             "check:stale-seat:last_activity": str(now - 86400),
             "check:depth-error:last_activity": str(now),
             "check:activity-error:last_activity": RuntimeError("simulated GET failure"),
+            "check:taey:last_activity": str(now),
+            "check:stale-idle:last_activity": str(now - 86400),
+            "check:stale-idle:idle": "1",
+            "check:stale-idle:turns_open": "0",
+            "check:taey-council-1:last_activity": str(now - 86400),
+            "check:taey-council-1:idle": "1",
+            "check:taey-council-1:turns_open": "0",
+            "check:taey-council-1:seat_registration": "{}",
         },
         lengths={
             "check:draining-seat:inbox": 3,
@@ -96,7 +109,7 @@ def main() -> int:
         tmux_sessions=set(),
         registered_sessions={"registered-worker"},
     )
-    _check("registered name without tmux fails check 1", not ok and "check 1 failed" in error, error)
+    _check("registered name without reader evidence fails check 3", not ok and "check 3 failed" in error, error)
 
     ok, error = validate_target_reader(
         redis_client,
@@ -132,6 +145,46 @@ def main() -> int:
         not ok and "check 3 failed" in error and "simulated GET failure" in error,
         error,
     )
+
+    ok, _ = validate_target_reader(
+        redis_client,
+        "taey",
+        "check",
+        tmux_sessions=set(),
+        registered_sessions={"taey"},
+    )
+    _check("registered headless taey passes without tmux", ok, "taey")
+
+    ok, _ = validate_target_reader(
+        redis_client,
+        "taey-council-1",
+        "check",
+        tmux_sessions=set(),
+        registered_sessions=set(),
+    )
+    _check("canonical council line reader passes without tmux", ok, "taey-council-1")
+
+    ok, _ = validate_target_reader(
+        redis_client,
+        "stale-idle",
+        "check",
+        tmux_sessions={"stale-idle"},
+        registered_sessions=set(),
+    )
+    _check("idle drained reader passes despite stale last_activity", ok, "stale-idle")
+
+    with patch(
+        "notifications.targets.subprocess.run",
+        side_effect=subprocess.TimeoutExpired(["tmux", "list-sessions"], timeout=2),
+    ):
+        ok, _ = validate_target_reader(
+            redis_client,
+            "registered-timeout",
+            "check",
+            tmux_sessions=None,
+            registered_sessions={"registered-timeout"},
+        )
+    _check("registered target passes when local tmux probe is unknown", ok, "registered-timeout")
 
     ok, _ = validate_target_reader(
         redis_client,

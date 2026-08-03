@@ -206,8 +206,10 @@ taey-notify session-b "cycle done" --type heartbeat --priority low
 ```
 
 Normal sends fail loud unless the target passes the three-check reader-readiness
-gate: `tmux has-session`, queue depth is zero or visibly draining, and
-`last_activity` is recent. Use `--allow-unregistered-target` (alias
+gate: reader signal exists through tmux or first-class headless/line-reader
+presence; queued tmux mail is zero or visibly draining while first-class
+headless presence is itself the queue-consumer signal; and the reader is active,
+explicitly idle, or headless-present. Use `--allow-unregistered-target` (alias
 `--allow-readerless-target`) only when you are intentionally pre-provisioning a
 Redis inbox for a later direct reader.
 

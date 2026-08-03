@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import time
 import urllib.parse
@@ -11,6 +12,8 @@ from typing import Any, Optional
 
 PEER_SUFFIXES = ("-codex", "-gemini", "-grok")
 READER_DRAIN_MARKER_SUFFIXES = ("last_drain_at", "last_read_at")
+READER_STATE_SUFFIXES = ("last_activity", "idle", "turns_open", "seat_registration")
+TAEY_LINE_READER_RE = re.compile(r"^taey(?:-council-[1-7])?$")
 
 
 class TargetReadinessError(RuntimeError):
@@ -73,8 +76,8 @@ def default_notify_target(
     return None
 
 
-def get_local_tmux_sessions() -> set[str]:
-    """Return local tmux session names, or an empty set when tmux is unavailable."""
+def _local_tmux_sessions_probe() -> tuple[set[str], Optional[str]]:
+    """Return local tmux session names plus a probe error, if tmux is unknown."""
     try:
         result = subprocess.run(
             ["tmux", "list-sessions", "-F", "#{session_name}"],
@@ -82,11 +85,18 @@ def get_local_tmux_sessions() -> set[str]:
             text=True,
             timeout=2,
         )
-    except Exception:
-        return set()
+    except Exception as exc:
+        return set(), f"{type(exc).__name__}: {exc}"
     if result.returncode != 0:
-        return set()
-    return {line.strip() for line in result.stdout.splitlines() if line.strip()}
+        detail = (result.stderr or result.stdout or "").strip()
+        return set(), f"tmux list-sessions exited {result.returncode}: {detail}"
+    return {line.strip() for line in result.stdout.splitlines() if line.strip()}, None
+
+
+def get_local_tmux_sessions() -> set[str]:
+    """Return local tmux session names, or an empty set when tmux is unavailable."""
+    sessions, _probe_error = _local_tmux_sessions_probe()
+    return sessions
 
 
 def registered_session_targets(api_base: Optional[str] = None, timeout: Optional[float] = None) -> set[str]:
@@ -142,6 +152,13 @@ def _float_or_none(raw) -> Optional[float]:
         return None
 
 
+def _int_or_none(raw) -> Optional[int]:
+    try:
+        return int(_decode(raw))
+    except (TypeError, ValueError):
+        return None
+
+
 def _reader_liveness_window() -> float:
     raw = os.environ.get("CF_NOTIFY_LAST_ACTIVITY_MAX_AGE_SECS")
     if raw is None:
@@ -182,6 +199,41 @@ def inbox_depth(redis_client, prefix: str, node_id: str) -> int:
         raise TargetReadinessError(
             f"cannot read {prefix}:{node_id}:inbox depth: {exc}"
         ) from exc
+
+
+def _redis_key_exists(redis_client, key: str) -> bool:
+    try:
+        return bool(redis_client.exists(key))
+    except Exception as exc:
+        raise TargetReadinessError(f"cannot read {key} existence: {exc}") from exc
+
+
+def _turns_open(redis_client, prefix: str, node_id: str) -> Optional[int]:
+    key = _state_key(prefix, node_id, "turns_open")
+    try:
+        raw = redis_client.get(key)
+    except Exception as exc:
+        raise TargetReadinessError(f"cannot read {key}: {exc}") from exc
+    if raw in (None, "", b""):
+        return None
+    value = _int_or_none(raw)
+    if value is None:
+        raise TargetReadinessError(f"cannot parse {key}: {_decode(raw)!r}")
+    return value
+
+
+def _is_taey_line_reader(node_id: str) -> bool:
+    return bool(TAEY_LINE_READER_RE.fullmatch(str(node_id or "").strip()))
+
+
+def _state_signal_targets(redis_client, prefix: str) -> set[str]:
+    targets: set[str] = set()
+    for suffix in READER_STATE_SUFFIXES:
+        for key in _redis_scan(redis_client, f"{prefix}:*:{suffix}"):
+            node_id = _node_from_state_key(prefix, key, suffix)
+            if node_id:
+                targets.add(node_id)
+    return targets
 
 
 def recent_drain_marker_targets(redis_client, prefix: str, now: float, max_age: float) -> set[str]:
@@ -239,13 +291,24 @@ def target_liveness_snapshot(
     """Collect send-eligible reader targets and failure diagnostics."""
     now = time.time()
     max_age = _reader_liveness_window()
-    tmux = set(tmux_sessions if tmux_sessions is not None else get_local_tmux_sessions())
+    tmux_probe_error: Optional[str] = None
+    if tmux_sessions is None:
+        tmux, tmux_probe_error = _local_tmux_sessions_probe()
+    else:
+        tmux = set(tmux_sessions)
     registered = set(
         registered_sessions if registered_sessions is not None else registered_session_targets()
     )
     draining = recent_drain_marker_targets(redis_client, prefix, now, max_age)
     draining.update(recent_trace_drain_targets(redis_client, prefix, now, max_age))
+    state_signal = _state_signal_targets(redis_client, prefix)
+    taey_line_readers = {"taey", *(f"taey-council-{idx}" for idx in range(1, 8))}
+    candidates = tmux | registered | state_signal | taey_line_readers
     reader: set[str] = set()
+    headless_reader: set[str] = set()
+    idle_ready: set[str] = set()
+    probe_unknown_allowed: set[str] = set()
+    missing_reader_signal: set[str] = set()
     queued_not_draining: set[str] = set()
     unreadable_inbox: set[str] = set()
     stale_activity: set[str] = set()
@@ -253,7 +316,13 @@ def target_liveness_snapshot(
     depth_errors: dict[str, str] = {}
     activity_ages: dict[str, float | None] = {}
     activity_errors: dict[str, str] = {}
-    for node_id in tmux:
+    state_errors: dict[str, str] = {}
+    turns_open_by_target: dict[str, int | None] = {}
+    for node_id in candidates:
+        has_tmux_session = node_id in tmux
+        registered_target = node_id in registered
+        has_state_signal = node_id in state_signal
+        is_taey_line_reader = _is_taey_line_reader(node_id)
         try:
             depth = inbox_depth(redis_client, prefix, node_id)
         except TargetReadinessError as exc:
@@ -261,9 +330,19 @@ def target_liveness_snapshot(
             depth_errors[node_id] = str(exc)
             continue
         inbox_depths[node_id] = depth
-        if depth > 0 and node_id not in draining:
-            queued_not_draining.add(node_id)
+        try:
+            idle_flag = _redis_key_exists(redis_client, _state_key(prefix, node_id, "idle"))
+            seat_registered = _redis_key_exists(redis_client, _state_key(prefix, node_id, "seat_registration"))
+            turns_open = _turns_open(redis_client, prefix, node_id)
+        except TargetReadinessError as exc:
+            stale_activity.add(node_id)
+            state_errors[node_id] = str(exc)
             continue
+        turns_open_by_target[node_id] = turns_open
+        idle_drained = idle_flag and depth == 0 and (turns_open is None or turns_open == 0)
+        idle_at_rest = idle_flag and (turns_open is None or turns_open == 0)
+        if idle_drained:
+            idle_ready.add(node_id)
         try:
             age = _last_activity_age(redis_client, prefix, node_id, now)
         except TargetReadinessError as exc:
@@ -271,14 +350,44 @@ def target_liveness_snapshot(
             activity_errors[node_id] = str(exc)
             continue
         activity_ages[node_id] = age
+        fresh_activity = age is not None and 0 <= age <= max_age
+        headless_identity = (
+            not has_tmux_session
+            and (registered_target or is_taey_line_reader or seat_registered)
+        )
+        headless_ready = (
+            headless_identity
+            and (fresh_activity or idle_at_rest or (seat_registered and turns_open == 0))
+        )
+        if depth > 0 and node_id not in draining and not headless_ready:
+            queued_not_draining.add(node_id)
+            continue
+        if not has_tmux_session and headless_ready:
+            headless_reader.add(node_id)
+        if has_tmux_session or headless_ready:
+            if fresh_activity or idle_drained or headless_ready:
+                reader.add(node_id)
+                continue
+        if tmux_probe_error and (registered_target or has_state_signal or is_taey_line_reader):
+            probe_unknown_allowed.add(node_id)
+            reader.add(node_id)
+            continue
+        if not (has_tmux_session or registered_target or is_taey_line_reader or seat_registered or has_state_signal):
+            missing_reader_signal.add(node_id)
+            continue
         if age is None or age < 0 or age > max_age:
             stale_activity.add(node_id)
             continue
-        reader.add(node_id)
     return {
         "reader": reader,
         "tmux": tmux,
         "registered": registered,
+        "state_signal": state_signal,
+        "headless_reader": headless_reader,
+        "idle_ready": idle_ready,
+        "probe_unknown_allowed": probe_unknown_allowed,
+        "missing_reader_signal": missing_reader_signal,
+        "tmux_probe_error": tmux_probe_error,
         "draining": draining,
         "queued_not_draining": queued_not_draining,
         "unreadable_inbox": unreadable_inbox,
@@ -287,6 +396,8 @@ def target_liveness_snapshot(
         "depth_errors": depth_errors,
         "activity_ages": activity_ages,
         "activity_errors": activity_errors,
+        "state_errors": state_errors,
+        "turns_open": turns_open_by_target,
     }
 
 
@@ -314,36 +425,63 @@ def format_target_liveness_failure(
     max_age = _reader_liveness_window()
     depth_errors = snapshot.get("depth_errors", {})
     activity_errors = snapshot.get("activity_errors", {})
+    state_errors = snapshot.get("state_errors", {})
     inbox_depths = snapshot.get("inbox_depths", {})
     activity_ages = snapshot.get("activity_ages", {})
+    turns_open_by_target = snapshot.get("turns_open", {})
     depth_error = depth_errors.get(node_id, "") if isinstance(depth_errors, dict) else ""
     activity_error = activity_errors.get(node_id, "") if isinstance(activity_errors, dict) else ""
+    state_error = state_errors.get(node_id, "") if isinstance(state_errors, dict) else ""
     depth = inbox_depths.get(node_id, "unreadable" if depth_error else "not_checked") if isinstance(inbox_depths, dict) else "not_checked"
     activity_age = activity_ages.get(node_id, None) if isinstance(activity_ages, dict) else None
+    turns_open = turns_open_by_target.get(node_id, "missing") if isinstance(turns_open_by_target, dict) else "missing"
     draining = node_id in snapshot.get("draining", set())
     has_session = node_id in snapshot.get("tmux", set())
-    if not has_session:
-        reason = "check 1 failed: tmux has-session is false"
+    has_headless = node_id in snapshot.get("headless_reader", set())
+    idle_ready = node_id in snapshot.get("idle_ready", set())
+    probe_unknown = node_id in snapshot.get("probe_unknown_allowed", set())
+    registered = node_id in snapshot.get("registered", set())
+    state_signal = node_id in snapshot.get("state_signal", set())
+    tmux_probe_error = snapshot.get("tmux_probe_error")
+    has_reader_signal = (
+        has_session
+        or has_headless
+        or idle_ready
+        or registered
+        or state_signal
+        or _is_taey_line_reader(node_id)
+        or probe_unknown
+    )
+    if not has_reader_signal:
+        reason = "check 1 failed: no tmux/headless reader signal"
+        if tmux_probe_error:
+            reason += f"; local tmux probe unavailable ({tmux_probe_error})"
     elif depth_error:
         reason = f"check 2 failed: inbox depth unreadable ({depth_error})"
     elif isinstance(depth, int) and depth > 0 and not draining:
         reason = "check 2 failed: inbox is non-empty and not visibly draining"
     elif activity_error:
         reason = f"check 3 failed: last_activity unreadable ({activity_error})"
+    elif state_error:
+        reason = f"check 3 failed: reader state unreadable ({state_error})"
     else:
-        reason = "check 3 failed: last_activity is missing, stale, or from the future"
+        reason = "check 3 failed: no fresh activity, idle-drained state, or headless presence"
     return "\n".join([
         f"ERROR: target '{target}' failed notify readiness; refusing to enqueue.",
         f"Reason: {reason}.",
-        "Required checks: (1) tmux session exists; (2) inbox depth is 0 or visibly draining; (3) last_activity is recent.",
-        f"Target state: has_session={has_session} inbox_depth={depth} draining={draining} last_activity_age_seconds={activity_age if activity_age is not None else 'missing'} max_age_seconds={max_age:g}",
+        "Required checks: (1) reader signal exists via tmux or first-class headless presence; (2) queued tmux mail is 0 or visibly draining, while headless presence is the queue-consumer signal; (3) reader is active, explicitly idle, or headless-present.",
+        f"Target state: has_tmux={has_session} headless={has_headless} registered={registered} state_signal={state_signal} inbox_depth={depth} draining={draining} idle_ready={idle_ready} turns_open={turns_open} last_activity_age_seconds={activity_age if activity_age is not None else 'missing'} max_age_seconds={max_age:g}",
         "Live targets observed:",
         f"  eligible: {_format_targets(snapshot.get('reader', set()), limit)}",
         f"  tmux_sessions: {_format_targets(snapshot.get('tmux', set()), limit)}",
+        f"  headless_reader: {_format_targets(snapshot.get('headless_reader', set()), limit)}",
+        f"  idle_ready: {_format_targets(snapshot.get('idle_ready', set()), limit)}",
+        f"  probe_unknown_allowed: {_format_targets(snapshot.get('probe_unknown_allowed', set()), limit)}",
         f"  queued_not_draining: {_format_targets(snapshot.get('queued_not_draining', set()), limit)}",
         f"  unreadable_inbox: {_format_targets(snapshot.get('unreadable_inbox', set()), limit)}",
         f"  stale_activity: {_format_targets(snapshot.get('stale_activity', set()), limit)}",
         f"  registered_diagnostic: {_format_targets(snapshot.get('registered', set()), limit)}",
+        f"  tmux_probe_error: {tmux_probe_error or '(none)'}",
         "Use --allow-unregistered-target only for intentional pre-provisioning sends.",
     ])
 
