@@ -12,7 +12,7 @@ from notifications.targets import validate_target_reader
 
 
 class FakeRedis:
-    def __init__(self, values: dict[str, str], lengths: dict[str, int], trace_entries: list[tuple[str, dict[str, str]]]):
+    def __init__(self, values: dict[str, object], lengths: dict[str, object], trace_entries: list[tuple[str, dict[str, str]]]):
         self._values = dict(values)
         self._lengths = dict(lengths)
         self._trace_entries = list(trace_entries)
@@ -23,11 +23,17 @@ class FakeRedis:
             if fnmatch(key, match):
                 yield key
 
-    def get(self, key: str) -> str | None:
-        return self._values.get(key)
+    def get(self, key: str) -> object | None:
+        value = self._values.get(key)
+        if isinstance(value, Exception):
+            raise value
+        return value
 
     def llen(self, key: str) -> int:
-        return self._lengths.get(key, 0)
+        value = self._lengths.get(key, 0)
+        if isinstance(value, Exception):
+            raise value
+        return int(value)
 
     def xrevrange(self, key: str, start: str, end: str, count: int = 2000):
         del start, end, count
@@ -50,10 +56,13 @@ def main() -> int:
             "check:draining-seat:last_activity": str(now),
             "check:blocked-gemini:last_activity": str(now),
             "check:stale-seat:last_activity": str(now - 86400),
+            "check:depth-error:last_activity": str(now),
+            "check:activity-error:last_activity": RuntimeError("simulated GET failure"),
         },
         lengths={
             "check:draining-seat:inbox": 3,
             "check:blocked-gemini:inbox": 7,
+            "check:depth-error:inbox": RuntimeError("simulated LLEN failure"),
         },
         trace_entries=[
             ("1-0", {"ev": "drain", "node": "draining-seat", "wall": str(now)}),
@@ -97,6 +106,32 @@ def main() -> int:
         registered_sessions=set(),
     )
     _check("stale session fails check 3", not ok and "check 3 failed" in error, error)
+
+    ok, error = validate_target_reader(
+        redis_client,
+        "depth-error",
+        "check",
+        tmux_sessions={"depth-error"},
+        registered_sessions=set(),
+    )
+    _check(
+        "unreadable inbox depth fails check 2",
+        not ok and "check 2 failed" in error and "simulated LLEN failure" in error,
+        error,
+    )
+
+    ok, error = validate_target_reader(
+        redis_client,
+        "activity-error",
+        "check",
+        tmux_sessions={"activity-error"},
+        registered_sessions=set(),
+    )
+    _check(
+        "unreadable last_activity fails check 3",
+        not ok and "check 3 failed" in error and "simulated GET failure" in error,
+        error,
+    )
 
     ok, _ = validate_target_reader(
         redis_client,

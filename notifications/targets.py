@@ -6,11 +6,15 @@ import subprocess
 import time
 import urllib.parse
 import urllib.request
-from typing import Optional
+from typing import Any, Optional
 
 
 PEER_SUFFIXES = ("-codex", "-gemini", "-grok")
 READER_DRAIN_MARKER_SUFFIXES = ("last_drain_at", "last_read_at")
+
+
+class TargetReadinessError(RuntimeError):
+    """Raised when a target readiness signal cannot be measured."""
 
 
 def _decode(raw) -> str:
@@ -174,8 +178,10 @@ def _queue_key(prefix: str, node_id: str, suffix: str) -> str:
 def inbox_depth(redis_client, prefix: str, node_id: str) -> int:
     try:
         return int(redis_client.llen(_queue_key(prefix, node_id, "inbox")) or 0)
-    except Exception:
-        return 0
+    except Exception as exc:
+        raise TargetReadinessError(
+            f"cannot read {prefix}:{node_id}:inbox depth: {exc}"
+        ) from exc
 
 
 def recent_drain_marker_targets(redis_client, prefix: str, now: float, max_age: float) -> set[str]:
@@ -214,8 +220,10 @@ def reader_live_targets(redis_client, prefix: str) -> set[str]:
 def _last_activity_age(redis_client, prefix: str, node_id: str, now: float) -> Optional[float]:
     try:
         timestamp = _float_or_none(redis_client.get(_state_key(prefix, node_id, "last_activity")))
-    except Exception:
-        timestamp = None
+    except Exception as exc:
+        raise TargetReadinessError(
+            f"cannot read {prefix}:{node_id}:last_activity: {exc}"
+        ) from exc
     if timestamp is None:
         return None
     return now - timestamp
@@ -227,7 +235,7 @@ def target_liveness_snapshot(
     *,
     tmux_sessions: Optional[set[str]] = None,
     registered_sessions: Optional[set[str]] = None,
-) -> dict[str, set[str]]:
+) -> dict[str, Any]:
     """Collect send-eligible reader targets and failure diagnostics."""
     now = time.time()
     max_age = _reader_liveness_window()
@@ -239,13 +247,30 @@ def target_liveness_snapshot(
     draining.update(recent_trace_drain_targets(redis_client, prefix, now, max_age))
     reader: set[str] = set()
     queued_not_draining: set[str] = set()
+    unreadable_inbox: set[str] = set()
     stale_activity: set[str] = set()
+    inbox_depths: dict[str, int] = {}
+    depth_errors: dict[str, str] = {}
+    activity_ages: dict[str, float | None] = {}
+    activity_errors: dict[str, str] = {}
     for node_id in tmux:
-        depth = inbox_depth(redis_client, prefix, node_id)
+        try:
+            depth = inbox_depth(redis_client, prefix, node_id)
+        except TargetReadinessError as exc:
+            unreadable_inbox.add(node_id)
+            depth_errors[node_id] = str(exc)
+            continue
+        inbox_depths[node_id] = depth
         if depth > 0 and node_id not in draining:
             queued_not_draining.add(node_id)
             continue
-        age = _last_activity_age(redis_client, prefix, node_id, now)
+        try:
+            age = _last_activity_age(redis_client, prefix, node_id, now)
+        except TargetReadinessError as exc:
+            stale_activity.add(node_id)
+            activity_errors[node_id] = str(exc)
+            continue
+        activity_ages[node_id] = age
         if age is None or age < 0 or age > max_age:
             stale_activity.add(node_id)
             continue
@@ -254,12 +279,18 @@ def target_liveness_snapshot(
         "reader": reader,
         "tmux": tmux,
         "registered": registered,
+        "draining": draining,
         "queued_not_draining": queued_not_draining,
+        "unreadable_inbox": unreadable_inbox,
         "stale_activity": stale_activity,
+        "inbox_depths": inbox_depths,
+        "depth_errors": depth_errors,
+        "activity_ages": activity_ages,
+        "activity_errors": activity_errors,
     }
 
 
-def target_has_reader(snapshot: dict[str, set[str]], target: str) -> bool:
+def target_has_reader(snapshot: dict[str, Any], target: str) -> bool:
     node_id = str(target or "").strip()
     return node_id in snapshot.get("reader", set())
 
@@ -275,25 +306,30 @@ def _format_targets(values: set[str], limit: int) -> str:
 
 def format_target_liveness_failure(
     target: str,
-    snapshot: dict[str, set[str]],
+    snapshot: dict[str, Any],
     *,
-    redis_client=None,
-    prefix: str = "taey",
     limit: int = 80,
 ) -> str:
     node_id = str(target or "").strip()
-    now = time.time()
     max_age = _reader_liveness_window()
-    depth = inbox_depth(redis_client, prefix, node_id) if redis_client is not None else -1
-    activity_age = _last_activity_age(redis_client, prefix, node_id, now) if redis_client is not None else None
-    draining = node_id in recent_drain_marker_targets(redis_client, prefix, now, max_age) if redis_client is not None else False
-    if redis_client is not None:
-        draining = draining or node_id in recent_trace_drain_targets(redis_client, prefix, now, max_age)
+    depth_errors = snapshot.get("depth_errors", {})
+    activity_errors = snapshot.get("activity_errors", {})
+    inbox_depths = snapshot.get("inbox_depths", {})
+    activity_ages = snapshot.get("activity_ages", {})
+    depth_error = depth_errors.get(node_id, "") if isinstance(depth_errors, dict) else ""
+    activity_error = activity_errors.get(node_id, "") if isinstance(activity_errors, dict) else ""
+    depth = inbox_depths.get(node_id, "unreadable" if depth_error else "not_checked") if isinstance(inbox_depths, dict) else "not_checked"
+    activity_age = activity_ages.get(node_id, None) if isinstance(activity_ages, dict) else None
+    draining = node_id in snapshot.get("draining", set())
     has_session = node_id in snapshot.get("tmux", set())
     if not has_session:
         reason = "check 1 failed: tmux has-session is false"
-    elif depth > 0 and not draining:
+    elif depth_error:
+        reason = f"check 2 failed: inbox depth unreadable ({depth_error})"
+    elif isinstance(depth, int) and depth > 0 and not draining:
         reason = "check 2 failed: inbox is non-empty and not visibly draining"
+    elif activity_error:
+        reason = f"check 3 failed: last_activity unreadable ({activity_error})"
     else:
         reason = "check 3 failed: last_activity is missing, stale, or from the future"
     return "\n".join([
@@ -305,6 +341,7 @@ def format_target_liveness_failure(
         f"  eligible: {_format_targets(snapshot.get('reader', set()), limit)}",
         f"  tmux_sessions: {_format_targets(snapshot.get('tmux', set()), limit)}",
         f"  queued_not_draining: {_format_targets(snapshot.get('queued_not_draining', set()), limit)}",
+        f"  unreadable_inbox: {_format_targets(snapshot.get('unreadable_inbox', set()), limit)}",
         f"  stale_activity: {_format_targets(snapshot.get('stale_activity', set()), limit)}",
         f"  registered_diagnostic: {_format_targets(snapshot.get('registered', set()), limit)}",
         "Use --allow-unregistered-target only for intentional pre-provisioning sends.",
@@ -319,17 +356,19 @@ def validate_target_reader(
     tmux_sessions: Optional[set[str]] = None,
     registered_sessions: Optional[set[str]] = None,
 ) -> tuple[bool, str]:
-    snapshot = target_liveness_snapshot(
-        redis_client,
-        prefix,
-        tmux_sessions=tmux_sessions,
-        registered_sessions=registered_sessions,
-    )
+    try:
+        snapshot = target_liveness_snapshot(
+            redis_client,
+            prefix,
+            tmux_sessions=tmux_sessions,
+            registered_sessions=registered_sessions,
+        )
+    except Exception as exc:
+        return False, "\n".join([
+            f"ERROR: target '{target}' failed notify readiness; refusing to enqueue.",
+            f"Reason: readiness check failed closed: {exc}.",
+            "Use --allow-unregistered-target only for intentional pre-provisioning sends.",
+        ])
     if target_has_reader(snapshot, target):
         return True, ""
-    return False, format_target_liveness_failure(
-        target,
-        snapshot,
-        redis_client=redis_client,
-        prefix=prefix,
-    )
+    return False, format_target_liveness_failure(target, snapshot)
