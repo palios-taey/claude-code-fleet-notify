@@ -71,11 +71,22 @@ def main() -> int:
             "check:taey-council-1:idle": "1",
             "check:taey-council-1:turns_open": "0",
             "check:taey-council-1:seat_registration": "{}",
+            "check:taey-council-1:last_drain_at": str(now),
+            "check:dead-headless:last_activity": str(now - 86400),
+            "check:dead-headless:turns_open": "0",
+            "check:dead-headless:seat_registration": "{}",
+            "check:seat-only:turns_open": "0",
+            "check:seat-only:seat_registration": "{}",
+            "check:idle-piling:last_activity": str(now - 86400),
+            "check:idle-piling:idle": "1",
+            "check:idle-piling:turns_open": "0",
         },
         lengths={
             "check:draining-seat:inbox": 3,
             "check:blocked-gemini:inbox": 7,
             "check:depth-error:inbox": RuntimeError("simulated LLEN failure"),
+            "check:dead-headless:inbox": 4,
+            "check:idle-piling:inbox": 5,
         },
         trace_entries=[
             ("1-0", {"ev": "drain", "node": "draining-seat", "wall": str(now)}),
@@ -203,6 +214,46 @@ def main() -> int:
         registered_sessions=set(),
     )
     _check("non-empty but visibly draining reader passes", ok, "draining-seat")
+
+    ok, error = validate_target_reader(
+        redis_client,
+        "dead-headless",
+        "check",
+        tmux_sessions=set(),
+        registered_sessions=set(),
+    )
+    _check("dead headless with piling inbox fails", not ok and "check 2 failed" in error, error)
+
+    ok, error = validate_target_reader(
+        redis_client,
+        "seat-only",
+        "check",
+        tmux_sessions=set(),
+        registered_sessions=set(),
+    )
+    _check("seat registration without fresh drain evidence fails", not ok and "check 3 failed" in error, error)
+
+    ok, error = validate_target_reader(
+        redis_client,
+        "idle-piling",
+        "check",
+        tmux_sessions=set(),
+        registered_sessions={"idle-piling"},
+    )
+    _check("idle registered seat with piling inbox fails", not ok and "check 2 failed" in error, error)
+
+    with patch(
+        "notifications.targets.subprocess.run",
+        side_effect=subprocess.TimeoutExpired(["tmux", "list-sessions"], timeout=2),
+    ):
+        ok, error = validate_target_reader(
+            redis_client,
+            "nonexistent-timeout",
+            "check",
+            tmux_sessions=None,
+            registered_sessions={"registered-timeout"},
+        )
+    _check("nonexistent target fails check 1 when tmux probe is unknown", not ok and "check 1 failed" in error, error)
     return 0
 
 

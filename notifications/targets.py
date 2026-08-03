@@ -339,8 +339,8 @@ def target_liveness_snapshot(
             state_errors[node_id] = str(exc)
             continue
         turns_open_by_target[node_id] = turns_open
+        queue_drained_or_draining = depth == 0 or node_id in draining
         idle_drained = idle_flag and depth == 0 and (turns_open is None or turns_open == 0)
-        idle_at_rest = idle_flag and (turns_open is None or turns_open == 0)
         if idle_drained:
             idle_ready.add(node_id)
         try:
@@ -357,7 +357,8 @@ def target_liveness_snapshot(
         )
         headless_ready = (
             headless_identity
-            and (fresh_activity or idle_at_rest or (seat_registered and turns_open == 0))
+            and queue_drained_or_draining
+            and (fresh_activity or node_id in draining)
         )
         if depth > 0 and node_id not in draining and not headless_ready:
             queued_not_draining.add(node_id)
@@ -465,7 +466,7 @@ def format_target_liveness_failure(
     elif state_error:
         reason = f"check 3 failed: reader state unreadable ({state_error})"
     else:
-        reason = "check 3 failed: no fresh activity, idle-drained state, or headless presence"
+        reason = "check 3 failed: no fresh activity, idle-drained state, or headless fresh/drain evidence"
     return "\n".join([
         f"ERROR: target '{target}' failed notify readiness; refusing to enqueue.",
         f"Reason: {reason}.",
