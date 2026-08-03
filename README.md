@@ -239,17 +239,10 @@ ${NOTIFY_KEY_PREFIX:-taey}:SESSION:tool_running
 ${NOTIFY_KEY_PREFIX:-taey}:SESSION:tool_running_at
 ```
 
-## Testing
+## Syntax Check
 
 ```bash
-python3 -m py_compile identity.py notifications/*.py hooks/*.py tests/*.py
-python3 -m unittest discover -s tests
-```
-
-or:
-
-```bash
-make test
+make syntax
 ```
 
 ## License
