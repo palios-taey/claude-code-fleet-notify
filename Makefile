@@ -66,4 +66,5 @@ daemon-status:
 syntax:
 	@echo "Syntax check..."
 	@python3 -m py_compile identity.py notifications/*.py hooks/*.py scripts/_stage_b_api.py scripts/taey-*
+	@python3 scripts/check_dead_address_guard.py
 	@bash -n scripts/start_notify_daemons.sh scripts/tmux-send scripts/install-hooks.sh scripts/atomic_deploy.sh

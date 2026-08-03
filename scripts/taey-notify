@@ -123,6 +123,9 @@ def main():
                         help='JSON object written into the explicit handoff record')
     parser.add_argument('--ack-deadline-secs', type=int, default=300,
                         help='Long safety backstop in seconds for explicit handoffs; short pickup window comes from CF_HANDOFF_PICKUP_POLL_BUDGET (default: 300)')
+    parser.add_argument('--allow-unregistered-target', '--allow-readerless-target',
+                        dest='allow_unregistered_target', action='store_true',
+                        help='Explicitly allow enqueueing to a target that fails the reader-liveness pre-check')
     args = parser.parse_args()
 
     from_node = args.from_node or detect_from_node()
@@ -148,6 +151,13 @@ def main():
               file=sys.stderr)
         sys.exit(1)
     target, message = resolve_target_and_message(args, from_node, r)
+    if not args.allow_unregistered_target:
+        from notifications.targets import validate_target_reader
+
+        allowed, reason = validate_target_reader(r, target, args.key_prefix)
+        if not allowed:
+            print(reason, file=sys.stderr)
+            sys.exit(1)
     if args.handoff:
         from notifications.handoff import create_explicit_handoff
 

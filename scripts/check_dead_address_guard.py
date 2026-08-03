@@ -1,0 +1,122 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import time
+import os
+import sys
+from fnmatch import fnmatch
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+
+from notifications.targets import validate_target_reader
+
+
+class FakeRedis:
+    def __init__(self, values: dict[str, str], lengths: dict[str, int], trace_entries: list[tuple[str, dict[str, str]]]):
+        self._values = dict(values)
+        self._lengths = dict(lengths)
+        self._trace_entries = list(trace_entries)
+
+    def scan_iter(self, match: str, count: int = 1000):
+        del count
+        for key in sorted(self._values):
+            if fnmatch(key, match):
+                yield key
+
+    def get(self, key: str) -> str | None:
+        return self._values.get(key)
+
+    def llen(self, key: str) -> int:
+        return self._lengths.get(key, 0)
+
+    def xrevrange(self, key: str, start: str, end: str, count: int = 2000):
+        del start, end, count
+        if key != "taey:notify_trace":
+            return []
+        return list(self._trace_entries)
+
+
+def _check(name: str, condition: bool, detail: object) -> None:
+    if not condition:
+        raise SystemExit(f"FAIL: {name}: {detail}")
+    print(f"PASS: {name}")
+
+
+def main() -> int:
+    now = time.time()
+    redis_client = FakeRedis(
+        values={
+            "check:live-empty:last_activity": str(now),
+            "check:draining-seat:last_activity": str(now),
+            "check:blocked-gemini:last_activity": str(now),
+            "check:stale-seat:last_activity": str(now - 86400),
+        },
+        lengths={
+            "check:draining-seat:inbox": 3,
+            "check:blocked-gemini:inbox": 7,
+        },
+        trace_entries=[
+            ("1-0", {"ev": "drain", "node": "draining-seat", "wall": str(now)}),
+        ],
+    )
+
+    ok, error = validate_target_reader(
+        redis_client,
+        "codex-1",
+        "check",
+        tmux_sessions={"live-empty", "draining-seat", "blocked-gemini", "stale-seat"},
+        registered_sessions={"registered-worker"},
+    )
+    _check("nonexistent target fails check 1", not ok and "check 1 failed" in error, error)
+    _check("failure names missing target", "codex-1" in error, error)
+    _check("failure includes live target list", "Live targets observed:" in error, error)
+
+    ok, error = validate_target_reader(
+        redis_client,
+        "blocked-gemini",
+        "check",
+        tmux_sessions={"blocked-gemini"},
+        registered_sessions=set(),
+    )
+    _check("existing readerless backlog fails check 2", not ok and "check 2 failed" in error, error)
+
+    ok, error = validate_target_reader(
+        redis_client,
+        "registered-worker",
+        "check",
+        tmux_sessions=set(),
+        registered_sessions={"registered-worker"},
+    )
+    _check("registered name without tmux fails check 1", not ok and "check 1 failed" in error, error)
+
+    ok, error = validate_target_reader(
+        redis_client,
+        "stale-seat",
+        "check",
+        tmux_sessions={"stale-seat"},
+        registered_sessions=set(),
+    )
+    _check("stale session fails check 3", not ok and "check 3 failed" in error, error)
+
+    ok, _ = validate_target_reader(
+        redis_client,
+        "live-empty",
+        "check",
+        tmux_sessions={"live-empty"},
+        registered_sessions=set(),
+    )
+    _check("live empty reader passes", ok, "live-empty")
+
+    ok, _ = validate_target_reader(
+        redis_client,
+        "draining-seat",
+        "check",
+        tmux_sessions={"draining-seat"},
+        registered_sessions=set(),
+    )
+    _check("non-empty but visibly draining reader passes", ok, "draining-seat")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
