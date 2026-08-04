@@ -416,6 +416,45 @@ def _format_targets(values: set[str], limit: int) -> str:
     return ", ".join(visible) + suffix
 
 
+def _format_target_liveness_remedy(
+    *,
+    has_reader_signal: bool,
+    registered: bool,
+    depth: object,
+    draining: bool,
+    depth_error: str,
+    activity_error: str,
+    state_error: str,
+) -> str:
+    if not has_reader_signal:
+        return (
+            "Remedy: target is not registered and no reader is visible; "
+            "provision/start/register the target, or use --allow-unregistered-target only "
+            "for an intentional pre-provisioning send where policy explicitly permits it."
+        )
+    if depth_error:
+        return (
+            "Remedy: inbox depth could not be measured; retry after readiness measurement "
+            "recovers. Do not use --allow-unregistered-target to bypass an unknown queue state."
+        )
+    if isinstance(depth, int) and depth > 0 and not draining:
+        visibility = "registered" if registered else "visible"
+        return (
+            f"Remedy: target is {visibility} but its inbox is not draining; "
+            "retry in a few seconds. Do not use --allow-unregistered-target to bypass a busy reader."
+        )
+    if activity_error or state_error:
+        return (
+            "Remedy: reader state could not be measured; retry after readiness measurement "
+            "recovers. Do not use --allow-unregistered-target to bypass an unknown reader state."
+        )
+    return (
+        "Remedy: target has a reader signal but no fresh activity, idle-drained state, or "
+        "headless fresh/drain evidence; wait for the reader to become ready or inspect it. "
+        "Do not use --allow-unregistered-target to bypass a stale reader."
+    )
+
+
 def format_target_liveness_failure(
     target: str,
     snapshot: dict[str, Any],
@@ -467,11 +506,21 @@ def format_target_liveness_failure(
         reason = f"check 3 failed: reader state unreadable ({state_error})"
     else:
         reason = "check 3 failed: no fresh activity, idle-drained state, or headless fresh/drain evidence"
+    remedy = _format_target_liveness_remedy(
+        has_reader_signal=has_reader_signal,
+        registered=registered,
+        depth=depth,
+        draining=draining,
+        depth_error=depth_error,
+        activity_error=activity_error,
+        state_error=state_error,
+    )
     return "\n".join([
         f"ERROR: target '{target}' failed notify readiness; refusing to enqueue.",
         f"Reason: {reason}.",
         "Required checks: (1) reader signal exists via tmux or first-class headless presence; (2) queued tmux mail is 0 or visibly draining, while headless presence is the queue-consumer signal; (3) reader is active, explicitly idle, or headless-present.",
         f"Target state: has_tmux={has_session} headless={has_headless} registered={registered} state_signal={state_signal} inbox_depth={depth} draining={draining} idle_ready={idle_ready} turns_open={turns_open} last_activity_age_seconds={activity_age if activity_age is not None else 'missing'} max_age_seconds={max_age:g}",
+        remedy,
         "Live targets observed:",
         f"  eligible: {_format_targets(snapshot.get('reader', set()), limit)}",
         f"  tmux_sessions: {_format_targets(snapshot.get('tmux', set()), limit)}",
@@ -483,7 +532,6 @@ def format_target_liveness_failure(
         f"  stale_activity: {_format_targets(snapshot.get('stale_activity', set()), limit)}",
         f"  registered_diagnostic: {_format_targets(snapshot.get('registered', set()), limit)}",
         f"  tmux_probe_error: {tmux_probe_error or '(none)'}",
-        "Use --allow-unregistered-target only for intentional pre-provisioning sends.",
     ])
 
 
@@ -506,7 +554,7 @@ def validate_target_reader(
         return False, "\n".join([
             f"ERROR: target '{target}' failed notify readiness; refusing to enqueue.",
             f"Reason: readiness check failed closed: {exc}.",
-            "Use --allow-unregistered-target only for intentional pre-provisioning sends.",
+            "Remedy: readiness could not be measured; retry after measurement recovers. Do not use --allow-unregistered-target to bypass an unknown reader state.",
         ])
     if target_has_reader(snapshot, target):
         return True, ""

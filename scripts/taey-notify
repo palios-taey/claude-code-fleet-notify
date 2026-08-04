@@ -125,7 +125,7 @@ def main():
                         help='Long safety backstop in seconds for explicit handoffs; short pickup window comes from CF_HANDOFF_PICKUP_POLL_BUDGET (default: 300)')
     parser.add_argument('--allow-unregistered-target', '--allow-readerless-target',
                         dest='allow_unregistered_target', action='store_true',
-                        help='Explicitly allow enqueueing to a target that fails the reader-liveness pre-check')
+                        help='Explicitly allow an intentional pre-provisioning send to an unregistered/readerless target when policy permits')
     args = parser.parse_args()
 
     from_node = args.from_node or detect_from_node()
