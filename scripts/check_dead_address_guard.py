@@ -103,15 +103,30 @@ def main() -> int:
     _check("nonexistent target fails check 1", not ok and "check 1 failed" in error, error)
     _check("failure names missing target", "codex-1" in error, error)
     _check("failure includes live target list", "Live targets observed:" in error, error)
+    _check(
+        "unregistered target gives provision/register remedy",
+        "Remedy: target is not registered and no reader is visible" in error
+        and "provision/start/register" in error
+        and "where policy explicitly permits it" in error,
+        error,
+    )
 
     ok, error = validate_target_reader(
         redis_client,
         "blocked-gemini",
         "check",
         tmux_sessions={"blocked-gemini"},
-        registered_sessions=set(),
+        registered_sessions={"blocked-gemini"},
     )
     _check("existing readerless backlog fails check 2", not ok and "check 2 failed" in error, error)
+    _check(
+        "registered non-draining target gives retry remedy",
+        "Remedy: target is registered but its inbox is not draining" in error
+        and "retry in a few seconds" in error
+        and "Do not use --allow-unregistered-target to bypass a busy reader" in error
+        and "intentional pre-provisioning" not in error,
+        error,
+    )
 
     ok, error = validate_target_reader(
         redis_client,
@@ -121,6 +136,14 @@ def main() -> int:
         registered_sessions={"registered-worker"},
     )
     _check("registered name without reader evidence fails check 3", not ok and "check 3 failed" in error, error)
+    _check(
+        "registered name without reader evidence gives repair/wait remedy",
+        "Remedy: target is registered but no live reader is visible" in error
+        and "start or repair the reader" in error
+        and "wait until it reports fresh activity" in error
+        and "--allow-unregistered-target" not in error,
+        error,
+    )
 
     ok, error = validate_target_reader(
         redis_client,

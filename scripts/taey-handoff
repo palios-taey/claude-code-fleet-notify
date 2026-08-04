@@ -63,7 +63,7 @@ def main() -> int:
         "--allow-readerless-target",
         dest="allow_unregistered_target",
         action="store_true",
-        help="Explicitly allow enqueueing to a target that fails the reader-liveness pre-check",
+        help="Explicitly allow an intentional pre-provisioning send to an unregistered/readerless target when policy permits",
     )
     args = parser.parse_args()
 
