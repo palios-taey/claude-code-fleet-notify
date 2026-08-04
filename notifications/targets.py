@@ -419,6 +419,7 @@ def _format_targets(values: set[str], limit: int) -> str:
 def _format_target_liveness_remedy(
     *,
     has_reader_signal: bool,
+    has_live_reader_signal: bool,
     registered: bool,
     depth: object,
     draining: bool,
@@ -431,6 +432,12 @@ def _format_target_liveness_remedy(
             "Remedy: target is not registered and no reader is visible; "
             "provision/start/register the target, or use --allow-unregistered-target only "
             "for an intentional pre-provisioning send where policy explicitly permits it."
+        )
+    if registered and not has_live_reader_signal:
+        return (
+            "Remedy: target is registered but no live reader is visible; start or repair "
+            "the reader, or wait until it reports fresh activity, idle-drained state, or "
+            "drain evidence."
         )
     if depth_error:
         return (
@@ -483,14 +490,17 @@ def format_target_liveness_failure(
     registered = node_id in snapshot.get("registered", set())
     state_signal = node_id in snapshot.get("state_signal", set())
     tmux_probe_error = snapshot.get("tmux_probe_error")
-    has_reader_signal = (
+    has_live_reader_signal = (
         has_session
         or has_headless
         or idle_ready
-        or registered
         or state_signal
         or _is_taey_line_reader(node_id)
         or probe_unknown
+    )
+    has_reader_signal = (
+        has_live_reader_signal
+        or registered
     )
     if not has_reader_signal:
         reason = "check 1 failed: no tmux/headless reader signal"
@@ -508,6 +518,7 @@ def format_target_liveness_failure(
         reason = "check 3 failed: no fresh activity, idle-drained state, or headless fresh/drain evidence"
     remedy = _format_target_liveness_remedy(
         has_reader_signal=has_reader_signal,
+        has_live_reader_signal=has_live_reader_signal,
         registered=registered,
         depth=depth,
         draining=draining,

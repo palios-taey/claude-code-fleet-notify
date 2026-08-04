@@ -136,6 +136,14 @@ def main() -> int:
         registered_sessions={"registered-worker"},
     )
     _check("registered name without reader evidence fails check 3", not ok and "check 3 failed" in error, error)
+    _check(
+        "registered name without reader evidence gives repair/wait remedy",
+        "Remedy: target is registered but no live reader is visible" in error
+        and "start or repair the reader" in error
+        and "wait until it reports fresh activity" in error
+        and "--allow-unregistered-target" not in error,
+        error,
+    )
 
     ok, error = validate_target_reader(
         redis_client,
