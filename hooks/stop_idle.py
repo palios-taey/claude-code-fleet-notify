@@ -6,9 +6,10 @@ at-rest reconciler can also set it. Prompt/tool activity clears it. The
 notification router delivers via tmux ONLY when idle=1.
 
 Universal Stop+notify primitive (v0.2.0): if this session has a
-supervisor (resolved via taey:<node>:parent override OR the
-<name>-codex/<name>-gemini/<name>-grok suffix-strip rule), the supervisor
-receives a peer_idle message including the just-completed task summary.
+supervisor (resolved via NOTIFY_SUPERVISOR_IDS *-codex topology, else
+taey:<node>:parent override or the <name>-codex/<name>-gemini/<name>-grok
+suffix-strip rule), the supervisor receives a peer_idle message including
+the just-completed task summary.
 Workers do not need to call taey-notify manually on completion — the
 Stop hook is the canonical notifier across all supported CLIs.
 

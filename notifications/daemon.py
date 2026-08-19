@@ -803,6 +803,19 @@ def main() -> None:
     parser.add_argument("--tmux-session", default=None, help=argparse.SUPPRESS)
     args = parser.parse_args()
 
+    from notifications.targets import (
+        NOTIFY_SUPERVISOR_IDS_ENV,
+        SupervisorTopologyError,
+        load_supervisor_topology,
+    )
+
+    try:
+        load_supervisor_topology()
+    except SupervisorTopologyError as exc:
+        raise SystemExit(
+            f"ERROR: {NOTIFY_SUPERVISOR_IDS_ENV} is malformed: {exc}"
+        ) from exc
+
     run_daemon(args.redis_host, args.redis_port, args.poll_interval)
 
 

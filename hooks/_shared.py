@@ -757,19 +757,20 @@ def _fetch_wake_packet(node_id: str) -> str:
 def _resolve_supervisor(r, node_id: str) -> Optional[str]:
     """Resolve who supervises this node, if anyone.
 
-    Resolution order:
-    1. Explicit override key ``taey:<node>:parent`` — set by orchestrators
-       that need multi-level supervisor trees (a worker that is itself a
-       supervisor for its own children).
-    2. Suffix-strip rule for CLI peers: ``<name>-codex`` / ``<name>-gemini``
-       / ``<name>-grok`` strip to ``<name>``, which is then treated as the
-       supervisor session.
-    3. Top-level sessions (no recognized suffix and no explicit override)
-       return ``None`` — they have no supervisor to notify.
+    Resolution lives in ``notifications.targets.resolve_supervisor``:
 
-    The explicit key wins because the suffix rule can't distinguish a
-    second-level worker (e.g., ``treasurer-codex-research``) from a
-    first-level one.
+    1. If ``NOTIFY_SUPERVISOR_IDS`` lists ``*-codex`` sessions, those
+       nodes are top-level (return ``None``; no suffix-strip to Claude).
+       Matching base Claude / ``*-gemini`` / ``*-grok`` workers resolve
+       to that configured codex supervisor.
+    2. Else explicit ``taey:<node>:parent`` override (when it is not the
+       node itself) or suffix-strip ``<name>-codex`` / ``-gemini`` /
+       ``-grok`` → ``<name>``.
+    3. Top-level sessions (no suffix, no override, not a configured
+       worker) return ``None`` and skip the parent-notify.
+
+    Unset/blank ``NOTIFY_SUPERVISOR_IDS`` keeps the legacy suffix-strip
+    rule for deployments that have not opted in.
     """
     from notifications.targets import resolve_supervisor
 
