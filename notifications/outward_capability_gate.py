@@ -119,26 +119,31 @@ def require_outward_notify_capability(
     redis_client: Any,
     *,
     key_prefix: str = "taey",
+    capability_session: Optional[str] = None,
 ) -> str:
-    """Authorize worker outward notify. Returns which gate fired: orch|redis|skip."""
-    session = str(from_node or "").strip()
-    if not session:
-        raise OutwardNotifyDenied("from_node is required for outward notify mutation")
-    if is_control_plane_exception(session, msg_type):
+    """Authorize worker outward notify. Returns which gate fired: orch|skip.
+
+    ``capability_session`` is the process identity (tmux/TAEY_NODE_ID). Claimed
+    ``from_node``/``--from`` is envelope metadata only and cannot skip the gate.
+    """
+    identity = str(capability_session or from_node or "").strip()
+    if not identity:
+        raise OutwardNotifyDenied("process identity is required for outward notify mutation")
+    if is_control_plane_exception(identity, msg_type):
         return "skip"
 
-    # Shared boundary with GitHub when orchestrator is on PYTHONPATH.
     try:
         from fleet_orchestrator.outward_capability import (  # type: ignore
             OutwardAuthorizationError,
             require_outward_capability,
         )
-    except ImportError:
-        _redis_current_task_gate(redis_client, session, key_prefix=key_prefix)
-        return "redis"
+    except ImportError as exc:
+        raise OutwardNotifyDenied(
+            "fleet_orchestrator outward capability required; redis-only fallback removed"
+        ) from exc
 
     try:
-        require_outward_capability(session, channel="taey_notify", redis_client=redis_client)
+        require_outward_capability(identity, channel="taey_notify", redis_client=redis_client)
     except OutwardAuthorizationError as exc:
         raise OutwardNotifyDenied(str(exc)) from exc
     return "orch"

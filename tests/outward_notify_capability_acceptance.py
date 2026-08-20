@@ -46,13 +46,35 @@ def main() -> int:
     redis = FakeRedis()
     key = f"{prefix}:{session}:current_task"
 
+    import types
+    package = types.ModuleType("fleet_orchestrator")
+    outward = types.ModuleType("fleet_orchestrator.outward_capability")
+
+    class FakeOutwardAuthorizationError(RuntimeError):
+        pass
+
+    def require_outward_capability(session_id: str, **kwargs):
+        client = kwargs.get("redis_client") or redis
+        raw = client.get(f"{prefix}:{session_id}:current_task")
+        if not raw:
+            raise FakeOutwardAuthorizationError(
+                f"no live current_task binding for session {session_id}"
+            )
+        return {"allowed": True}
+
+    outward.OutwardAuthorizationError = FakeOutwardAuthorizationError
+    outward.require_outward_capability = require_outward_capability
+    sys.modules["fleet_orchestrator"] = package
+    sys.modules["fleet_orchestrator.outward_capability"] = outward
+
     try:
         require_outward_notify_capability(session, "message", redis, key_prefix=prefix)
         _check("unbound worker message denied", False, "expected OutwardNotifyDenied")
     except OutwardNotifyDenied as exc:
         _check(
             "unbound worker message denied",
-            "no live current_task binding" in str(exc),
+            "no live current_task binding" in str(exc)
+            or "fleet_orchestrator outward capability required" in str(exc),
             exc,
         )
 
@@ -66,11 +88,17 @@ def main() -> int:
             }
         ),
     )
-    # Without fleet_orchestrator on path this uses redis gate.
-    gate = require_outward_notify_capability(
-        session, "response_ready", redis, key_prefix=prefix
-    )
-    _check("bound response_ready allowed via redis gate", gate in {"redis", "orch"}, gate)
+    try:
+        gate = require_outward_notify_capability(
+            session, "response_ready", redis, key_prefix=prefix
+        )
+        _check("bound response_ready allowed via orch gate", gate == "orch", gate)
+    except OutwardNotifyDenied as exc:
+        _check(
+            "bound response_ready allowed via orch gate",
+            False,
+            exc,
+        )
 
     redis.delete(key)
     try:

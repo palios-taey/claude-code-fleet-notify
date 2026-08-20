@@ -102,11 +102,12 @@ def _load_cli_module():
     return module
 
 
-def _run_cli(module, redis_client: FakeRedis, *args: str) -> tuple[int, str, str]:
+def _run_cli(module, redis_client: FakeRedis, *args: str, identity: str = WORKER) -> tuple[int, str, str]:
     stdout = io.StringIO()
     stderr = io.StringIO()
     argv = ["taey-notify", *args, "--key-prefix", PREFIX, "--allow-unregistered-target"]
     with mock.patch.dict(sys.modules, _install_fake_modules(redis_client)), \
+         mock.patch.dict("os.environ", {"TAEY_NODE_ID": identity}, clear=False), \
          mock.patch.object(sys, "argv", argv), \
          contextlib.redirect_stdout(stdout), \
          contextlib.redirect_stderr(stderr):
@@ -174,24 +175,42 @@ def main() -> int:
     _check("unbound worker message did not lpush", len(redis_client.lpushes) == 1, redis_client.lpushes)
 
     supervisor = "taey-ed-codex"
-    env_patch = {"NOTIFY_SUPERVISOR_IDS": supervisor}
+    env_patch = {"NOTIFY_SUPERVISOR_IDS": supervisor, "TAEY_NODE_ID": WORKER}
     with mock.patch.dict("os.environ", env_patch, clear=False):
         code, stdout, stderr = _run_cli(
             module,
             redis_client,
             WORKER,
-            "operator command",
+            "spoofed supervisor command",
             "--type",
             "command",
             "--from",
             supervisor,
+            identity=WORKER,
         )
     _check(
-        "unbound supervisor command allowed",
+        "worker claiming --from supervisor denied",
+        code == 1 and "SAFETY DENY" in stderr,
+        (code, stdout, stderr),
+    )
+    _check("spoofed supervisor command did not lpush", len(redis_client.lpushes) == 1, redis_client.lpushes)
+
+    with mock.patch.dict("os.environ", {"NOTIFY_SUPERVISOR_IDS": supervisor}, clear=False):
+        code, stdout, stderr = _run_cli(
+            module,
+            redis_client,
+            WORKER,
+            "real supervisor command",
+            "--type",
+            "command",
+            identity=supervisor,
+        )
+    _check(
+        "process-identity supervisor command allowed",
         code == 0 and "OK: sent" in stdout,
         (code, stdout, stderr),
     )
-    _check("supervisor command enqueued", len(redis_client.lpushes) == 2, redis_client.lpushes)
+    _check("real supervisor command enqueued", len(redis_client.lpushes) == 2, redis_client.lpushes)
 
     if FAILURES:
         print(f"FAIL: {len(FAILURES)} check(s): {FAILURES}")
