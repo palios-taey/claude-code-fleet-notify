@@ -45,10 +45,15 @@ def main() -> int:
     redis = FakeRedis()
     key = f"{prefix}:{session}:current_task"
 
-    _check(
-        "non-worker type skipped",
-        require_outward_notify_capability(session, "message", redis, key_prefix=prefix) == "skip",
-    )
+    try:
+        require_outward_notify_capability(session, "message", redis, key_prefix=prefix)
+        _check("unbound worker message denied", False, "expected OutwardNotifyDenied")
+    except OutwardNotifyDenied as exc:
+        _check(
+            "unbound worker message denied",
+            "no live current_task binding" in str(exc),
+            exc,
+        )
 
     redis.set(
         key,

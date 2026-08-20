@@ -164,14 +164,34 @@ def main() -> int:
         module,
         redis_client,
         TARGET,
-        "plain operator message",
+        "plain worker message after unbind",
         "--type",
         "message",
         "--from",
         WORKER,
     )
-    _check("plain message skips outward gate", code == 0 and "OK: sent" in stdout, (code, stdout, stderr))
-    _check("plain message enqueued after skip", len(redis_client.lpushes) == 2, redis_client.lpushes)
+    _check("unbound worker message denied", code == 1 and "SAFETY DENY" in stderr, (code, stdout, stderr))
+    _check("unbound worker message did not lpush", len(redis_client.lpushes) == 1, redis_client.lpushes)
+
+    supervisor = "taey-ed-codex"
+    env_patch = {"NOTIFY_SUPERVISOR_IDS": supervisor}
+    with mock.patch.dict("os.environ", env_patch, clear=False):
+        code, stdout, stderr = _run_cli(
+            module,
+            redis_client,
+            WORKER,
+            "operator command",
+            "--type",
+            "command",
+            "--from",
+            supervisor,
+        )
+    _check(
+        "unbound supervisor command allowed",
+        code == 0 and "OK: sent" in stdout,
+        (code, stdout, stderr),
+    )
+    _check("supervisor command enqueued", len(redis_client.lpushes) == 2, redis_client.lpushes)
 
     if FAILURES:
         print(f"FAIL: {len(FAILURES)} check(s): {FAILURES}")

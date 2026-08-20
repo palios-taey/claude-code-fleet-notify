@@ -1,8 +1,9 @@
 """Fail-closed gate for worker outward taey-notify enqueues after unbind.
 
-P0 safety (task-f396305d): when a worker sends response_ready/result/defect/status,
-unbind/revocation must deny the Redis inbox mutation even if the process is still
-running.
+P0 safety (task-7107c13f / task-f396305d): every inbox LPUSH from a worker is an
+outward mutation. Message-type skip was a bypass. Unbind must deny *all* types
+for worker senders even if the process is still running. Named/topology
+supervisors remain operators and may send without a worker binding.
 
 Prefers the orchestrator's shared ``authorize_outward_capability`` when
 ``fleet_orchestrator`` is importable (one shared boundary with GitHub status/comment).
@@ -12,8 +13,13 @@ clears — when orch is not installed.
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from typing import Any, FrozenSet, Optional
 
+from notifications.targets import PEER_SUFFIXES, load_supervisor_topology
+
+# Kept as documentation of the original worker-report types. The gate no longer
+# skips other types for worker senders.
 WORKER_OUTWARD_NOTIFY_TYPES: FrozenSet[str] = frozenset(
     {"response_ready", "result", "defect", "status"}
 )
@@ -24,7 +30,23 @@ class OutwardNotifyDenied(RuntimeError):
 
 
 def notify_type_requires_outward_capability(msg_type: str) -> bool:
-    return str(msg_type or "").strip().lower() in WORKER_OUTWARD_NOTIFY_TYPES
+    """Deprecated type skip — always True. Sender identity decides, not type."""
+    return True
+
+
+def sender_requires_outward_capability(
+    from_node: str,
+    *,
+    environ: Optional[Mapping[str, str]] = None,
+) -> bool:
+    """Workers need a live binding for every notify type; supervisors do not."""
+    session = str(from_node or "").strip()
+    if not session:
+        return True
+    topology = load_supervisor_topology(environ)
+    if topology is not None:
+        return session not in topology.supervisors
+    return any(session.endswith(suffix) for suffix in PEER_SUFFIXES)
 
 
 def _decode_current_task(raw: Any) -> Optional[dict]:
@@ -75,12 +97,11 @@ def require_outward_notify_capability(
     key_prefix: str = "taey",
 ) -> str:
     """Authorize worker outward notify. Returns which gate fired: orch|redis|skip."""
-    if not notify_type_requires_outward_capability(msg_type):
-        return "skip"
-
     session = str(from_node or "").strip()
     if not session:
         raise OutwardNotifyDenied("from_node is required for outward notify mutation")
+    if not sender_requires_outward_capability(session):
+        return "skip"
 
     # Shared boundary with GitHub when orchestrator is on PYTHONPATH.
     try:
