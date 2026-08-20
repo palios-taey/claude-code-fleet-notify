@@ -19,43 +19,60 @@ except ImportError:
         return None
 
 
-def _find_ancestor_tty() -> str:
-    """Walk up the process tree to find the nearest ancestor with a real TTY."""
-    pid = os.getpid()
-    for _ in range(10):
+def ancestor_tty_from_pid(start_pid: int) -> str:
+    """Walk `/proc/<pid>` including start_pid for a real TTY. Not TMUX_PANE."""
+    pid = int(start_pid)
+    for _ in range(12):
+        if pid <= 1:
+            break
         try:
-            with open(f"/proc/{pid}/stat") as f:
-                stat = f.read()
-            after_comm = stat[stat.rfind(")") + 2 :]
-            pid = int(after_comm.split()[1])
-            if pid <= 1:
-                break
             fd0 = os.readlink(f"/proc/{pid}/fd/0")
             if fd0.startswith("/dev/pts/") or fd0.startswith("/dev/tty"):
                 return fd0
-        except Exception:
+        except OSError:
+            pass
+        try:
+            with open(f"/proc/{pid}/stat", encoding="utf-8") as handle:
+                stat = handle.read()
+            after_comm = stat[stat.rfind(")") + 2 :]
+            pid = int(after_comm.split()[1])
+        except (OSError, IndexError, ValueError):
             break
+    return ""
+
+
+def _find_ancestor_tty() -> str:
+    """Walk up the process tree to find the nearest ancestor with a real TTY."""
+    return ancestor_tty_from_pid(os.getpid())
+
+
+def detect_capability_session() -> str:
+    """TTY-backed tmux session for outward mutation. Never TAEY_NODE_ID or TMUX_PANE."""
+    tty = _find_ancestor_tty()
+    if not tty:
+        return ""
+    try:
+        result = subprocess.run(
+            ["tmux", "list-panes", "-a", "-F", "#{pane_tty} #{session_name}"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        if result.returncode == 0:
+            for line in result.stdout.strip().splitlines():
+                parts = line.split(" ", 1)
+                if len(parts) == 2 and parts[0] == tty:
+                    return parts[1]
+    except Exception:
+        pass
     return ""
 
 
 def detect_tmux_session() -> str:
     """Detect which tmux session this process is running in."""
-    try:
-        ancestor_tty = _find_ancestor_tty()
-        if ancestor_tty:
-            result = subprocess.run(
-                ["tmux", "list-panes", "-a", "-F", "#{pane_tty} #{session_name}"],
-                capture_output=True,
-                text=True,
-                timeout=2,
-            )
-            if result.returncode == 0:
-                for line in result.stdout.strip().splitlines():
-                    parts = line.split(" ", 1)
-                    if len(parts) == 2 and parts[0] == ancestor_tty:
-                        return parts[1]
-    except Exception:
-        pass
+    session = detect_capability_session()
+    if session:
+        return session
     try:
         result = subprocess.run(
             ["tmux", "display-message", "-p", "#S"],

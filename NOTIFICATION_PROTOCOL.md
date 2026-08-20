@@ -192,10 +192,11 @@ provenance (and a seat's `idle`/`inbox`/`current_task` keys resolve on the same 
 id), a seat whose resolved id does not match its role is mis-seated — fix the id, and
 confirm the seat is in the session it should be.
 
-Outward **mutation** authorization does not use that envelope chain. Every
-sender must present a possession handle (`ORCH_OUTWARD_HANDLE`) minted at bind
-and revoked at unbind. `TAEY_NODE_ID`, `--from`, and `TMUX_PANE` cannot skip
-the gate. Missing or revoked handle fail-closes every type.
+Outward **mutation** authorization does not use that envelope chain. The
+capability session is the process TTY → tmux pane session (never `TMUX_PANE`,
+`TAEY_NODE_ID`, or `--from`). Workers need a live `current_task`. Topology
+supervisors retain a distinct control-plane send path when that TTY identity
+is a supervisor.
 
 ## Hook install model
 

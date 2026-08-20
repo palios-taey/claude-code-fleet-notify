@@ -2,7 +2,7 @@
 """Acceptance: taey-notify gates worker outward enqueue before Redis lpush.
 
 Uses fake redis and a fake orchestrator authorization module; no live Redis,
-Neo4j, tmux, or GitHub.
+Neo4j, or GitHub. Capability identity is injected as TTY-backed session.
 """
 from __future__ import annotations
 
@@ -24,7 +24,6 @@ WORKER = "worker-grok"
 TARGET = "supervisor-codex"
 CURRENT_KEY = f"{PREFIX}:{WORKER}:current_task"
 INBOX_KEY = f"{PREFIX}:{TARGET}:inbox"
-LIVE_HANDLE = "live-handle-worker-grok"
 
 
 FAILURES: list[str] = []
@@ -67,7 +66,7 @@ class FakeOutwardAuthorizationError(RuntimeError):
     pass
 
 
-def _install_fake_modules(redis_client: FakeRedis) -> dict[str, object]:
+def _install_fake_modules(redis_client: FakeRedis, tty_session: str) -> dict[str, object]:
     redis_module = types.SimpleNamespace(
         Redis=lambda **_kwargs: redis_client,
     )
@@ -85,19 +84,16 @@ def _install_fake_modules(redis_client: FakeRedis) -> dict[str, object]:
             )
         return {"allowed": True}
 
-    def require_outward_handle(handle: str, *, channel: str = "", redis_client=None, **_kwargs):
-        token = str(handle or "").strip()
-        if token != LIVE_HANDLE:
-            raise FakeOutwardAuthorizationError("missing or revoked outward possession handle")
-        return require_outward_capability(WORKER, channel=channel, redis_client=redis_client)
-
     outward_module.require_outward_capability = require_outward_capability
-    outward_module.require_outward_handle = require_outward_handle
     package = types.ModuleType("fleet_orchestrator")
+    identity_module = types.ModuleType("identity")
+    identity_module.detect_capability_session = lambda: tty_session
+    identity_module.detect_tmux_session = lambda: tty_session
     return {
         "redis": redis_module,
         "fleet_orchestrator": package,
         "fleet_orchestrator.outward_capability": outward_module,
+        "identity": identity_module,
     }
 
 
@@ -114,16 +110,16 @@ def _run_cli(
     module,
     redis_client: FakeRedis,
     *args: str,
-    handle: str = "",
+    tty_session: str = WORKER,
     extra_env: dict[str, str] | None = None,
 ) -> tuple[int, str, str]:
     stdout = io.StringIO()
     stderr = io.StringIO()
     argv = ["taey-notify", *args, "--key-prefix", PREFIX, "--allow-unregistered-target"]
-    env = {"ORCH_OUTWARD_HANDLE": handle, "TAEY_NODE_ID": "", "TMUX_PANE": ""}
+    env = {"TAEY_NODE_ID": "", "TMUX_PANE": "", "ORCH_OUTWARD_HANDLE": ""}
     if extra_env:
         env.update(extra_env)
-    with mock.patch.dict(sys.modules, _install_fake_modules(redis_client)), \
+    with mock.patch.dict(sys.modules, _install_fake_modules(redis_client, tty_session)), \
          mock.patch.dict("os.environ", env, clear=False), \
          mock.patch.object(sys, "argv", argv), \
          contextlib.redirect_stdout(stdout), \
@@ -149,6 +145,7 @@ def main() -> int:
         "response_ready",
         "--from",
         WORKER,
+        tty_session=WORKER,
     )
     _check("unbound response_ready denied", code == 1 and "SAFETY DENY" in stderr, stderr)
     _check("unbound response_ready did not lpush", not redis_client.lpushes, redis_client.lpushes)
@@ -172,7 +169,7 @@ def main() -> int:
         "response_ready",
         "--from",
         WORKER,
-        handle=LIVE_HANDLE,
+        tty_session=WORKER,
     )
     _check("bound response_ready allowed", code == 0 and "OK: sent" in stdout, (code, stdout, stderr))
     _check("bound response_ready enqueued once", len(redis_client.lpushes) == 1, redis_client.lpushes)
@@ -188,7 +185,7 @@ def main() -> int:
         "message",
         "--from",
         WORKER,
-        handle=LIVE_HANDLE,
+        tty_session=WORKER,
     )
     _check("unbound worker message denied", code == 1 and "SAFETY DENY" in stderr, (code, stdout, stderr))
     _check("unbound worker message did not lpush", len(redis_client.lpushes) == 1, redis_client.lpushes)
@@ -205,6 +202,8 @@ def main() -> int:
             "command",
             "--from",
             supervisor,
+            tty_session=WORKER,
+            extra_env={"NOTIFY_SUPERVISOR_IDS": supervisor},
         )
     _check(
         "worker claiming --from supervisor denied",
@@ -218,30 +217,10 @@ def main() -> int:
             module,
             redis_client,
             WORKER,
-            "TAEY_NODE_ID supervisor spoof command",
-            "--type",
-            "command",
-            extra_env={"TAEY_NODE_ID": supervisor, "NOTIFY_SUPERVISOR_IDS": supervisor},
-        )
-    _check(
-        "worker TAEY_NODE_ID supervisor spoof denied",
-        code == 1 and "SAFETY DENY" in stderr,
-        (code, stdout, stderr),
-    )
-    _check(
-        "TAEY_NODE_ID supervisor spoof did not lpush",
-        len(redis_client.lpushes) == 1,
-        redis_client.lpushes,
-    )
-
-    with mock.patch.dict("os.environ", env_patch, clear=False):
-        code, stdout, stderr = _run_cli(
-            module,
-            redis_client,
-            WORKER,
             "TMUX_PANE supervisor pane spoof command",
             "--type",
             "command",
+            tty_session=WORKER,
             extra_env={
                 "TMUX_PANE": "%20",
                 "TAEY_NODE_ID": supervisor,
@@ -264,17 +243,18 @@ def main() -> int:
             module,
             redis_client,
             WORKER,
-            "supervisor command without possession handle",
+            "real supervisor command",
             "--type",
             "command",
-            extra_env={"TAEY_NODE_ID": supervisor, "NOTIFY_SUPERVISOR_IDS": supervisor},
+            tty_session=supervisor,
+            extra_env={"NOTIFY_SUPERVISOR_IDS": supervisor},
         )
     _check(
-        "every sender without possession handle denied",
-        code == 1 and "SAFETY DENY" in stderr,
+        "TTY supervisor control-plane command allowed",
+        code == 0 and "OK: sent" in stdout,
         (code, stdout, stderr),
     )
-    _check("supervisor without handle did not lpush", len(redis_client.lpushes) == 1, redis_client.lpushes)
+    _check("real supervisor command enqueued", len(redis_client.lpushes) == 2, redis_client.lpushes)
 
     if FAILURES:
         print(f"FAIL: {len(FAILURES)} check(s): {FAILURES}")
