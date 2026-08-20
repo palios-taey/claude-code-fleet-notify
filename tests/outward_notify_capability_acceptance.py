@@ -12,6 +12,7 @@ sys.path.insert(0, str(ROOT))
 
 from notifications.outward_capability_gate import (  # noqa: E402
     OutwardNotifyDenied,
+    is_control_plane_exception,
     require_outward_notify_capability,
 )
 
@@ -79,6 +80,30 @@ def main() -> int:
         _check("unbound response_ready denied", False, "expected OutwardNotifyDenied")
     except OutwardNotifyDenied as exc:
         _check("unbound response_ready denied", "no live current_task binding" in str(exc), exc)
+
+    import os
+    from unittest import mock
+
+    with mock.patch.dict(os.environ, {"NOTIFY_SUPERVISOR_IDS": "taey-ed-codex"}, clear=False):
+        _check(
+            "topology supervisor command is control-plane",
+            is_control_plane_exception("taey-ed-codex", "command"),
+        )
+        _check(
+            "topology supervisor unknown type is gated",
+            not is_control_plane_exception("taey-ed-codex", "not-a-type"),
+        )
+        try:
+            require_outward_notify_capability(
+                "taey-ed-codex", "not-a-type", redis, key_prefix=prefix
+            )
+            _check("supervisor unknown type denied", False, "expected OutwardNotifyDenied")
+        except OutwardNotifyDenied as exc:
+            _check(
+                "supervisor unknown type denied",
+                "no live current_task binding" in str(exc),
+                exc,
+            )
 
     if FAILURES:
         print(f"FAIL: {FAILURES}")

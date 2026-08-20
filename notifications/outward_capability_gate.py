@@ -23,6 +23,18 @@ from notifications.targets import PEER_SUFFIXES, load_supervisor_topology
 WORKER_OUTWARD_NOTIFY_TYPES: FrozenSet[str] = frozenset(
     {"response_ready", "result", "defect", "status"}
 )
+CONTROL_PLANE_NOTIFY_TYPES: FrozenSet[str] = frozenset(
+    {
+        "command",
+        "wake",
+        "directive",
+        "heartbeat",
+        "message",
+        "notification",
+        "escalation",
+        "task",
+    }
+)
 
 
 class OutwardNotifyDenied(RuntimeError):
@@ -30,8 +42,8 @@ class OutwardNotifyDenied(RuntimeError):
 
 
 def notify_type_requires_outward_capability(msg_type: str) -> bool:
-    """Deprecated type skip — always True. Sender identity decides, not type."""
-    return True
+    """Unknown types default gated. Only control-plane types may skip."""
+    return str(msg_type or "").strip().lower() not in CONTROL_PLANE_NOTIFY_TYPES
 
 
 def sender_requires_outward_capability(
@@ -39,7 +51,7 @@ def sender_requires_outward_capability(
     *,
     environ: Optional[Mapping[str, str]] = None,
 ) -> bool:
-    """Workers need a live binding for every notify type; supervisors do not."""
+    """Workers need a live binding; topology supervisors are control-plane."""
     session = str(from_node or "").strip()
     if not session:
         return True
@@ -47,6 +59,18 @@ def sender_requires_outward_capability(
     if topology is not None:
         return session not in topology.supervisors
     return any(session.endswith(suffix) for suffix in PEER_SUFFIXES)
+
+
+def is_control_plane_exception(
+    from_node: str,
+    msg_type: str,
+    *,
+    environ: Optional[Mapping[str, str]] = None,
+) -> bool:
+    """Trusted topology control-plane types may skip; unknown types never skip."""
+    if notify_type_requires_outward_capability(msg_type):
+        return False
+    return not sender_requires_outward_capability(from_node, environ=environ)
 
 
 def _decode_current_task(raw: Any) -> Optional[dict]:
@@ -100,7 +124,7 @@ def require_outward_notify_capability(
     session = str(from_node or "").strip()
     if not session:
         raise OutwardNotifyDenied("from_node is required for outward notify mutation")
-    if not sender_requires_outward_capability(session):
+    if is_control_plane_exception(session, msg_type):
         return "skip"
 
     # Shared boundary with GitHub when orchestrator is on PYTHONPATH.
