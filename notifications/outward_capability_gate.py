@@ -12,7 +12,6 @@ clears — when orch is not installed.
 from __future__ import annotations
 
 import json
-import os
 from typing import Any, FrozenSet, Optional
 
 WORKER_OUTWARD_NOTIFY_TYPES: FrozenSet[str] = frozenset(
@@ -78,8 +77,6 @@ def require_outward_notify_capability(
     """Authorize worker outward notify. Returns which gate fired: orch|redis|skip."""
     if not notify_type_requires_outward_capability(msg_type):
         return "skip"
-    if os.environ.get("ORCH_OUTWARD_NOTIFY_EXEMPT", "").strip() in {"1", "true", "yes"}:
-        return "exempt"
 
     session = str(from_node or "").strip()
     if not session:
