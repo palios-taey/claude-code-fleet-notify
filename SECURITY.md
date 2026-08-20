@@ -52,11 +52,11 @@ broken guard cannot disable every tool call on the machine.
 
 Worker `taey-notify` enqueues are outward mutations. Unbind must deny them even
 if the worker process is still running. Authorization identity is the process
-TTY → tmux session, not `TMUX_PANE`/`TAEY_NODE_ID`/`--from`. Topology
-supervisors retain a control-plane send path when that TTY identity is a
-supervisor. A worker cannot point `TMUX_PANE` at a supervisor pane to skip the
-gate. Same-UID ptrace of another process remains a residual until CONTROL
-deploys per-worker OS principals.
+TTY → tmux session, not `TMUX_PANE`/`TAEY_NODE_ID`. Envelope `from` is that
+principal; `--from` that differs is denied. Topology supervisors retain a
+control-plane send path when that TTY identity is a supervisor. Same-UID
+ptrace of another process remains a residual until CONTROL deploys per-worker
+OS principals.
 
 ## Constitutional constraints [Observed — FAMILY_KERNEL constitutional commitments]
 

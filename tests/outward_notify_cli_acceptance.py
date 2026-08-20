@@ -175,6 +175,28 @@ def main() -> int:
     _check("bound response_ready enqueued once", len(redis_client.lpushes) == 1, redis_client.lpushes)
     _check("bound response_ready target inbox", redis_client.lpushes[-1][0] == INBOX_KEY, redis_client.lpushes)
 
+    code, stdout, stderr = _run_cli(
+        module,
+        redis_client,
+        TARGET,
+        "impersonating another sender",
+        "--type",
+        "response_ready",
+        "--from",
+        "other-worker-grok",
+        tty_session=WORKER,
+    )
+    _check(
+        "bound worker --from other seat denied",
+        code == 1 and "authenticated principal" in stderr,
+        (code, stdout, stderr),
+    )
+    _check(
+        "bound worker impersonation did not lpush",
+        len(redis_client.lpushes) == 1,
+        redis_client.lpushes,
+    )
+
     redis_client.delete(CURRENT_KEY)
     code, stdout, stderr = _run_cli(
         module,
@@ -207,7 +229,7 @@ def main() -> int:
         )
     _check(
         "worker claiming --from supervisor denied",
-        code == 1 and "SAFETY DENY" in stderr,
+        code == 1 and "authenticated principal" in stderr,
         (code, stdout, stderr),
     )
     _check("spoofed supervisor command did not lpush", len(redis_client.lpushes) == 1, redis_client.lpushes)

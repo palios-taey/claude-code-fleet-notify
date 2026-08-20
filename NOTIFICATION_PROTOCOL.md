@@ -193,8 +193,9 @@ id), a seat whose resolved id does not match its role is mis-seated — fix the 
 confirm the seat is in the session it should be.
 
 Outward **mutation** authorization does not use that envelope chain. The
-capability session is the process TTY → tmux pane session (never `TMUX_PANE`,
-`TAEY_NODE_ID`, or `--from`). Workers need a live `current_task`. Topology
+capability session is the process TTY → tmux pane session (never `TMUX_PANE`
+or `TAEY_NODE_ID`). Envelope `from` is that authenticated principal;
+`--from` that differs is denied. Workers need a live `current_task`. Topology
 supervisors retain a distinct control-plane send path when that TTY identity
 is a supervisor.
 

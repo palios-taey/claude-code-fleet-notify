@@ -125,7 +125,16 @@ def main():
     from identity import detect_capability_session
 
     capability_session = detect_capability_session()
-    from_node = args.from_node or detect_from_node()
+    if not capability_session:
+        print("SAFETY DENY: process tty/session identity is required for outward notify", file=sys.stderr)
+        sys.exit(1)
+    if args.from_node and args.from_node != capability_session:
+        print(
+            "SAFETY DENY: envelope --from does not match authenticated principal",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    from_node = capability_session
 
     if args.type == 'escalation' and args.priority == 'normal':
         args.priority = 'high'
