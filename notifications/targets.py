@@ -7,10 +7,15 @@ import subprocess
 import time
 import urllib.parse
 import urllib.request
+from collections.abc import Mapping
 from typing import Any, Optional
 
 
 PEER_SUFFIXES = ("-codex", "-gemini", "-grok")
+SUPERVISOR_SUFFIX = "-codex"
+WORKER_SUFFIXES = ("-gemini", "-grok")
+NOTIFY_SUPERVISOR_IDS_ENV = "NOTIFY_SUPERVISOR_IDS"
+_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 READER_DRAIN_MARKER_SUFFIXES = ("last_drain_at", "last_read_at")
 READER_STATE_SUFFIXES = ("last_activity", "idle", "turns_open", "seat_registration")
 TAEY_LINE_READER_RE = re.compile(r"^taey(?:-council-[1-7])?$")
@@ -18,6 +23,93 @@ TAEY_LINE_READER_RE = re.compile(r"^taey(?:-council-[1-7])?$")
 
 class TargetReadinessError(RuntimeError):
     """Raised when a target readiness signal cannot be measured."""
+
+
+class SupervisorTopologyError(ValueError):
+    """Raised when ``NOTIFY_SUPERVISOR_IDS`` is set but cannot be used."""
+
+
+class SupervisorTopology:
+    """Opt-in map of configured ``*-codex`` supervisors to their workers.
+
+    Unset/blank ``NOTIFY_SUPERVISOR_IDS`` means this object is not loaded and
+    resolve_supervisor keeps the legacy suffix-strip rule. When loaded, each
+    configured ``<family>-codex`` is a top-level supervisor; ``<family>``,
+    ``<family>-gemini``, and ``<family>-grok`` resolve to that supervisor.
+    """
+
+    def __init__(self, supervisors: tuple[str, ...]):
+        self.supervisors = frozenset(supervisors)
+        worker_to_supervisor: dict[str, str] = {}
+        for supervisor in supervisors:
+            family = supervisor[: -len(SUPERVISOR_SUFFIX)]
+            for worker in (family, *(f"{family}{suffix}" for suffix in WORKER_SUFFIXES)):
+                existing = worker_to_supervisor.get(worker)
+                if existing and existing != supervisor:
+                    raise SupervisorTopologyError(
+                        f"worker {worker!r} maps to both {existing!r} and {supervisor!r}"
+                    )
+                if worker in self.supervisors:
+                    raise SupervisorTopologyError(
+                        f"configured supervisor {worker!r} cannot also be a worker of {supervisor!r}"
+                    )
+                worker_to_supervisor[worker] = supervisor
+        self._worker_to_supervisor = worker_to_supervisor
+
+    def worker_supervisor(self, node_id: str) -> Optional[str]:
+        return self._worker_to_supervisor.get(node_id)
+
+
+def _parse_supervisor_ids(raw: str) -> tuple[str, ...]:
+    parts = [item.strip() for item in raw.replace(";", ",").split(",")]
+    if any(part == "" for part in parts):
+        raise SupervisorTopologyError(
+            f"{NOTIFY_SUPERVISOR_IDS_ENV} contains an empty entry; "
+            "use a comma-separated list of *-codex session names"
+        )
+    seen: set[str] = set()
+    supervisors: list[str] = []
+    for session_id in parts:
+        if not _SESSION_ID_RE.fullmatch(session_id):
+            raise SupervisorTopologyError(
+                f"{NOTIFY_SUPERVISOR_IDS_ENV} entry {session_id!r} is not a valid session name"
+            )
+        if not session_id.endswith(SUPERVISOR_SUFFIX):
+            raise SupervisorTopologyError(
+                f"{NOTIFY_SUPERVISOR_IDS_ENV} entry {session_id!r} must end with {SUPERVISOR_SUFFIX!r}; "
+                "do not list base Claude family names as supervisors"
+            )
+        family = session_id[: -len(SUPERVISOR_SUFFIX)]
+        if not family:
+            raise SupervisorTopologyError(
+                f"{NOTIFY_SUPERVISOR_IDS_ENV} entry {session_id!r} has an empty family name"
+            )
+        if any(family.endswith(suffix) for suffix in PEER_SUFFIXES):
+            raise SupervisorTopologyError(
+                f"{NOTIFY_SUPERVISOR_IDS_ENV} entry {session_id!r} nests a peer suffix in the family name"
+            )
+        if session_id in seen:
+            raise SupervisorTopologyError(
+                f"{NOTIFY_SUPERVISOR_IDS_ENV} lists {session_id!r} more than once"
+            )
+        seen.add(session_id)
+        supervisors.append(session_id)
+    return tuple(supervisors)
+
+
+def load_supervisor_topology(environ: Optional[Mapping[str, str]] = None) -> Optional[SupervisorTopology]:
+    """Return the opt-in topology, or None to keep legacy suffix-strip.
+
+    Fail loud when the env var is present and non-blank but malformed.
+    """
+    env = os.environ if environ is None else environ
+    raw = env.get(NOTIFY_SUPERVISOR_IDS_ENV)
+    if raw is None:
+        return None
+    stripped = raw.strip()
+    if not stripped:
+        return None
+    return SupervisorTopology(_parse_supervisor_ids(stripped))
 
 
 def _decode(raw) -> str:
@@ -43,11 +135,13 @@ def _explicit_parent(redis_client, node_id: str, prefix: str) -> str:
         return ""
 
 
-def resolve_supervisor(redis_client, node_id: str, prefix: Optional[str] = None) -> Optional[str]:
-    """Resolve the supervisor for ``node_id`` using the fleet parent rule."""
-    if not node_id:
-        return None
-    key_prefix = prefix or os.environ.get("NOTIFY_KEY_PREFIX", "taey")
+def _legacy_resolve_supervisor(redis_client, node_id: str, key_prefix: str) -> Optional[str]:
+    """Suffix-strip ``*-codex`` / ``*-gemini`` / ``*-grok`` to the family name.
+
+    Used when ``NOTIFY_SUPERVISOR_IDS`` is unset (deployments that have not
+    opted into the *-codex supervisor topology) and for families that are
+    not listed in an opted-in topology.
+    """
     for suffix in PEER_SUFFIXES:
         if node_id.endswith(suffix):
             suffix_supervisor = node_id[: -len(suffix)]
@@ -55,9 +149,33 @@ def resolve_supervisor(redis_client, node_id: str, prefix: Optional[str] = None)
             if explicit and explicit != node_id:
                 return explicit
             return suffix_supervisor
-
     explicit = _explicit_parent(redis_client, node_id, key_prefix)
     return explicit or None
+
+
+def resolve_supervisor(redis_client, node_id: str, prefix: Optional[str] = None) -> Optional[str]:
+    """Resolve the supervisor for ``node_id`` using the fleet parent rule.
+
+    Opt-in: when ``NOTIFY_SUPERVISOR_IDS`` lists ``*-codex`` sessions, those
+    nodes are top-level (no suffix-strip back to base Claude). Matching base
+    Claude, ``*-gemini``, and ``*-grok`` workers resolve to that codex
+    supervisor through the derived topology, even if a stale Redis parent
+    still points at the family name.
+
+    Legacy: unset/blank ``NOTIFY_SUPERVISOR_IDS`` keeps suffix-strip plus
+    explicit Redis ``taey:<node>:parent`` override.
+    """
+    if not node_id:
+        return None
+    key_prefix = prefix or os.environ.get("NOTIFY_KEY_PREFIX", "taey")
+    topology = load_supervisor_topology()
+    if topology is not None:
+        if node_id in topology.supervisors:
+            return None
+        mapped = topology.worker_supervisor(node_id)
+        if mapped is not None:
+            return mapped
+    return _legacy_resolve_supervisor(redis_client, node_id, key_prefix)
 
 
 def default_notify_target(
