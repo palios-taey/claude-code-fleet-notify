@@ -174,7 +174,8 @@ but advancing fan-out from a genuinely stalled delivery loop.
 
 ## Sender identity
 
-Every message carries a `from` node id. `taey-notify` resolves it in this precedence:
+Every message carries a `from` node id. `taey-notify` resolves **envelope**
+`from` in this precedence:
 
 1. `--from <id>` — explicit per-call flag, always wins.
 2. `TAEY_NODE_ID` environment variable.
@@ -190,6 +191,11 @@ fix; `--from` overrides a single call. Because the `from` label drives inbox
 provenance (and a seat's `idle`/`inbox`/`current_task` keys resolve on the same node
 id), a seat whose resolved id does not match its role is mis-seated — fix the id, and
 confirm the seat is in the session it should be.
+
+Outward **mutation** authorization does not use that envelope chain. The
+capability session is the process tmux `#S` only. `TAEY_NODE_ID` and `--from`
+cannot skip the unbind gate (a worker cannot become a supervisor by exporting
+`TAEY_NODE_ID=conductor-codex`). Missing tmux identity fail-closes the send.
 
 ## Hook install model
 

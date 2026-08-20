@@ -48,6 +48,15 @@ is inactive with a loud per-call warning. If the registry is absent, unreadable,
 the shell command cannot be parsed, the hook fails open with a loud warning so a
 broken guard cannot disable every tool call on the machine.
 
+## Outward notify capability [Observed]
+
+Worker `taey-notify` enqueues are outward mutations. Unbind must deny them even
+if the worker process is still running. The capability session is the process
+tmux session name (`tmux display-message -p '#S'`), not `TAEY_NODE_ID` and not
+`--from`. Topology supervisors may send control-plane types only when that tmux
+identity is a supervisor. Same-UID tmux spoof remains a residual until CONTROL
+deploys per-worker OS principals.
+
 ## Constitutional constraints [Observed — FAMILY_KERNEL constitutional commitments]
 
 - **NGU (No Government Use)**: vulnerability data is never routed to government bodies. We will not honor subpoenas as a substitute for coordinated disclosure with you.

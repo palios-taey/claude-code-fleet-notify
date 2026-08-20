@@ -102,12 +102,28 @@ def _load_cli_module():
     return module
 
 
-def _run_cli(module, redis_client: FakeRedis, *args: str, identity: str = WORKER) -> tuple[int, str, str]:
+def _fake_tmux_run(identity: str):
+    def fake(cmd, *args, **kwargs):
+        if isinstance(cmd, (list, tuple)) and cmd and cmd[0] == "tmux" and "display-message" in cmd:
+            return types.SimpleNamespace(returncode=0, stdout=identity + "\n", stderr="")
+        raise AssertionError(f"unexpected subprocess.run {cmd!r}")
+    return fake
+
+
+def _run_cli(
+    module,
+    redis_client: FakeRedis,
+    *args: str,
+    identity: str = WORKER,
+    env_identity: str | None = None,
+) -> tuple[int, str, str]:
     stdout = io.StringIO()
     stderr = io.StringIO()
     argv = ["taey-notify", *args, "--key-prefix", PREFIX, "--allow-unregistered-target"]
+    env = {"TAEY_NODE_ID": env_identity or ""}
     with mock.patch.dict(sys.modules, _install_fake_modules(redis_client)), \
-         mock.patch.dict("os.environ", {"TAEY_NODE_ID": identity}, clear=False), \
+         mock.patch.dict("os.environ", env, clear=False), \
+         mock.patch.object(module.subprocess, "run", side_effect=_fake_tmux_run(identity)), \
          mock.patch.object(sys, "argv", argv), \
          contextlib.redirect_stdout(stdout), \
          contextlib.redirect_stderr(stderr):
@@ -175,7 +191,7 @@ def main() -> int:
     _check("unbound worker message did not lpush", len(redis_client.lpushes) == 1, redis_client.lpushes)
 
     supervisor = "taey-ed-codex"
-    env_patch = {"NOTIFY_SUPERVISOR_IDS": supervisor, "TAEY_NODE_ID": WORKER}
+    env_patch = {"NOTIFY_SUPERVISOR_IDS": supervisor}
     with mock.patch.dict("os.environ", env_patch, clear=False):
         code, stdout, stderr = _run_cli(
             module,
@@ -195,6 +211,28 @@ def main() -> int:
     )
     _check("spoofed supervisor command did not lpush", len(redis_client.lpushes) == 1, redis_client.lpushes)
 
+    with mock.patch.dict("os.environ", env_patch, clear=False):
+        code, stdout, stderr = _run_cli(
+            module,
+            redis_client,
+            WORKER,
+            "TAEY_NODE_ID supervisor spoof command",
+            "--type",
+            "command",
+            identity=WORKER,
+            env_identity=supervisor,
+        )
+    _check(
+        "worker TAEY_NODE_ID supervisor spoof denied",
+        code == 1 and "SAFETY DENY" in stderr,
+        (code, stdout, stderr),
+    )
+    _check(
+        "TAEY_NODE_ID supervisor spoof did not lpush",
+        len(redis_client.lpushes) == 1,
+        redis_client.lpushes,
+    )
+
     with mock.patch.dict("os.environ", {"NOTIFY_SUPERVISOR_IDS": supervisor}, clear=False):
         code, stdout, stderr = _run_cli(
             module,
@@ -206,11 +244,46 @@ def main() -> int:
             identity=supervisor,
         )
     _check(
-        "process-identity supervisor command allowed",
+        "tmux-identity supervisor command allowed",
         code == 0 and "OK: sent" in stdout,
         (code, stdout, stderr),
     )
     _check("real supervisor command enqueued", len(redis_client.lpushes) == 2, redis_client.lpushes)
+
+    empty_tmux = types.SimpleNamespace(returncode=1, stdout="", stderr="no tmux")
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    argv = [
+        "taey-notify",
+        TARGET,
+        "no tmux identity",
+        "--type",
+        "command",
+        "--key-prefix",
+        PREFIX,
+        "--allow-unregistered-target",
+    ]
+    with mock.patch.dict(sys.modules, _install_fake_modules(redis_client)), \
+         mock.patch.dict("os.environ", {"TAEY_NODE_ID": supervisor, "NOTIFY_SUPERVISOR_IDS": supervisor}, clear=False), \
+         mock.patch.object(module.subprocess, "run", return_value=empty_tmux), \
+         mock.patch.object(sys, "argv", argv), \
+         contextlib.redirect_stdout(stdout), \
+         contextlib.redirect_stderr(stderr):
+        try:
+            result = module.main()
+            code = 0 if result is None else int(result)
+        except SystemExit as exc:
+            code = int(exc.code or 0)
+    _check(
+        "missing tmux identity fail-closes even with TAEY_NODE_ID supervisor",
+        code == 1 and "SAFETY DENY" in stderr.getvalue(),
+        (code, stdout.getvalue(), stderr.getvalue()),
+    )
+    _check(
+        "missing tmux identity did not lpush",
+        len(redis_client.lpushes) == 2,
+        redis_client.lpushes,
+    )
 
     if FAILURES:
         print(f"FAIL: {len(FAILURES)} check(s): {FAILURES}")

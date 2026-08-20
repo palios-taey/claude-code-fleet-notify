@@ -34,11 +34,8 @@ NOTIFY_KEY_PREFIX = os.environ.get('NOTIFY_KEY_PREFIX', 'taey')
 DEFAULT_TARGET_TYPES = {'defect', 'response_ready', 'result', 'status', 'escalation'}
 
 
-def detect_from_node():
-    """Auto-detect sender identity."""
-    explicit = os.environ.get('TAEY_NODE_ID')
-    if explicit:
-        return explicit
+def detect_tmux_session():
+    """Return the tmux session name for this process, or empty."""
     try:
         result = subprocess.run(
             ['tmux', 'display-message', '-p', '#S'],
@@ -48,6 +45,22 @@ def detect_from_node():
             return result.stdout.strip()
     except Exception:
         pass
+    return ""
+
+
+def detect_capability_session():
+    """Process identity for outward notify mutation. Never TAEY_NODE_ID or --from."""
+    return detect_tmux_session()
+
+
+def detect_from_node():
+    """Auto-detect envelope sender identity (metadata only, not the mutation gate)."""
+    explicit = os.environ.get('TAEY_NODE_ID')
+    if explicit:
+        return explicit
+    session = detect_tmux_session()
+    if session:
+        return session
     import socket
     return socket.gethostname()
 
@@ -128,8 +141,8 @@ def main():
                         help='Explicitly allow an intentional pre-provisioning send to an unregistered/readerless target when policy permits')
     args = parser.parse_args()
 
-    capability_session = detect_from_node()
-    from_node = args.from_node or capability_session
+    capability_session = detect_capability_session()
+    from_node = args.from_node or detect_from_node()
 
     if args.type == 'escalation' and args.priority == 'normal':
         args.priority = 'high'

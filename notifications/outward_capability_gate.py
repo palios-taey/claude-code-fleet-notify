@@ -123,10 +123,13 @@ def require_outward_notify_capability(
 ) -> str:
     """Authorize worker outward notify. Returns which gate fired: orch|skip.
 
-    ``capability_session`` is the process identity (tmux/TAEY_NODE_ID). Claimed
-    ``from_node``/``--from`` is envelope metadata only and cannot skip the gate.
+    ``capability_session`` is the process tmux session (never ``TAEY_NODE_ID``
+    or ``--from``). Claimed envelope identity cannot skip the gate.
     """
-    identity = str(capability_session or from_node or "").strip()
+    if capability_session is None:
+        identity = str(from_node or "").strip()
+    else:
+        identity = str(capability_session).strip()
     if not identity:
         raise OutwardNotifyDenied("process identity is required for outward notify mutation")
     if is_control_plane_exception(identity, msg_type):
