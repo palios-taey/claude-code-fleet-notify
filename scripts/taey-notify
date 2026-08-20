@@ -48,11 +48,6 @@ def detect_tmux_session():
     return ""
 
 
-def detect_capability_session():
-    """Process identity for outward notify mutation. Never TAEY_NODE_ID or --from."""
-    return detect_tmux_session()
-
-
 def detect_from_node():
     """Auto-detect envelope sender identity (metadata only, not the mutation gate)."""
     explicit = os.environ.get('TAEY_NODE_ID')
@@ -141,7 +136,6 @@ def main():
                         help='Explicitly allow an intentional pre-provisioning send to an unregistered/readerless target when policy permits')
     args = parser.parse_args()
 
-    capability_session = detect_capability_session()
     from_node = args.from_node or detect_from_node()
 
     if args.type == 'escalation' and args.priority == 'normal':
@@ -186,7 +180,7 @@ def main():
             args.type,
             r,
             key_prefix=args.key_prefix,
-            capability_session=capability_session,
+            handle=os.environ.get("ORCH_OUTWARD_HANDLE") or "",
         )
     except OutwardNotifyDenied as exc:
         print(f"SAFETY DENY: {exc}", file=sys.stderr)

@@ -18,6 +18,7 @@ from notifications.outward_capability_gate import (  # noqa: E402
 
 
 FAILURES: list[str] = []
+LIVE_HANDLE = "live-handle-conductor-grok"
 
 
 def _check(label: str, condition: bool, detail: object = "") -> None:
@@ -62,8 +63,14 @@ def main() -> int:
             )
         return {"allowed": True}
 
+    def require_outward_handle(handle: str, **kwargs):
+        if str(handle or "").strip() != LIVE_HANDLE:
+            raise FakeOutwardAuthorizationError("missing or revoked outward possession handle")
+        return require_outward_capability(session, **kwargs)
+
     outward.OutwardAuthorizationError = FakeOutwardAuthorizationError
     outward.require_outward_capability = require_outward_capability
+    outward.require_outward_handle = require_outward_handle
     sys.modules["fleet_orchestrator"] = package
     sys.modules["fleet_orchestrator.outward_capability"] = outward
 
@@ -73,8 +80,7 @@ def main() -> int:
     except OutwardNotifyDenied as exc:
         _check(
             "unbound worker message denied",
-            "no live current_task binding" in str(exc)
-            or "fleet_orchestrator outward capability required" in str(exc),
+            "missing or revoked outward possession handle" in str(exc),
             exc,
         )
 
@@ -90,7 +96,7 @@ def main() -> int:
     )
     try:
         gate = require_outward_notify_capability(
-            session, "response_ready", redis, key_prefix=prefix
+            session, "response_ready", redis, key_prefix=prefix, handle=LIVE_HANDLE
         )
         _check("bound response_ready allowed via orch gate", gate == "orch", gate)
     except OutwardNotifyDenied as exc:
@@ -103,7 +109,7 @@ def main() -> int:
     redis.delete(key)
     try:
         require_outward_notify_capability(
-            session, "response_ready", redis, key_prefix=prefix
+            session, "response_ready", redis, key_prefix=prefix, handle=LIVE_HANDLE
         )
         _check("unbound response_ready denied", False, "expected OutwardNotifyDenied")
     except OutwardNotifyDenied as exc:
@@ -123,13 +129,13 @@ def main() -> int:
         )
         try:
             require_outward_notify_capability(
-                "taey-ed-codex", "not-a-type", redis, key_prefix=prefix
+                "taey-ed-codex", "command", redis, key_prefix=prefix
             )
-            _check("supervisor unknown type denied", False, "expected OutwardNotifyDenied")
+            _check("supervisor without handle denied", False, "expected OutwardNotifyDenied")
         except OutwardNotifyDenied as exc:
             _check(
-                "supervisor unknown type denied",
-                "no live current_task binding" in str(exc),
+                "supervisor without handle denied",
+                "missing or revoked outward possession handle" in str(exc),
                 exc,
             )
 
