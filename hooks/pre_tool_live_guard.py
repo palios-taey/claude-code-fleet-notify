@@ -16,12 +16,23 @@ from _shared import live_guard_decision, log_debug, read_stdin_json
 
 
 def _emit_claude_or_codex(event_name: str, allowed: bool, reason: str) -> None:
-    decision = "allow" if allowed else "deny"
+    if allowed:
+        if reason:
+            print(json.dumps({
+                "hookSpecificOutput": {
+                    "hookEventName": event_name,
+                    "additionalContext": reason,
+                }
+            }))
+        else:
+            print(json.dumps({}))
+        return
+
     payload = {
         "hookSpecificOutput": {
             "hookEventName": event_name,
-            "permissionDecision": decision,
-            "permissionDecisionReason": reason or "live-path guard allow",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": reason,
         }
     }
     print(json.dumps(payload))
