@@ -161,6 +161,7 @@ def main():
             from_node=from_node,
             msg_type=args.type,
             body=message,
+            explicit_handoff=args.handoff,
         )
         if not allowed:
             print(reason, file=sys.stderr)

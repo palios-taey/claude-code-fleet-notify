@@ -53,7 +53,8 @@ Main Taey is already serving a model turn. An exact `target=taey`,
 extraction status, and non-empty monitor/platform/display identities may queue
 behind a non-empty inbox only while Taey has both a positive `turns_open`
 projection and an unexpired active-turn lease. Malformed receipts, council
-targets, and every ordinary notification retain the non-draining-inbox refusal.
+targets, explicit handoffs, and every ordinary notification retain the
+non-draining-inbox refusal.
 The receipt uses the ordinary `${NOTIFY_KEY_PREFIX:-taey}:taey:inbox`: writers
 `LPUSH`, the Presence reader `LMOVE`s from `RIGHT`, so delivery remains FIFO and
 the receipt does not jump ahead of older actionable mail. Send success still

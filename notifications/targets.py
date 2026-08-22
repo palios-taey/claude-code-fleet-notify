@@ -376,12 +376,14 @@ def _is_consult_terminal_receipt(
     from_node: str,
     msg_type: str,
     body: str,
+    explicit_handoff: bool,
 ) -> bool:
     if (
         target != "taey"
         or from_node != CONSULT_TERMINAL_RECEIPT_SENDER
         or msg_type != "result"
         or not isinstance(body, str)
+        or explicit_handoff
     ):
         return False
     try:
@@ -791,6 +793,7 @@ def validate_target_reader(
     from_node: str = "",
     msg_type: str = "",
     body: str = "",
+    explicit_handoff: bool = False,
 ) -> tuple[bool, str]:
     try:
         snapshot = target_liveness_snapshot(
@@ -814,6 +817,7 @@ def validate_target_reader(
             from_node=from_node,
             msg_type=msg_type,
             body=body,
+            explicit_handoff=explicit_handoff,
         )
         and _has_unexpired_taey_turn(snapshot, target)
     ):

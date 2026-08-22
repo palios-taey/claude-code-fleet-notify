@@ -486,6 +486,23 @@ def main() -> int:
         )
 
     ok, error = validate_target_reader(
+        queued_taey,
+        "taey",
+        "check",
+        tmux_sessions=set(),
+        registered_sessions={"taey"},
+        from_node="consult-monitor",
+        msg_type="result",
+        body=json.dumps(receipt),
+        explicit_handoff=True,
+    )
+    _check(
+        "explicit handoff cannot use the record-only exception",
+        not ok and "check 2 failed" in error,
+        error,
+    )
+
+    ok, error = validate_target_reader(
         redis_client,
         "taey-council-5",
         "check",
