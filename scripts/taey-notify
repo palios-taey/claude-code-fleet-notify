@@ -17,7 +17,6 @@ Usage:
 import argparse
 import json
 import os
-import subprocess
 import sys
 import time
 import uuid
@@ -35,19 +34,14 @@ DEFAULT_TARGET_TYPES = {'defect', 'response_ready', 'result', 'status', 'escalat
 
 
 def detect_from_node():
-    """Auto-detect sender identity."""
+    """Auto-detect envelope sender identity (metadata only, not the mutation gate)."""
     explicit = os.environ.get('TAEY_NODE_ID')
     if explicit:
         return explicit
-    try:
-        result = subprocess.run(
-            ['tmux', 'display-message', '-p', '#S'],
-            capture_output=True, text=True, timeout=2,
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            return result.stdout.strip()
-    except Exception:
-        pass
+    from identity import detect_tmux_session
+    session = detect_tmux_session()
+    if session:
+        return session
     import socket
     return socket.gethostname()
 
@@ -128,7 +122,19 @@ def main():
                         help='Explicitly allow an intentional pre-provisioning send to an unregistered/readerless target when policy permits')
     args = parser.parse_args()
 
-    from_node = args.from_node or detect_from_node()
+    from identity import detect_capability_session
+
+    capability_session = detect_capability_session()
+    if not capability_session:
+        print("SAFETY DENY: process tty/session identity is required for outward notify", file=sys.stderr)
+        sys.exit(1)
+    if args.from_node and args.from_node != capability_session:
+        print(
+            "SAFETY DENY: envelope --from does not match authenticated principal",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    from_node = capability_session
 
     if args.type == 'escalation' and args.priority == 'normal':
         args.priority = 'high'
@@ -166,6 +172,26 @@ def main():
         if not allowed:
             print(reason, file=sys.stderr)
             sys.exit(1)
+
+    # P0 safety (task-f396305d): revoke worker outward notify after unbind.
+    # Prefers orch authorize_outward_capability (shared with GitHub); else Redis current_task.
+    from notifications.outward_capability_gate import (
+        OutwardNotifyDenied,
+        require_outward_notify_capability,
+    )
+
+    try:
+        require_outward_notify_capability(
+            from_node,
+            args.type,
+            r,
+            key_prefix=args.key_prefix,
+            capability_session=capability_session,
+        )
+    except OutwardNotifyDenied as exc:
+        print(f"SAFETY DENY: {exc}", file=sys.stderr)
+        sys.exit(1)
+
     if args.handoff:
         from notifications.handoff import create_explicit_handoff
 
