@@ -10,14 +10,21 @@ from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 
-from notifications.targets import validate_target_reader
+from notifications.targets import target_liveness_snapshot, validate_target_reader
 
 
 class FakeRedis:
-    def __init__(self, values: dict[str, object], lengths: dict[str, object], trace_entries: list[tuple[str, dict[str, str]]]):
+    def __init__(
+        self,
+        values: dict[str, object],
+        lengths: dict[str, object],
+        trace_entries: list[tuple[str, dict[str, str]]],
+        sorted_sets: dict[str, object] | None = None,
+    ):
         self._values = dict(values)
         self._lengths = dict(lengths)
         self._trace_entries = list(trace_entries)
+        self._sorted_sets = dict(sorted_sets or {})
 
     def scan_iter(self, match: str, count: int = 1000):
         del count
@@ -46,6 +53,25 @@ class FakeRedis:
             return []
         return list(self._trace_entries)
 
+    def zrangebyscore(self, key: str, minimum: str, maximum: str, withscores: bool = False):
+        del maximum
+        value = self._sorted_sets.get(key, [])
+        if isinstance(value, Exception):
+            raise value
+        threshold = float(str(minimum).removeprefix("("))
+        entries = []
+        for entry in value:
+            try:
+                score = float(entry[1])
+            except (TypeError, ValueError):
+                entries.append(entry)
+                continue
+            if score > threshold:
+                entries.append(entry)
+        if withscores:
+            return entries
+        return [entry[0] for entry in entries]
+
 
 def _check(name: str, condition: bool, detail: object) -> None:
     if not condition:
@@ -63,7 +89,8 @@ def main() -> int:
             "check:stale-seat:last_activity": str(now - 86400),
             "check:depth-error:last_activity": str(now),
             "check:activity-error:last_activity": RuntimeError("simulated GET failure"),
-            "check:taey:last_activity": str(now),
+            "check:taey:last_activity": str(now - 86400),
+            "check:taey:turns_open": "1",
             "check:stale-idle:last_activity": str(now - 86400),
             "check:stale-idle:idle": "1",
             "check:stale-idle:turns_open": "0",
@@ -72,6 +99,16 @@ def main() -> int:
             "check:taey-council-1:turns_open": "0",
             "check:taey-council-1:seat_registration": "{}",
             "check:taey-council-1:last_drain_at": str(now),
+            "check:taey-council-2:last_activity": str(now - 86400),
+            "check:taey-council-2:turns_open": "1",
+            "check:taey-council-3:last_activity": str(now - 86400),
+            "check:taey-council-3:turns_open": "1",
+            "check:taey-council-4:last_activity": str(now - 86400),
+            "check:taey-council-4:turns_open": "1",
+            "check:taey-council-5:last_activity": str(now - 86400),
+            "check:taey-council-5:turns_open": "1",
+            "check:lookalike-active:last_activity": str(now - 86400),
+            "check:lookalike-active:turns_open": "1",
             "check:dead-headless:last_activity": str(now - 86400),
             "check:dead-headless:turns_open": "0",
             "check:dead-headless:seat_registration": "{}",
@@ -87,10 +124,19 @@ def main() -> int:
             "check:depth-error:inbox": RuntimeError("simulated LLEN failure"),
             "check:dead-headless:inbox": 4,
             "check:idle-piling:inbox": 5,
+            "check:taey-council-5:inbox": 5,
         },
         trace_entries=[
             ("1-0", {"ev": "drain", "node": "draining-seat", "wall": str(now)}),
         ],
+        sorted_sets={
+            "check:taey:active_turns": [("turn-live", now + 120)],
+            "check:taey-council-2:active_turns": [("turn-expired", now - 1)],
+            "check:taey-council-3:active_turns": [("turn-malformed", "not-a-score")],
+            "check:taey-council-4:active_turns": RuntimeError("simulated ZRANGEBYSCORE failure"),
+            "check:taey-council-5:active_turns": [("turn-live-backlog", now + 120)],
+            "check:lookalike-active:active_turns": [("turn-lookalike", now + 120)],
+        },
     )
 
     ok, error = validate_target_reader(
@@ -187,7 +233,94 @@ def main() -> int:
         tmux_sessions=set(),
         registered_sessions={"taey"},
     )
-    _check("registered headless taey passes without tmux", ok, "taey")
+    _check("canonical Taey active lease passes despite stale last_activity", ok, "taey")
+
+    snapshot = target_liveness_snapshot(
+        redis_client,
+        "check",
+        tmux_sessions=set(),
+        registered_sessions={"taey"},
+    )
+    _check(
+        "canonical Taey pass exposes active-reader diagnostic",
+        "taey" in snapshot["active_reader"],
+        snapshot,
+    )
+    _check(
+        "canonical Taey pass exposes unexpired lease count",
+        snapshot["unexpired_active_turns"].get("taey") == 1,
+        snapshot,
+    )
+
+    ok, error = validate_target_reader(
+        redis_client,
+        "taey-council-2",
+        "check",
+        tmux_sessions=set(),
+        registered_sessions=set(),
+    )
+    _check(
+        "canonical Taey expired lease fails check 3",
+        not ok and "check 3 failed" in error,
+        error,
+    )
+    _check(
+        "expired lease diagnostic reports zero unexpired turns",
+        "unexpired_active_turns=0" in error,
+        error,
+    )
+
+    ok, error = validate_target_reader(
+        redis_client,
+        "taey-council-3",
+        "check",
+        tmux_sessions=set(),
+        registered_sessions=set(),
+    )
+    _check(
+        "malformed active-turn lease fails closed",
+        not ok and "check 3 failed" in error and "invalid lease score" in error,
+        error,
+    )
+
+    ok, error = validate_target_reader(
+        redis_client,
+        "taey-council-4",
+        "check",
+        tmux_sessions=set(),
+        registered_sessions=set(),
+    )
+    _check(
+        "unreadable active-turn lease fails closed",
+        not ok and "check 3 failed" in error and "simulated ZRANGEBYSCORE failure" in error,
+        error,
+    )
+
+    ok, error = validate_target_reader(
+        redis_client,
+        "lookalike-active",
+        "check",
+        tmux_sessions={"lookalike-active"},
+        registered_sessions=set(),
+    )
+    _check(
+        "non-Taey active-turn key cannot bypass stale activity",
+        not ok and "check 3 failed" in error,
+        error,
+    )
+
+    ok, error = validate_target_reader(
+        redis_client,
+        "taey-council-5",
+        "check",
+        tmux_sessions=set(),
+        registered_sessions=set(),
+    )
+    _check(
+        "canonical Taey live lease cannot bypass non-draining inbox",
+        not ok and "check 2 failed" in error,
+        error,
+    )
 
     ok, _ = validate_target_reader(
         redis_client,
