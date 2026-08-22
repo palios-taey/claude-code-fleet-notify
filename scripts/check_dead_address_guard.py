@@ -270,6 +270,44 @@ def main() -> int:
         error,
     )
 
+    # PR98 regression: a canonical Taey line reader with turns_open=1 and only an
+    # expired active turn must fail closed even when the local tmux probe is unknown.
+    # The generic tmux_probe_error fallback must never re-admit a Taey line reader
+    # after the authoritative active-reader predicate already failed on
+    # unexpired_active_turns=0 (fallback guarded with `not is_taey_line_reader`).
+    with patch(
+        "notifications.targets.subprocess.run",
+        side_effect=subprocess.TimeoutExpired(["tmux", "list-sessions"], timeout=2),
+    ):
+        ok, error = validate_target_reader(
+            redis_client,
+            "taey-council-2",
+            "check",
+            tmux_sessions=None,
+            registered_sessions=set(),
+        )
+        snapshot = target_liveness_snapshot(
+            redis_client,
+            "check",
+            tmux_sessions=None,
+            registered_sessions=set(),
+        )
+    _check(
+        "canonical Taey expired lease fails check 3 even when tmux probe is unknown",
+        not ok and "check 3 failed" in error,
+        error,
+    )
+    _check(
+        "canonical Taey expired lease not admitted as active_reader under unknown probe",
+        "taey-council-2" not in snapshot["active_reader"],
+        snapshot["active_reader"],
+    )
+    _check(
+        "canonical Taey expired lease not admitted via probe_unknown_allowed under unknown probe",
+        "taey-council-2" not in snapshot["probe_unknown_allowed"],
+        snapshot["probe_unknown_allowed"],
+    )
+
     ok, error = validate_target_reader(
         redis_client,
         "taey-council-3",

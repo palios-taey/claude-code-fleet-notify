@@ -539,7 +539,7 @@ def target_liveness_snapshot(
             if fresh_activity or idle_drained or headless_ready:
                 reader.add(node_id)
                 continue
-        if tmux_probe_error and (registered_target or has_state_signal or is_taey_line_reader):
+        if tmux_probe_error and not is_taey_line_reader and (registered_target or has_state_signal):
             probe_unknown_allowed.add(node_id)
             reader.add(node_id)
             continue
