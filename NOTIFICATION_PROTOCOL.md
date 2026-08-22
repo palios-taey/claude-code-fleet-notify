@@ -35,8 +35,14 @@ three-check reader-readiness gate before Redis is mutated: the target has a
 reader signal through tmux or first-class headless/line-reader presence; queued
 mail is zero or visibly draining; and the reader is active, explicitly idle with
 an empty queue, or a headless reader with fresh activity or recent drain
-evidence. If the local tmux probe itself is unavailable, known targets
-degrade to warn-and-send rather than blocking the notify channel. A failed check
+evidence. Exact canonical Taey line readers also count as active when
+`turns_open > 0`, their `active_turns` sorted set contains an unexpired lease,
+and their queue is empty or visibly draining. This lease projection is not
+accepted for arbitrary targets. Non-Taey targets
+that are registered or carry a first-class state signal are admitted for send rather than blocked
+solely because the local tmux probe is unavailable; canonical Taey line readers never take this
+degraded admission and must still satisfy one of the ordinary fresh/idle/headless readiness paths or the canonical
+active-turn lease predicate; an expired lease alone never authorizes delivery. A failed check
 exits nonzero and prints the currently eligible targets.
 Use `--allow-unregistered-target` (alias `--allow-readerless-target`) only for intentional pre-provisioning sends.
 
@@ -134,6 +140,8 @@ Tmux is used only when the session is stopped and `idle=1`, and it carries only 
 | `${NOTIFY_KEY_PREFIX:-taey}:SESSION:last_tool_activity` | last tool-hook activity timestamp, used for handoff activation observation |
 | `${NOTIFY_KEY_PREFIX:-taey}:SESSION:tool_running` | transient tool-running flag set by PreToolUse and cleared by PostToolUse |
 | `${NOTIFY_KEY_PREFIX:-taey}:SESSION:tool_running_at` | epoch timestamp stamped with `tool_running=1`, used by orchestrator liveness to age-bound long-running tools |
+| `${NOTIFY_KEY_PREFIX:-taey}:SESSION:turns_open` | Taey line-reader compatibility projection of attributable open-turn membership |
+| `${NOTIFY_KEY_PREFIX:-taey}:SESSION:active_turns` | Taey line-reader sorted set of turn IDs scored by lease expiry epoch |
 | `${NOTIFY_KEY_PREFIX:-taey}:_notify_daemon:heartbeat` | daemon process liveness timestamp, written from an independent heartbeat thread |
 | `${NOTIFY_KEY_PREFIX:-taey}:_notify_daemon:delivery_progress` | daemon delivery-loop progress cursor, advanced by the serial tmux-delivery loop |
 

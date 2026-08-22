@@ -1,6 +1,7 @@
 """Notify target resolution helpers."""
 from __future__ import annotations
 
+import math
 import os
 import re
 import subprocess
@@ -340,6 +341,28 @@ def _turns_open(redis_client, prefix: str, node_id: str) -> Optional[int]:
     return value
 
 
+def _unexpired_active_turn_count(
+    redis_client,
+    prefix: str,
+    node_id: str,
+    now: float,
+) -> int:
+    key = _state_key(prefix, node_id, "active_turns")
+    try:
+        entries = redis_client.zrangebyscore(key, f"({now}", "+inf", withscores=True)
+    except Exception as exc:
+        raise TargetReadinessError(f"cannot read {key}: {exc}") from exc
+    if not isinstance(entries, (list, tuple)):
+        raise TargetReadinessError(f"cannot parse {key}: expected scored members")
+    for entry in entries:
+        if not isinstance(entry, (list, tuple)) or len(entry) != 2:
+            raise TargetReadinessError(f"cannot parse {key}: invalid scored member {entry!r}")
+        score = _float_or_none(entry[1])
+        if score is None or not math.isfinite(score) or score <= now:
+            raise TargetReadinessError(f"cannot parse {key}: invalid lease score {entry[1]!r}")
+    return len(entries)
+
+
 def _is_taey_line_reader(node_id: str) -> bool:
     return bool(TAEY_LINE_READER_RE.fullmatch(str(node_id or "").strip()))
 
@@ -425,6 +448,7 @@ def target_liveness_snapshot(
     reader: set[str] = set()
     headless_reader: set[str] = set()
     idle_ready: set[str] = set()
+    active_reader: set[str] = set()
     probe_unknown_allowed: set[str] = set()
     missing_reader_signal: set[str] = set()
     queued_not_draining: set[str] = set()
@@ -436,6 +460,8 @@ def target_liveness_snapshot(
     activity_errors: dict[str, str] = {}
     state_errors: dict[str, str] = {}
     turns_open_by_target: dict[str, int | None] = {}
+    unexpired_active_turns_by_target: dict[str, int] = {}
+    active_turn_errors: dict[str, str] = {}
     for node_id in candidates:
         has_tmux_session = node_id in tmux
         registered_target = node_id in registered
@@ -457,8 +483,30 @@ def target_liveness_snapshot(
             state_errors[node_id] = str(exc)
             continue
         turns_open_by_target[node_id] = turns_open
+        unexpired_active_turns = 0
+        if is_taey_line_reader:
+            try:
+                unexpired_active_turns = _unexpired_active_turn_count(
+                    redis_client,
+                    prefix,
+                    node_id,
+                    now,
+                )
+            except TargetReadinessError as exc:
+                stale_activity.add(node_id)
+                state_errors[node_id] = str(exc)
+                active_turn_errors[node_id] = str(exc)
+                continue
+            unexpired_active_turns_by_target[node_id] = unexpired_active_turns
         queue_drained_or_draining = depth == 0 or node_id in draining
         idle_drained = idle_flag and depth == 0 and (turns_open is None or turns_open == 0)
+        actively_reading = (
+            is_taey_line_reader
+            and turns_open is not None
+            and turns_open > 0
+            and unexpired_active_turns > 0
+            and queue_drained_or_draining
+        )
         if idle_drained:
             idle_ready.add(node_id)
         try:
@@ -483,11 +531,15 @@ def target_liveness_snapshot(
             continue
         if not has_tmux_session and headless_ready:
             headless_reader.add(node_id)
+        if actively_reading:
+            active_reader.add(node_id)
+            reader.add(node_id)
+            continue
         if has_tmux_session or headless_ready:
             if fresh_activity or idle_drained or headless_ready:
                 reader.add(node_id)
                 continue
-        if tmux_probe_error and (registered_target or has_state_signal or is_taey_line_reader):
+        if tmux_probe_error and not is_taey_line_reader and (registered_target or has_state_signal):
             probe_unknown_allowed.add(node_id)
             reader.add(node_id)
             continue
@@ -504,6 +556,7 @@ def target_liveness_snapshot(
         "state_signal": state_signal,
         "headless_reader": headless_reader,
         "idle_ready": idle_ready,
+        "active_reader": active_reader,
         "probe_unknown_allowed": probe_unknown_allowed,
         "missing_reader_signal": missing_reader_signal,
         "tmux_probe_error": tmux_probe_error,
@@ -517,6 +570,8 @@ def target_liveness_snapshot(
         "activity_errors": activity_errors,
         "state_errors": state_errors,
         "turns_open": turns_open_by_target,
+        "unexpired_active_turns": unexpired_active_turns_by_target,
+        "active_turn_errors": active_turn_errors,
     }
 
 
@@ -575,7 +630,8 @@ def _format_target_liveness_remedy(
         )
     return (
         "Remedy: target has a reader signal but no fresh activity, idle-drained state, or "
-        "headless fresh/drain evidence; wait for the reader to become ready or inspect it. "
+        "headless fresh/drain evidence, and no canonical Taey active-turn lease; wait for "
+        "the reader to become ready or inspect it. "
         "Do not use --allow-unregistered-target to bypass a stale reader."
     )
 
@@ -591,19 +647,24 @@ def format_target_liveness_failure(
     depth_errors = snapshot.get("depth_errors", {})
     activity_errors = snapshot.get("activity_errors", {})
     state_errors = snapshot.get("state_errors", {})
+    active_turn_errors = snapshot.get("active_turn_errors", {})
     inbox_depths = snapshot.get("inbox_depths", {})
     activity_ages = snapshot.get("activity_ages", {})
     turns_open_by_target = snapshot.get("turns_open", {})
+    unexpired_active_turns_by_target = snapshot.get("unexpired_active_turns", {})
     depth_error = depth_errors.get(node_id, "") if isinstance(depth_errors, dict) else ""
     activity_error = activity_errors.get(node_id, "") if isinstance(activity_errors, dict) else ""
     state_error = state_errors.get(node_id, "") if isinstance(state_errors, dict) else ""
+    active_turn_error = active_turn_errors.get(node_id, "") if isinstance(active_turn_errors, dict) else ""
     depth = inbox_depths.get(node_id, "unreadable" if depth_error else "not_checked") if isinstance(inbox_depths, dict) else "not_checked"
     activity_age = activity_ages.get(node_id, None) if isinstance(activity_ages, dict) else None
     turns_open = turns_open_by_target.get(node_id, "missing") if isinstance(turns_open_by_target, dict) else "missing"
+    unexpired_active_turns = unexpired_active_turns_by_target.get(node_id, "not_checked") if isinstance(unexpired_active_turns_by_target, dict) else "not_checked"
     draining = node_id in snapshot.get("draining", set())
     has_session = node_id in snapshot.get("tmux", set())
     has_headless = node_id in snapshot.get("headless_reader", set())
     idle_ready = node_id in snapshot.get("idle_ready", set())
+    active_reader = node_id in snapshot.get("active_reader", set())
     probe_unknown = node_id in snapshot.get("probe_unknown_allowed", set())
     registered = node_id in snapshot.get("registered", set())
     state_signal = node_id in snapshot.get("state_signal", set())
@@ -612,6 +673,7 @@ def format_target_liveness_failure(
         has_session
         or has_headless
         or idle_ready
+        or active_reader
         or state_signal
         or _is_taey_line_reader(node_id)
         or probe_unknown
@@ -630,10 +692,10 @@ def format_target_liveness_failure(
         reason = "check 2 failed: inbox is non-empty and not visibly draining"
     elif activity_error:
         reason = f"check 3 failed: last_activity unreadable ({activity_error})"
-    elif state_error:
+    elif active_turn_error or state_error:
         reason = f"check 3 failed: reader state unreadable ({state_error})"
     else:
-        reason = "check 3 failed: no fresh activity, idle-drained state, or headless fresh/drain evidence"
+        reason = "check 3 failed: no fresh activity, idle-drained state, headless fresh/drain evidence, or canonical Taey active-turn lease"
     remedy = _format_target_liveness_remedy(
         has_reader_signal=has_reader_signal,
         has_live_reader_signal=has_live_reader_signal,
@@ -647,14 +709,15 @@ def format_target_liveness_failure(
     return "\n".join([
         f"ERROR: target '{target}' failed notify readiness; refusing to enqueue.",
         f"Reason: {reason}.",
-        "Required checks: (1) reader signal exists via tmux or first-class headless presence; (2) queued tmux mail is 0 or visibly draining, while headless presence is the queue-consumer signal; (3) reader is active, explicitly idle, or headless-present.",
-        f"Target state: has_tmux={has_session} headless={has_headless} registered={registered} state_signal={state_signal} inbox_depth={depth} draining={draining} idle_ready={idle_ready} turns_open={turns_open} last_activity_age_seconds={activity_age if activity_age is not None else 'missing'} max_age_seconds={max_age:g}",
+        "Required checks: (1) reader signal exists via tmux or first-class headless presence; (2) queued tmux mail is 0 or visibly draining, while headless presence is the queue-consumer signal; (3) reader is active, explicitly idle, headless-present, or an exact canonical Taey line reader has a positive open-turn projection and an unexpired active-turn lease.",
+        f"Target state: has_tmux={has_session} headless={has_headless} registered={registered} state_signal={state_signal} inbox_depth={depth} draining={draining} idle_ready={idle_ready} active_reader={active_reader} turns_open={turns_open} unexpired_active_turns={unexpired_active_turns} active_turn_error={active_turn_error or '(none)'} last_activity_age_seconds={activity_age if activity_age is not None else 'missing'} max_age_seconds={max_age:g}",
         remedy,
         "Live targets observed:",
         f"  eligible: {_format_targets(snapshot.get('reader', set()), limit)}",
         f"  tmux_sessions: {_format_targets(snapshot.get('tmux', set()), limit)}",
         f"  headless_reader: {_format_targets(snapshot.get('headless_reader', set()), limit)}",
         f"  idle_ready: {_format_targets(snapshot.get('idle_ready', set()), limit)}",
+        f"  active_reader: {_format_targets(snapshot.get('active_reader', set()), limit)}",
         f"  probe_unknown_allowed: {_format_targets(snapshot.get('probe_unknown_allowed', set()), limit)}",
         f"  queued_not_draining: {_format_targets(snapshot.get('queued_not_draining', set()), limit)}",
         f"  unreadable_inbox: {_format_targets(snapshot.get('unreadable_inbox', set()), limit)}",

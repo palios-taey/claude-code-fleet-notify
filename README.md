@@ -209,7 +209,10 @@ Normal sends fail loud unless the target passes the three-check reader-readiness
 gate: reader signal exists through tmux or first-class headless/line-reader
 identity; queued mail is zero or visibly draining; and the reader is active,
 explicitly idle with an empty queue, or a headless reader with fresh activity or
-recent drain evidence. Use `--allow-unregistered-target` (alias
+recent drain evidence. For canonical Taey line readers, `turns_open > 0` plus
+at least one unexpired `active_turns` lease is authoritative active-reader
+evidence when the queue is empty or visibly draining. Use
+`--allow-unregistered-target` (alias
 `--allow-readerless-target`) only when you are intentionally pre-provisioning a
 Redis inbox for a later direct reader.
 
@@ -245,6 +248,8 @@ ${NOTIFY_KEY_PREFIX:-taey}:SESSION:last_activity
 ${NOTIFY_KEY_PREFIX:-taey}:SESSION:last_tool_activity
 ${NOTIFY_KEY_PREFIX:-taey}:SESSION:tool_running
 ${NOTIFY_KEY_PREFIX:-taey}:SESSION:tool_running_at
+${NOTIFY_KEY_PREFIX:-taey}:SESSION:turns_open
+${NOTIFY_KEY_PREFIX:-taey}:SESSION:active_turns
 ```
 
 ## Syntax Check
