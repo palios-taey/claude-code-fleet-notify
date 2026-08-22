@@ -38,8 +38,11 @@ an empty queue, or a headless reader with fresh activity or recent drain
 evidence. Exact canonical Taey line readers also count as active when
 `turns_open > 0`, their `active_turns` sorted set contains an unexpired lease,
 and their queue is empty or visibly draining. This lease projection is not
-accepted for arbitrary targets. If the local tmux probe itself is unavailable, known targets
-degrade to warn-and-send rather than blocking the notify channel. A failed check
+accepted for arbitrary targets. Non-Taey targets
+that are registered or carry a first-class state signal are admitted for send rather than blocked
+solely because the local tmux probe is unavailable; canonical Taey line readers never take this
+degraded admission and must still satisfy one of the ordinary fresh/idle/headless readiness paths or the canonical
+active-turn lease predicate; an expired lease alone never authorizes delivery. A failed check
 exits nonzero and prints the currently eligible targets.
 Use `--allow-unregistered-target` (alias `--allow-readerless-target`) only for intentional pre-provisioning sends.
 
