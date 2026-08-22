@@ -154,7 +154,14 @@ def main():
     if not args.allow_unregistered_target:
         from notifications.targets import validate_target_reader
 
-        allowed, reason = validate_target_reader(r, target, args.key_prefix)
+        allowed, reason = validate_target_reader(
+            r,
+            target,
+            args.key_prefix,
+            from_node=from_node,
+            msg_type=args.type,
+            body=message,
+        )
         if not allowed:
             print(reason, file=sys.stderr)
             sys.exit(1)

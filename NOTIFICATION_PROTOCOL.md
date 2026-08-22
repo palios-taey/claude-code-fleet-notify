@@ -46,6 +46,19 @@ active-turn lease predicate; an expired lease alone never authorizes delivery. A
 exits nonzero and prints the currently eligible targets.
 Use `--allow-unregistered-target` (alias `--allow-readerless-target`) only for intentional pre-provisioning sends.
 
+One narrow record-only exception preserves terminal consultation receipts while
+Main Taey is already serving a model turn. An exact `target=taey`,
+`from=consult-monitor`, `type=result` envelope whose JSON body declares
+`schema=taey.consult_terminal_receipt.v1`, `terminal=true`, a supported terminal
+extraction status, and non-empty monitor/platform/display identities may queue
+behind a non-empty inbox only while Taey has both a positive `turns_open`
+projection and an unexpired active-turn lease. Malformed receipts, council
+targets, and every ordinary notification retain the non-draining-inbox refusal.
+The receipt uses the ordinary `${NOTIFY_KEY_PREFIX:-taey}:taey:inbox`: writers
+`LPUSH`, the Presence reader `LMOVE`s from `RIGHT`, so delivery remains FIFO and
+the receipt does not jump ahead of older actionable mail. Send success still
+proves enqueue only, not that Presence has persisted and acknowledged the receipt.
+
 ## Participant types
 
 - **tmux-session participants** are REPL-CLI sessions with the four hooks installed. Supported CLIs: Claude Code, OpenAI codex, Google gemini, and xAI grok (see "Per-CLI hook integration" below for config-file paths and event-name mappings). The daemon injects a pointer prompt through tmux only when the session is stopped and marked idle.

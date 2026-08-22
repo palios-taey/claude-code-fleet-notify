@@ -1,6 +1,7 @@
 """Notify target resolution helpers."""
 from __future__ import annotations
 
+import json
 import math
 import os
 import re
@@ -20,6 +21,8 @@ _SESSION_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 READER_DRAIN_MARKER_SUFFIXES = ("last_drain_at", "last_read_at")
 READER_STATE_SUFFIXES = ("last_activity", "idle", "turns_open", "seat_registration")
 TAEY_LINE_READER_RE = re.compile(r"^taey(?:-council-[1-7])?$")
+CONSULT_TERMINAL_RECEIPT_SCHEMA = "taey.consult_terminal_receipt.v1"
+CONSULT_TERMINAL_RECEIPT_SENDER = "consult-monitor"
 
 
 class TargetReadinessError(RuntimeError):
@@ -365,6 +368,57 @@ def _unexpired_active_turn_count(
 
 def _is_taey_line_reader(node_id: str) -> bool:
     return bool(TAEY_LINE_READER_RE.fullmatch(str(node_id or "").strip()))
+
+
+def _is_consult_terminal_receipt(
+    *,
+    target: str,
+    from_node: str,
+    msg_type: str,
+    body: str,
+) -> bool:
+    if (
+        target != "taey"
+        or from_node != CONSULT_TERMINAL_RECEIPT_SENDER
+        or msg_type != "result"
+        or not isinstance(body, str)
+    ):
+        return False
+    try:
+        receipt = json.loads(body)
+    except (TypeError, json.JSONDecodeError):
+        return False
+    if not isinstance(receipt, dict):
+        return False
+    if (
+        receipt.get("schema") != CONSULT_TERMINAL_RECEIPT_SCHEMA
+        or receipt.get("terminal") is not True
+        or receipt.get("extraction_status") not in {"succeeded", "failed"}
+    ):
+        return False
+    return all(
+        isinstance(receipt.get(field), str) and bool(receipt[field].strip())
+        for field in ("monitor_id", "platform", "display")
+    )
+
+
+def _has_unexpired_taey_turn(snapshot: dict[str, Any], target: str) -> bool:
+    turns_open_by_target = snapshot.get("turns_open", {})
+    active_turns_by_target = snapshot.get("unexpired_active_turns", {})
+    if not isinstance(turns_open_by_target, dict) or not isinstance(
+        active_turns_by_target, dict
+    ):
+        return False
+    turns_open = turns_open_by_target.get(target)
+    active_turns = active_turns_by_target.get(target)
+    return (
+        isinstance(turns_open, int)
+        and not isinstance(turns_open, bool)
+        and turns_open > 0
+        and isinstance(active_turns, int)
+        and not isinstance(active_turns, bool)
+        and active_turns > 0
+    )
 
 
 def _state_signal_targets(redis_client, prefix: str) -> set[str]:
@@ -734,6 +788,9 @@ def validate_target_reader(
     *,
     tmux_sessions: Optional[set[str]] = None,
     registered_sessions: Optional[set[str]] = None,
+    from_node: str = "",
+    msg_type: str = "",
+    body: str = "",
 ) -> tuple[bool, str]:
     try:
         snapshot = target_liveness_snapshot(
@@ -749,5 +806,16 @@ def validate_target_reader(
             "Remedy: readiness could not be measured; retry after measurement recovers. Do not use --allow-unregistered-target to bypass an unknown reader state.",
         ])
     if target_has_reader(snapshot, target):
+        return True, ""
+    if (
+        target in snapshot.get("queued_not_draining", set())
+        and _is_consult_terminal_receipt(
+            target=target,
+            from_node=from_node,
+            msg_type=msg_type,
+            body=body,
+        )
+        and _has_unexpired_taey_turn(snapshot, target)
+    ):
         return True, ""
     return False, format_target_liveness_failure(target, snapshot)

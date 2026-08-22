@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-import time
+import json
 import os
 import subprocess
 import sys
+import time
 from fnmatch import fnmatch
 from unittest.mock import patch
 
@@ -356,6 +357,146 @@ def main() -> int:
     )
     _check(
         "canonical Taey live lease cannot bypass non-draining inbox",
+        not ok and "check 2 failed" in error,
+        error,
+    )
+
+    queued_taey = FakeRedis(
+        values={
+            "check:taey:last_activity": str(now - 86400),
+            "check:taey:turns_open": "1",
+        },
+        lengths={"check:taey:inbox": 3},
+        trace_entries=[],
+        sorted_sets={"check:taey:active_turns": [("turn-live", now + 120)]},
+    )
+    receipt = {
+        "display": ":4",
+        "extraction_status": "succeeded",
+        "monitor_id": "monitor-gemini-r1",
+        "platform": "gemini",
+        "schema": "taey.consult_terminal_receipt.v1",
+        "terminal": True,
+    }
+    ok, _ = validate_target_reader(
+        queued_taey,
+        "taey",
+        "check",
+        tmux_sessions=set(),
+        registered_sessions={"taey"},
+        from_node="consult-monitor",
+        msg_type="result",
+        body=json.dumps(receipt),
+    )
+    _check(
+        "exact consult terminal receipt queues behind active Taey turn",
+        ok,
+        receipt,
+    )
+
+    failed_receipt = {
+        **receipt,
+        "error": "mapped extraction failure",
+        "extraction_status": "failed",
+    }
+    ok, _ = validate_target_reader(
+        queued_taey,
+        "taey",
+        "check",
+        tmux_sessions=set(),
+        registered_sessions={"taey"},
+        from_node="consult-monitor",
+        msg_type="result",
+        body=json.dumps(failed_receipt),
+    )
+    _check(
+        "exact failed consult receipt queues behind active Taey turn",
+        ok,
+        failed_receipt,
+    )
+
+    inactive_taey = FakeRedis(
+        values={
+            "check:taey:last_activity": str(now - 86400),
+            "check:taey:turns_open": "0",
+        },
+        lengths={"check:taey:inbox": 3},
+        trace_entries=[],
+    )
+    ok, error = validate_target_reader(
+        inactive_taey,
+        "taey",
+        "check",
+        tmux_sessions=set(),
+        registered_sessions={"taey"},
+        from_node="consult-monitor",
+        msg_type="result",
+        body=json.dumps(receipt),
+    )
+    _check(
+        "consult receipt cannot bypass without an active Taey turn",
+        not ok and "check 2 failed" in error,
+        error,
+    )
+
+    malformed_receipts = (
+        ("wrong sender", "other-monitor", "result", json.dumps(receipt)),
+        ("wrong type", "consult-monitor", "status", json.dumps(receipt)),
+        ("invalid json", "consult-monitor", "result", "{not-json"),
+        (
+            "wrong schema",
+            "consult-monitor",
+            "result",
+            json.dumps({**receipt, "schema": "other.schema"}),
+        ),
+        (
+            "non-terminal",
+            "consult-monitor",
+            "result",
+            json.dumps({**receipt, "terminal": False}),
+        ),
+        (
+            "unsupported extraction status",
+            "consult-monitor",
+            "result",
+            json.dumps({**receipt, "extraction_status": "pending"}),
+        ),
+        (
+            "missing identity",
+            "consult-monitor",
+            "result",
+            json.dumps({**receipt, "monitor_id": ""}),
+        ),
+    )
+    for name, from_node, msg_type, body in malformed_receipts:
+        ok, error = validate_target_reader(
+            queued_taey,
+            "taey",
+            "check",
+            tmux_sessions=set(),
+            registered_sessions={"taey"},
+            from_node=from_node,
+            msg_type=msg_type,
+            body=body,
+        )
+        _check(
+            f"{name} cannot bypass non-draining inbox",
+            not ok and "check 2 failed" in error,
+            error,
+        )
+
+    ok, error = validate_target_reader(
+        redis_client,
+        "taey-council-5",
+        "check",
+        tmux_sessions=set(),
+        registered_sessions=set(),
+        from_node="consult-monitor",
+        msg_type="result",
+        body=json.dumps(receipt),
+    )
+    _check(
+        "consult receipt cannot bypass a council inbox",
         not ok and "check 2 failed" in error,
         error,
     )
