@@ -69,4 +69,5 @@ syntax:
 	@python3 scripts/check_dead_address_guard.py
 	@python3 tests/supervisor_topology_acceptance.py
 	@python3 tests/grok_notification_discipline_acceptance.py
+	@python3 tests/live_path_guard_acceptance.py
 	@bash -n scripts/start_notify_daemons.sh scripts/tmux-send scripts/install-hooks.sh scripts/atomic_deploy.sh

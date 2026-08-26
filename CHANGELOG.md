@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Live-path guard failures now preserve read-only calls but fail closed for guarded mutating shell calls. Env-less processes discover the committed conductor registry, malformed/invalid state cannot authorize mutation, explicit live targets from worktrees are denied, and one bounded-TTL defect per node/failure class routes to the owning supervisor without per-tool passenger warning spam.
 - Opt-in `NOTIFY_SUPERVISOR_IDS` topology: configured `*-codex` sessions are top-level supervisors (default notify no longer suffix-strips them back to base Claude). Matching base Claude / `*-gemini` / `*-grok` workers resolve to that codex supervisor. Unset/blank keeps the legacy suffix-strip rule. Malformed config fails loud at parse and daemon start.
 
 ## v1.0.3 - 2026-05-31
