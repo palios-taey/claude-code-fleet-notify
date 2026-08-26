@@ -130,6 +130,15 @@ def main():
 
     from_node = args.from_node or detect_from_node()
 
+    if from_node.endswith('-grok') and args.type == 'message':
+        print(
+            "ERROR: Grok peer notifications must be actionable and typed; "
+            "use defect, response_ready, result, status, or escalation, and "
+            "aggregate one terminal parent notification per task.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
     if args.type == 'escalation' and args.priority == 'normal':
         args.priority = 'high'
 

@@ -4,6 +4,16 @@ Grok should use a dedicated global hook file at `~/.grok/hooks/cf-notify.json`.
 This avoids boot-time dependence on Claude-compat project hook loading and closes
 the cold-start idle gap.
 
+Grok's global notification discipline is separately tracked at
+`templates/grok/AGENTS.md`. Install it with:
+
+```bash
+scripts/install-grok-rules.sh
+```
+
+The rule source requires one aggregated, actionable terminal parent notification
+per task and requires all background work to be joined or cancelled before final.
+
 ## Install
 
 1. Create the global hooks directory:
