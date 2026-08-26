@@ -42,11 +42,14 @@ or filesystem operations that target a registered live checkout are denied so
 long-lived parent sessions must cut an isolated worktree before editing.
 Registered worktree roots are allowed.
 
-There is no default registry path: the guard reads only
-`CF_LIVE_PATH_REGISTRY` (or `ORCH_LIVE_PATH_REGISTRY`), and with neither set it
-is inactive with a loud per-call warning. If the registry is absent, unreadable, or
-the shell command cannot be parsed, the hook fails open with a loud warning so a
-broken guard cannot disable every tool call on the machine.
+The guard reads `CF_LIVE_PATH_REGISTRY` (or `ORCH_LIVE_PATH_REGISTRY`) first,
+then uses the committed registry at
+`$HOME/the-conductor/config/live_path_registry.json`. If the registry is absent,
+unreadable, structurally invalid, the command cannot be parsed, or guard internals
+fail, read-only calls remain available while guarded mutating shell calls fail
+closed. The failure is routed once per node and failure class to the node's
+supervisor (or itself when top-level), with a bounded dedupe TTL instead of a
+warning on every passenger tool call.
 
 ## Constitutional constraints [Observed — FAMILY_KERNEL constitutional commitments]
 
