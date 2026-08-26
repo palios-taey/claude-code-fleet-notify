@@ -52,6 +52,41 @@ def detect_from_node():
     return socket.gethostname()
 
 
+def detect_execution_principal():
+    """Return the process-bound caller class used for sender policy."""
+    try:
+        result = subprocess.run(
+            ['tmux', 'display-message', '-p', '#S'],
+            capture_output=True, text=True, timeout=2,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+    except Exception:
+        pass
+
+    pid = os.getppid()
+    for _ in range(16):
+        if pid <= 1:
+            break
+        try:
+            proc_root = f'/proc/{pid}'
+            with open(f'{proc_root}/comm', encoding='utf-8') as handle:
+                comm = handle.read().strip()
+            with open(f'{proc_root}/cmdline', 'rb') as handle:
+                cmdline = handle.read().split(b'\0', 1)[0]
+            executable = os.path.basename(os.fsdecode(cmdline)) if cmdline else ''
+            if comm == 'grok' or executable == 'grok':
+                return 'grok'
+            with open(f'{proc_root}/status', encoding='utf-8') as handle:
+                parent_line = next(
+                    line for line in handle if line.startswith('PPid:')
+                )
+            pid = int(parent_line.split(':', 1)[1].strip())
+        except (OSError, StopIteration, ValueError):
+            break
+    return ''
+
+
 def resolve_target_and_message(args, from_node, redis_client):
     if args.body_file is not None:
         if args.message is not None:
@@ -129,8 +164,12 @@ def main():
     args = parser.parse_args()
 
     from_node = args.from_node or detect_from_node()
+    execution_principal = detect_execution_principal()
 
-    if from_node.endswith('-grok') and args.type == 'message':
+    if (
+        execution_principal == 'grok'
+        or execution_principal.endswith('-grok')
+    ) and args.type == 'message':
         print(
             "ERROR: Grok peer notifications must be actionable and typed; "
             "use defect, response_ready, result, status, or escalation, and "
