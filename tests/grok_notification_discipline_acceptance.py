@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import importlib.machinery
+import io
 import os
 import pathlib
 import subprocess
@@ -45,3 +46,31 @@ with mock.patch.dict(
         run.call_args.args[0] == ["tmux", "display-message", "-p", "-t", "%42", "#S"],
         run.call_args,
     )
+
+
+def grok_proc_open(path, mode="r", **_kwargs):
+    if path.endswith("/comm"):
+        return io.StringIO("grok\n")
+    if path.endswith("/cmdline"):
+        return io.BytesIO(b"/usr/bin/grok\0")
+    if path.endswith("/status"):
+        return io.StringIO("PPid:\t1\n")
+    raise OSError(path)
+
+
+conductor_result = subprocess.CompletedProcess(
+    args=[], returncode=0, stdout="conductor-codex\n", stderr=""
+)
+with mock.patch.dict(
+    os.environ,
+    {"TMUX": "/tmp/tmux-1000/default,1,0", "TMUX_PANE": "%1290"},
+    clear=False,
+):
+    with mock.patch.object(NOTIFY.os, "getppid", return_value=4242):
+        with mock.patch("builtins.open", side_effect=grok_proc_open):
+            with mock.patch.object(
+                NOTIFY.subprocess, "run", return_value=conductor_result
+            ) as run:
+                principal = NOTIFY.detect_execution_principal()
+    check("observed Grok ancestry overrides a substituted pane", principal == "grok", principal)
+    check("substituted pane is not consulted after Grok ancestry", not run.called, run.call_args)

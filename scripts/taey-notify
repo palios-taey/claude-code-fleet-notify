@@ -54,18 +54,6 @@ def detect_from_node():
 
 def detect_execution_principal():
     """Return the process-bound caller class used for sender policy."""
-    tmux_pane = os.environ.get('TMUX_PANE') if os.environ.get('TMUX') else None
-    if tmux_pane:
-        try:
-            result = subprocess.run(
-                ['tmux', 'display-message', '-p', '-t', tmux_pane, '#S'],
-                capture_output=True, text=True, timeout=2,
-            )
-            if result.returncode == 0 and result.stdout.strip():
-                return result.stdout.strip()
-        except Exception:
-            pass
-
     pid = os.getppid()
     for _ in range(16):
         if pid <= 1:
@@ -86,6 +74,18 @@ def detect_execution_principal():
             pid = int(parent_line.split(':', 1)[1].strip())
         except (OSError, StopIteration, ValueError):
             break
+
+    tmux_pane = os.environ.get('TMUX_PANE') if os.environ.get('TMUX') else None
+    if tmux_pane:
+        try:
+            result = subprocess.run(
+                ['tmux', 'display-message', '-p', '-t', tmux_pane, '#S'],
+                capture_output=True, text=True, timeout=2,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                return result.stdout.strip()
+        except Exception:
+            pass
     return ''
 
 
