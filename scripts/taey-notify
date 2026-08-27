@@ -216,6 +216,25 @@ def main():
         if not allowed:
             print(reason, file=sys.stderr)
             sys.exit(1)
+
+    # P0 safety (task-f396305d): revoke worker outward notify after unbind.
+    # Prefers orch authorize_outward_capability (shared with GitHub); else Redis current_task.
+    from notifications.outward_capability_gate import (
+        OutwardNotifyDenied,
+        require_outward_notify_capability,
+    )
+
+    try:
+        require_outward_notify_capability(
+            from_node,
+            args.type,
+            r,
+            key_prefix=args.key_prefix,
+        )
+    except OutwardNotifyDenied as exc:
+        print(f"SAFETY DENY: {exc}", file=sys.stderr)
+        sys.exit(1)
+
     if args.handoff:
         from notifications.handoff import create_explicit_handoff
 
